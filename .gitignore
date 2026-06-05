@@ -1,0 +1,53 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Qt
+*.autosave
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# Binaries
+*.app
+*.exe
+*.dll
+*.dylib
+*.so
+*.o
+*.obj
+*.a
+*.lib
+
+# Editors
+.vscode/.cache/
+.idea/
+.DS_Store
+
+# Python
+.venv/
+venv/
+backend/.venv/
+backend/venv/
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
+logs/
+backend/logs/
+
+# Backend secrets
+.env
+.env.*
+backend/.env
+backend/.env.*
+!.env.example
+!backend/.env.example
