@@ -2,6 +2,26 @@
 
 #include <string>
 
+enum class OfflineModernizationLevel
+{
+    Conservative,
+    Balanced,
+    AggressiveSafe,
+    AiStyleAggressiveRewrite,
+};
+
+enum class CppStandard
+{
+    Cpp17,
+    Cpp20,
+};
+
+enum class OfflineRewriteStyle
+{
+    SafeModernization,
+    AggressiveAiLikeRewrite,
+};
+
 struct ModernizationOptions
 {
     bool useNullptr = true;
@@ -31,8 +51,13 @@ struct ModernizationOptions
     bool useDesignatedInitializers = false;
     bool useConstevalConstinit = false;
     bool useSpaceshipOperator = false;
+    bool useStdFormatForStreams = false;
     bool applySafeOwnershipModernization = true;
     bool applyStringViewWhenSafe = false;
+    bool compileVerificationEnabled = false;
+    OfflineModernizationLevel offlineModernizationLevel = OfflineModernizationLevel::Balanced;
+    OfflineRewriteStyle offlineRewriteStyle = OfflineRewriteStyle::SafeModernization;
+    CppStandard targetStandard = CppStandard::Cpp20;
 
     std::string customInstruction;
 };

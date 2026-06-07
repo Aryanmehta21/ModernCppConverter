@@ -1,6 +1,7 @@
 #include "backend/BackendClient.h"
 
 #include <QEventLoop>
+#include <QDebug>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkAccessManager>
@@ -25,6 +26,19 @@ QString modeToString(ConversionMode mode)
     }
     return "offline";
 }
+
+QString aggressivenessForMode(ConversionMode mode)
+{
+    switch (mode) {
+    case ConversionMode::OnlineAiAssisted:
+        return "balanced";
+    case ConversionMode::HybridOfflineAiReview:
+        return "aggressive_safe";
+    case ConversionMode::OfflineRuleBased:
+        return "conservative";
+    }
+    return "conservative";
+}
 } // namespace
 
 BackendClient::BackendClient(BackendConfig config)
@@ -34,6 +48,7 @@ BackendClient::BackendClient(BackendConfig config)
 
 bool BackendClient::isAvailable() const
 {
+    qInfo() << "Backend health check starts for" << config_.backendUrl;
     QNetworkAccessManager manager;
     QNetworkRequest request(QUrl(config_.backendUrl + "/health"));
     QNetworkReply* reply = manager.get(request);
@@ -52,12 +67,14 @@ bool BackendClient::isAvailable() const
         const bool ok = reply->error() == QNetworkReply::NoError
             && reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200
             && deserializeHealthResponse(reply->readAll());
+        qInfo() << "Backend health check" << (ok ? "succeeded" : "failed");
         reply->deleteLater();
         return ok;
     }
 
     reply->abort();
     reply->deleteLater();
+    qWarning() << "Backend health check timed out";
     return false;
 }
 
@@ -66,6 +83,7 @@ BackendConversionResponse BackendClient::convert(const std::string& code,
                                                  ConversionMode mode,
                                                  const ConversionResult* localResult) const
 {
+    qInfo() << "Backend conversion request starts; mode =" << modeToString(mode);
     QNetworkAccessManager manager;
     QNetworkRequest request(QUrl(config_.backendUrl + "/api/convert"));
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
@@ -84,6 +102,7 @@ BackendConversionResponse BackendClient::convert(const std::string& code,
     if (!timer.isActive()) {
         reply->abort();
         reply->deleteLater();
+        qWarning() << "Backend conversion request timed out";
         return {false, {}, "Backend request timed out."};
     }
 
@@ -91,12 +110,15 @@ BackendConversionResponse BackendClient::convert(const std::string& code,
     if (reply->error() != QNetworkReply::NoError) {
         const std::string error = reply->errorString().toStdString();
         reply->deleteLater();
+        qWarning() << "Backend conversion request failed:" << QString::fromStdString(error);
         return {false, {}, error};
     }
 
     const QByteArray payload = reply->readAll();
     reply->deleteLater();
-    return deserializeConversionResponse(payload);
+    BackendConversionResponse response = deserializeConversionResponse(payload);
+    qInfo() << "Backend conversion request" << (response.ok ? "succeeded" : "failed");
+    return response;
 }
 
 QByteArray BackendClient::serializeConversionRequest(const std::string& code,
@@ -107,6 +129,7 @@ QByteArray BackendClient::serializeConversionRequest(const std::string& code,
     QJsonObject object;
     object["code"] = QString::fromStdString(code);
     object["mode"] = modeToString(mode);
+    object["aggressivenessLevel"] = aggressivenessForMode(mode);
     object["options"] = optionsToJson(options);
     if (localResult != nullptr) {
         object["localResult"] = resultToJson(*localResult);
@@ -123,12 +146,30 @@ BackendConversionResponse BackendClient::deserializeConversionResponse(const QBy
 
     const QJsonObject object = document.object();
     if (!object.value("ok").toBool(false)) {
-        return {false, {}, object.value("error").toString("Backend conversion failed.").toStdString()};
+        ConversionResult result;
+        result.backendStatus = object.value("backendStatus").toString("Error").toStdString();
+        result.aiProvider = object.value("aiProvider").toString().toStdString();
+        result.aiModel = object.value("aiModel").toString().toStdString();
+        return {false, result, object.value("error").toString("Backend conversion failed.").toStdString()};
     }
 
     ConversionResult result;
     result.modernCode = object.value("modernCode").toString().toStdString();
     result.explanation = object.value("explanation").toString().toStdString();
+    result.backendStatus = object.value("backendStatus").toString("Connected").toStdString();
+    result.aiProvider = object.value("aiProvider").toString().toStdString();
+    result.aiModel = object.value("aiModel").toString().toStdString();
+
+    const QJsonArray warnings = object.value("warnings").toArray();
+    if (!warnings.empty()) {
+        result.explanation += "\n\nWarnings\n========\n\n";
+        for (const QJsonValue& warning : warnings) {
+            result.explanation += "- ";
+            result.explanation += warning.toString().toStdString();
+            result.explanation += "\n";
+            result.diagnosticMessages.push_back(warning.toString().toStdString());
+        }
+    }
 
     const QJsonArray changes = object.value("changes").toArray();
     result.changes.reserve(static_cast<std::size_t>(changes.size()));
@@ -136,6 +177,18 @@ BackendConversionResponse BackendClient::deserializeConversionResponse(const QBy
         if (value.isObject()) {
             result.changes.push_back(changeFromJson(value.toObject()));
         }
+    }
+
+    const QJsonArray suggestions = object.value("suggestions").toArray();
+    for (const QJsonValue& suggestion : suggestions) {
+        result.changes.push_back({
+            "AI suggestion",
+            suggestion.toString().toStdString(),
+            "",
+            "Suggestion returned by the backend AI service.",
+            false,
+            false,
+        });
     }
 
     return {true, result, {}};
@@ -157,6 +210,7 @@ QJsonObject BackendClient::optionsToJson(const ModernizationOptions& options)
     object["applySafeOwnershipModernization"] = options.applySafeOwnershipModernization;
     object["useStringView"] = options.useStringView;
     object["applyStringViewWhenSafe"] = options.applyStringViewWhenSafe;
+    object["useStdFormatForStreams"] = options.useStdFormatForStreams;
     object["customInstruction"] = QString::fromStdString(options.customInstruction);
     return object;
 }

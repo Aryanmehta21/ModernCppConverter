@@ -27,6 +27,26 @@ add_library(ModernCppConverterCore
     src/backend/BackendClient.cpp
     src/backend/BackendConfig.cpp
     src/app/ConversionCoordinator.cpp
+    src/converter/AggressiveRewriteEngine.cpp
+    src/converter/ClangAstStructureAnalyzer.cpp
+    src/converter/CompilerDiagnosticCleanupPass.cpp
+    src/converter/CompileVerifier.cpp
+    src/converter/DependentUsageRewritePass.cpp
+    src/converter/ImpactCascadingCleanupPass.cpp
+    src/converter/IncludeManager.cpp
+    src/converter/OfflineModernizationPipeline.cpp
+    src/converter/OrphanedGrowthSymbolCleanupPass.cpp
+    src/converter/OrphanedTempBufferLoopCleanupPass.cpp
+    src/converter/SafeReplacementEngine.cpp
+    src/converter/StructuralAnalyzers.cpp
+    src/converter/StructuralModernizationEngine.cpp
+    src/converter/TokenBasedStructureAnalyzer.cpp
+    src/converter/TransformationContext.cpp
+    src/converter/VectorAppendMethodRewritePass.cpp
+    src/converter/VectorEmulationEliminationPass.cpp
+    src/converter/VectorParadigmRewritePass.cpp
+    src/converter/ValueTypePointerOperationScanner.cpp
+    src/converter/VectorGrowthEmulationCleanupPass.cpp
     src/converter/ModernCppConverter.cpp
     src/converter/ConversionRule.cpp
     src/converter/RuleBasedConverterEngine.cpp
@@ -34,6 +54,12 @@ add_library(ModernCppConverterCore
     src/converter/RawTextRepresentation.cpp
     src/converter/TokenRepresentation.cpp
     src/converter/AstRepresentation.cpp
+    src/repository/RepositoryBackupService.cpp
+    src/repository/RepositoryCloneService.cpp
+    src/repository/RepositoryModernizationService.cpp
+    src/repository/RepositoryReportWriter.cpp
+    src/repository/RepositoryScanner.cpp
+    src/repository/RepositoryVerificationService.cpp
 )
 
 target_include_directories(ModernCppConverterCore

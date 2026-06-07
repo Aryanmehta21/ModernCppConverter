@@ -1,8 +1,10 @@
 #include "converter/RuleBasedConverterEngine.h"
 
 #include "converter/ModernCppExplanationGenerator.h"
+#include "converter/OfflineModernizationPipeline.h"
 #include "converter/RawTextRepresentation.h"
 
+#include <cctype>
 #include <regex>
 #include <set>
 #include <stdexcept>
@@ -35,6 +37,25 @@ std::string singularName(const std::string& collectionName)
         return collectionName.substr(0, collectionName.size() - 1);
     }
     return "value";
+}
+
+bool atLeastBalanced(const ModernizationOptions& options)
+{
+    return options.offlineModernizationLevel == OfflineModernizationLevel::Balanced
+        || options.offlineModernizationLevel == OfflineModernizationLevel::AggressiveSafe
+        || options.offlineModernizationLevel == OfflineModernizationLevel::AiStyleAggressiveRewrite;
+}
+
+bool aggressiveSafe(const ModernizationOptions& options)
+{
+    return options.offlineModernizationLevel == OfflineModernizationLevel::AggressiveSafe
+        || options.offlineModernizationLevel == OfflineModernizationLevel::AiStyleAggressiveRewrite;
+}
+
+bool aiStyleAggressive(const ModernizationOptions& options)
+{
+    return options.offlineRewriteStyle == OfflineRewriteStyle::AggressiveAiLikeRewrite
+        || options.offlineModernizationLevel == OfflineModernizationLevel::AiStyleAggressiveRewrite;
 }
 
 std::string ensureStringInclude(std::string code)
@@ -406,6 +427,51 @@ public:
     }
 };
 
+class OldStyleCastConversionRule final : public IConversionRule
+{
+public:
+    [[nodiscard]] std::string name() const override
+    {
+        return "Old-style cast to named cast";
+    }
+
+    void apply(CodeRepresentation& representation,
+               const ModernizationOptions& options,
+               std::vector<ConversionChange>& changes) const override
+    {
+        if (!atLeastBalanced(options)) {
+            return;
+        }
+
+        static const std::regex numericCastPattern(
+            R"(\((int|long|long long|float|double|std::size_t|size_t)\)\s*([A-Za-z_]\w*|[-+]?\d+(?:\.\d+)?))");
+
+        std::string remaining = representation.sourceText();
+        std::string updated;
+        std::smatch match;
+        bool changed = false;
+
+        while (std::regex_search(remaining, match, numericCastPattern)) {
+            const std::string before = match[0].str();
+            const std::string after = "static_cast<" + match[1].str() + ">(" + match[2].str() + ")";
+            addAppliedChange(changes,
+                             name(),
+                             before,
+                             after,
+                             "Converted a simple scalar old-style cast to static_cast so the conversion intent is explicit.");
+            updated += match.prefix().str();
+            updated += after;
+            remaining = match.suffix().str();
+            changed = true;
+        }
+
+        if (changed) {
+            updated += remaining;
+            representation.replaceSourceText(updated);
+        }
+    }
+};
+
 class RawPointerOwnershipRule final : public IConversionRule
 {
 public:
@@ -693,6 +759,326 @@ public:
     }
 };
 
+class AutoUsageRule final : public IConversionRule
+{
+public:
+    [[nodiscard]] std::string name() const override
+    {
+        return "Use auto for obvious construction";
+    }
+
+    void apply(CodeRepresentation& representation,
+               const ModernizationOptions& options,
+               std::vector<ConversionChange>& changes) const override
+    {
+        if (!options.useAuto || !atLeastBalanced(options)) {
+            return;
+        }
+
+        static const std::regex directConstruction(
+            R"(^([ \t]*)(std::[A-Za-z_]\w*(?:::\w+)*(?:<[^;\n=]+>)?|[A-Z][A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*\2\s*(\([^;\n]*\)|\{[^;\n]*\})\s*;\s*$)");
+
+        std::stringstream input(representation.sourceText());
+        std::ostringstream output;
+        std::string line;
+        bool firstLine = true;
+        bool changed = false;
+
+        while (std::getline(input, line)) {
+            std::smatch match;
+            std::string rewritten = line;
+            if (std::regex_match(line, match, directConstruction)) {
+                rewritten = match[1].str() + "auto " + match[3].str() + " = " + match[2].str() + match[4].str() + ";";
+                addAppliedChange(changes,
+                                 name(),
+                                 trim(line),
+                                 trim(rewritten),
+                                 "The right-hand side already states the constructed type, so auto removes repetition without hiding meaning.");
+                changed = true;
+            }
+            if (!firstLine) {
+                output << '\n';
+            }
+            firstLine = false;
+            output << rewritten;
+        }
+
+        if (changed) {
+            representation.replaceSourceText(output.str());
+        }
+    }
+};
+
+class ConstexprRule final : public IConversionRule
+{
+public:
+    [[nodiscard]] std::string name() const override
+    {
+        return "constexpr for compile-time value";
+    }
+
+    void apply(CodeRepresentation& representation,
+               const ModernizationOptions& options,
+               std::vector<ConversionChange>& changes) const override
+    {
+        if (!options.useConstexpr || !atLeastBalanced(options)) {
+            return;
+        }
+
+        static const std::regex constIntegral(
+            R"(^([ \t]*)const\s+(int|long|long long|std::size_t|size_t|double|float|bool)\s+([A-Z][A-Za-z_]\w*)\s*=\s*([-+]?\d+(?:\.\d+)?|true|false)\s*;\s*$)");
+        static const std::regex simpleFunction(
+            R"(^([ \t]*)(int|long|long long|double|float|bool)\s+([A-Za-z_]\w*)\s*\(([^;\{\}]*)\)\s*\{\s*return\s+([^;\{\}]+);\s*\}\s*$)");
+
+        std::stringstream input(representation.sourceText());
+        std::ostringstream output;
+        std::string line;
+        bool firstLine = true;
+        bool changed = false;
+
+        while (std::getline(input, line)) {
+            std::smatch match;
+            std::string rewritten = line;
+            if (std::regex_match(line, match, constIntegral)) {
+                rewritten = match[1].str() + "constexpr " + match[2].str() + " " + match[3].str() + " = " + match[4].str() + ";";
+            } else if (aggressiveSafe(options) && std::regex_match(line, match, simpleFunction)) {
+                rewritten = match[1].str() + "constexpr " + match[2].str() + " " + match[3].str() + "(" + match[4].str() + ") { return " + match[5].str() + "; }";
+            }
+
+            if (rewritten != line) {
+                addAppliedChange(changes,
+                                 name(),
+                                 trim(line),
+                                 trim(rewritten),
+                                 "The value or simple function can be evaluated at compile time, so constexpr communicates intent and enables compile-time use.");
+                changed = true;
+            }
+
+            if (!firstLine) {
+                output << '\n';
+            }
+            firstLine = false;
+            output << rewritten;
+        }
+
+        if (changed) {
+            representation.replaceSourceText(output.str());
+        }
+    }
+};
+
+class OverrideAnnotationRule final : public IConversionRule
+{
+public:
+    [[nodiscard]] std::string name() const override
+    {
+        return "Add override annotation";
+    }
+
+    void apply(CodeRepresentation& representation,
+               const ModernizationOptions& options,
+               std::vector<ConversionChange>& changes) const override
+    {
+        if (!options.useOverrideFinal || !atLeastBalanced(options)) {
+            return;
+        }
+
+        const std::string code = representation.sourceText();
+        static const std::regex virtualMethodPattern(R"(\bvirtual\s+[\w:<>~*&\s]+\s+([A-Za-z_]\w*)\s*\([^;\{\}]*\)\s*(?:const\s*)?[;{])");
+        std::set<std::string> virtualNames;
+        for (std::sregex_iterator it(code.begin(), code.end(), virtualMethodPattern), end; it != end; ++it) {
+            virtualNames.insert((*it)[1].str());
+        }
+        if (virtualNames.empty()) {
+            return;
+        }
+
+        static const std::regex declarationPattern(R"(^([ \t]*)([\w:<>~*&\s]+)\s+([A-Za-z_]\w*)\s*(\([^;\{\}]*\)\s*(?:const\s*)?)(;|[ \t]*\{)\s*$)");
+        std::stringstream input(code);
+        std::ostringstream output;
+        std::string line;
+        bool firstLine = true;
+        bool changed = false;
+
+        while (std::getline(input, line)) {
+            std::smatch match;
+            std::string rewritten = line;
+            if (std::regex_match(line, match, declarationPattern)
+                && virtualNames.contains(match[3].str())
+                && line.find("virtual") == std::string::npos
+                && line.find("override") == std::string::npos) {
+                rewritten = match[1].str() + trim(match[2].str()) + " " + match[3].str() + match[4].str() + " override" + match[5].str();
+                addAppliedChange(changes,
+                                 name(),
+                                 trim(line),
+                                 trim(rewritten),
+                                 "The method name matches a virtual method in the snippet, so override makes the inheritance contract explicit.");
+                changed = true;
+            }
+
+            if (!firstLine) {
+                output << '\n';
+            }
+            firstLine = false;
+            output << rewritten;
+        }
+
+        if (changed) {
+            representation.replaceSourceText(output.str());
+        }
+    }
+};
+
+class LambdaExtractionRule final : public IConversionRule
+{
+public:
+    [[nodiscard]] std::string name() const override
+    {
+        return "Extract repeated/simple computation to lambda";
+    }
+
+    void apply(CodeRepresentation& representation,
+               const ModernizationOptions& options,
+               std::vector<ConversionChange>& changes) const override
+    {
+        if (!options.useLambdas || !atLeastBalanced(options) || aiStyleAggressive(options)) {
+            return;
+        }
+
+        std::string code = representation.sourceText();
+        static const std::regex computationPattern(
+            R"(((?:unsigned\s+)?(?:long\s+long|long|int|short|double|float)|[A-Za-z_:]\w*(?:::\w+)*(?:<[^;\n{}]+>)?)\s+([A-Za-z_]\w*)\s*\{\s*([A-Za-z_]\w*)\s*\}\s*;\s*\n\s*\1\s+([A-Za-z_]\w*)\s*\{\s*([^{};]+)\s*\}\s*;\s*\n\s*while\s*\(\s*\3\s*([!<>=]+)\s*([^)]*)\)\s*\n\s*\{\s*\n\s*(?:if\s*\([^\)]*\)\s*\n\s*\{\s*\n\s*return\s+false\s*;\s*\n\s*\}\s*\n\s*)?\4\s*=\s*([^;]+);\s*\n\s*\3\s*([/%*+\-]?=)\s*([^;]+);\s*\n\s*\}\s*\n\s*return\s+\2\s*==\s*\4\s*;)",
+            std::regex::ECMAScript);
+
+        std::smatch match;
+        if (!std::regex_search(code, match, computationPattern)) {
+            return;
+        }
+
+        auto replaceIdentifier = [](std::string text, const std::string& from, const std::string& to) {
+            return std::regex_replace(text, std::regex("\\b" + from + "\\b"), to);
+        };
+        auto lambdaNameForAccumulator = [](std::string accumulator) {
+            if (accumulator.empty()) {
+                return std::string("computeValue");
+            }
+            accumulator[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(accumulator[0])));
+            return std::string("compute") + accumulator;
+        };
+
+        const std::string valueType = match[1].str();
+        const std::string sourceVariable = match[3].str();
+        const std::string accumulator = match[4].str();
+        const std::string initialValue = trim(match[5].str());
+        const std::string conditionOperator = match[6].str();
+        const std::string conditionRight = replaceIdentifier(trim(match[7].str()), sourceVariable, "value");
+        const std::string accumulatorExpression = replaceIdentifier(trim(match[8].str()), sourceVariable, "value");
+        const std::string mutationOperator = match[9].str();
+        const std::string mutationExpression = replaceIdentifier(trim(match[10].str()), sourceVariable, "value");
+        const std::string lambdaName = lambdaNameForAccumulator(accumulator);
+        const std::string replacement =
+            "const auto " + lambdaName + " = [](" + valueType + " value)\n"
+            "{\n"
+            "    " + valueType + " " + accumulator + "{" + initialValue + "};\n\n"
+            "    while (value " + conditionOperator + " " + conditionRight + ")\n"
+            "    {\n"
+            "        " + accumulator + " = " + accumulatorExpression + ";\n"
+            "        value " + mutationOperator + " " + mutationExpression + ";\n"
+            "    }\n\n"
+            "    return " + accumulator + ";\n"
+            "};\n\n"
+            "return " + sourceVariable + " == " + lambdaName + "(" + sourceVariable + ");";
+
+        addAppliedChange(changes,
+                         name(),
+                         trim(match[0].str()),
+                         trim(replacement),
+                         "Encapsulates self-contained local computation and improves readability using modern C++ lambda expressions.");
+        code.replace(static_cast<std::size_t>(match.position()), static_cast<std::size_t>(match.length()), replacement);
+        representation.replaceSourceText(code);
+    }
+};
+
+class FunctorToLambdaRule final : public IConversionRule
+{
+public:
+    [[nodiscard]] std::string name() const override
+    {
+        return "Function object to lambda";
+    }
+
+    void apply(CodeRepresentation& representation,
+               const ModernizationOptions& options,
+               std::vector<ConversionChange>& changes) const override
+    {
+        if (!options.useLambdas || !atLeastBalanced(options) || aiStyleAggressive(options)) {
+            return;
+        }
+
+        static const std::regex functorPattern(
+            R"(struct\s+([A-Za-z_]\w*)\s*\{\s*([A-Za-z_]\w*(?:::\w+)*|int|long|long long|double|float|bool)\s+operator\(\)\s*\(([^;\{\}]*)\)\s*const\s*\{\s*return\s+([^;\{\}]+);\s*\}\s*\};)");
+
+        std::string code = representation.sourceText();
+        std::smatch match;
+        if (!std::regex_search(code, match, functorPattern)) {
+            return;
+        }
+
+        std::string lambdaName = match[1].str();
+        if (!lambdaName.empty()) {
+            lambdaName[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(lambdaName[0])));
+        }
+        const std::string replacement = "const auto " + lambdaName + " = [](" + match[3].str() + ") { return " + match[4].str() + "; };";
+        addAppliedChange(changes,
+                         name(),
+                         trim(match[0].str()),
+                         replacement,
+                         "A stateless function object with a simple call operator can be represented more locally and clearly as a lambda.");
+        code.replace(static_cast<std::size_t>(match.position()), static_cast<std::size_t>(match.length()), replacement);
+        representation.replaceSourceText(code);
+    }
+};
+
+class StructuredBindingRule final : public IConversionRule
+{
+public:
+    [[nodiscard]] std::string name() const override
+    {
+        return "Structured binding for pair-like value";
+    }
+
+    void apply(CodeRepresentation& representation,
+               const ModernizationOptions& options,
+               std::vector<ConversionChange>& changes) const override
+    {
+        if (!options.useStructuredBindings || !aggressiveSafe(options)) {
+            return;
+        }
+
+        static const std::regex pairLoop(
+            R"((^[ \t]*)for\s*\(\s*const\s+auto&\s+([A-Za-z_]\w*)\s*:\s*([A-Za-z_]\w*)\s*\)\s*\n\1\{\s*\n([ \t]*)std::cout\s*<<\s*\2\.first\s*<<\s*\2\.second\s*<<\s*std::endl\s*;\s*\n\1\})",
+            std::regex::ECMAScript | std::regex::multiline);
+
+        std::string code = representation.sourceText();
+        std::smatch match;
+        if (!std::regex_search(code, match, pairLoop)) {
+            return;
+        }
+
+        const std::string replacement = match[1].str() + "for (const auto& [key, value] : " + match[3].str() + ")\n"
+            + match[1].str() + "{\n"
+            + match[4].str() + "std::cout << key << value << std::endl;\n"
+            + match[1].str() + "}";
+        addAppliedChange(changes,
+                         name(),
+                         trim(match[0].str()),
+                         trim(replacement),
+                         "Structured bindings make pair-like loop values clearer by naming each element directly.");
+        code.replace(static_cast<std::size_t>(match.position()), static_cast<std::size_t>(match.length()), replacement);
+        representation.replaceSourceText(code);
+    }
+};
+
 class EnumClassSuggestionRule final : public IConversionRule
 {
 public:
@@ -821,10 +1207,17 @@ std::vector<std::unique_ptr<IConversionRule>> createDefaultRules()
     rules.push_back(std::make_unique<NullToNullptrRule>());
     rules.push_back(std::make_unique<TypedefToUsingRule>());
     rules.push_back(std::make_unique<StrncpyToStringRule>());
+    rules.push_back(std::make_unique<LambdaExtractionRule>());
+    rules.push_back(std::make_unique<FunctorToLambdaRule>());
+    rules.push_back(std::make_unique<OldStyleCastConversionRule>());
     rules.push_back(std::make_unique<OldStyleCastSuggestionRule>());
     rules.push_back(std::make_unique<RawPointerOwnershipRule>());
+    rules.push_back(std::make_unique<AutoUsageRule>());
+    rules.push_back(std::make_unique<ConstexprRule>());
+    rules.push_back(std::make_unique<OverrideAnnotationRule>());
     rules.push_back(std::make_unique<CStyleArraySuggestionRule>());
     rules.push_back(std::make_unique<ManualLoopSuggestionRule>());
+    rules.push_back(std::make_unique<StructuredBindingRule>());
     rules.push_back(std::make_unique<EnumClassSuggestionRule>());
     rules.push_back(std::make_unique<OptionalSuggestionRule>());
     rules.push_back(std::make_unique<StringViewSuggestionRule>());
@@ -876,6 +1269,15 @@ ConversionResult RuleBasedConverterEngine::convert(const std::string& legacyCode
     }
 
     result.modernCode = representation.sourceText();
+    const OfflineModernizationPipeline pipeline;
+    const OfflineModernizationPipelineResult pipelineResult = pipeline.runAfterSafeRules(result.modernCode, options, result.changes);
+    result.modernCode = pipelineResult.modernCode;
+    result.compileVerificationEnabled = pipelineResult.compileVerificationEnabled;
+    result.compileVerificationPassed = pipelineResult.compileVerificationPassed;
+    result.compileVerificationAutoFixAttempted = pipelineResult.compileVerificationAutoFixAttempted;
+    result.compilerUsed = pipelineResult.compilerUsed;
+    result.compilerOutput = pipelineResult.compilerOutput;
+    result.rewriteLevel = pipelineResult.rewriteLevel;
     result.explanation = explanationGenerator_->generate(result.modernCode, result.changes, options);
     return result;
 }

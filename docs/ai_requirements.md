@@ -4,6 +4,8 @@ This document describes what must be in place before enabling a real AI provider
 
 OpenAI provider support is available behind `OpenAiModernizationService`, but it is disabled unless the backend is configured with `ENABLE_AI_PROVIDER=true`. The mock service remains available.
 
+AI-assisted mode can directly modernize complex C++ patterns when the backend response passes validation. The backend must leave uncertain transformations as suggestions or warnings so the Qt app can fall back safely when provider output is invalid.
+
 ## Developer Requirements
 
 Prerequisites for running AI-assisted mode:
@@ -243,8 +245,9 @@ Steps:
 5. Prompt/request construction server-side: implemented.
 6. Strict JSON response validation: implemented.
 7. Provider timeout handling: implemented.
-8. Tests for missing key, invalid request, timeout, and malformed provider response: added.
-9. Keep `MockAiModernizationService` available for offline backend testing: preserved.
+8. Lightweight `modernCode` validation and optional compile verification: implemented.
+9. Tests for missing key, invalid request, timeout, and malformed provider response: added.
+10. Keep `MockAiModernizationService` available for offline backend testing: preserved.
 
 ### Phase 3: Production Deployment
 

@@ -8,16 +8,44 @@ By default, `ENABLE_AI_PROVIDER=false`, so the backend uses `MockAiModernization
 
 When `ENABLE_AI_PROVIDER=true` and `AI_PROVIDER=openai`, the backend uses `OpenAiModernizationService`.
 
+Online AI-Assisted mode may directly return modernized C++ when the backend judges a transformation safe. Unsafe or ambiguous items should remain suggestions or warnings.
+
 ## Run
+
+Development server:
 
 ```sh
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+uvicorn src.main:app --host 127.0.0.1 --port 8000
+```
+
+Keep this terminal open while using Online AI-Assisted or Hybrid mode. The server keeps running until you press `Ctrl+C` or close the terminal.
+
+Optional reload mode for backend development:
+
+```sh
 uvicorn src.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+Helper scripts:
+
+Windows PowerShell:
+
+```powershell
+.\run_backend.ps1
+```
+
+macOS/Linux:
+
+```sh
+sh ./run_backend.sh
+```
+
 Then use **Check Backend Connection** in the desktop app.
+
+For production, run the backend with a process manager or service supervisor instead of relying on an interactive terminal.
 
 ## Security Notes
 
@@ -29,6 +57,22 @@ Then use **Check Backend Connection** in the desktop app.
 - Deploy behind HTTPS in production.
 
 Real provider support is implemented behind `OpenAiModernizationService`, but it is disabled unless `ENABLE_AI_PROVIDER=true`.
+
+## AI Response Validation
+
+Before returning AI-modernized code to the desktop app, the backend validates:
+
+- response is valid JSON
+- required fields are present
+- `modernCode` is not empty
+- no markdown fences appear in `modernCode`
+- braces are roughly balanced
+- parentheses are roughly balanced
+- `modernCode` does not appear to contain explanation text
+
+The backend also attempts optional syntax-only compile verification with `clang++`, `g++`, or `cl` when available. Compiler failures are returned as warnings instead of crashing the backend.
+
+If validation fails, the backend returns a structured error and the Qt app falls back to Offline Rule-Based mode.
 
 ## Enable OpenAI Provider Locally
 
@@ -59,7 +103,7 @@ Get-Content .env | ForEach-Object {
     [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
   }
 }
-uvicorn src.main:app --reload --host 127.0.0.1 --port 8000
+uvicorn src.main:app --host 127.0.0.1 --port 8000
 ```
 
 macOS/Linux:
@@ -72,7 +116,7 @@ pip install -r requirements.txt
 set -a
 . ./.env
 set +a
-uvicorn src.main:app --reload --host 127.0.0.1 --port 8000
+uvicorn src.main:app --host 127.0.0.1 --port 8000
 ```
 
 Verify health:

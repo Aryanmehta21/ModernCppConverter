@@ -26,6 +26,7 @@ class ModernizationOptionsModel(BaseModel):
     applySafeOwnershipModernization: bool = True
     useStringView: bool = True
     applyStringViewWhenSafe: bool = False
+    useStdFormatForStreams: bool = False
     customInstruction: str = ""
 
 
@@ -33,6 +34,7 @@ class ConvertRequest(BaseModel):
     code: str
     mode: Literal["offline", "online", "hybrid"] = "online"
     targetStandard: Literal["C++17", "C++20"] = "C++20"
+    aggressivenessLevel: Literal["conservative", "balanced", "aggressive_safe"] | None = None
     options: ModernizationOptionsModel = Field(default_factory=ModernizationOptionsModel)
     localResult: ConversionResultModel | None = None
 
@@ -46,6 +48,9 @@ class ConvertRequest(BaseModel):
 
 class ConvertResponse(BaseModel):
     ok: bool = True
+    backendStatus: str = ""
+    aiProvider: str = ""
+    aiModel: str = ""
     modernCode: str = ""
     changes: list[ConversionChangeModel] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
