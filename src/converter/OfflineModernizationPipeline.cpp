@@ -4,6 +4,8 @@
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
 #include "converter/ImpactCascadingCleanupPass.h"
+#include "converter/MemberApiCascadePass.h"
+#include "converter/ModernizationPolishPass.h"
 #include "converter/StructuralModernizationEngine.h"
 #include "converter/TransformationContext.h"
 #include "converter/VectorParadigmRewritePass.h"
@@ -108,6 +110,14 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         const VectorParadigmRewritePass vectorParadigmRewritePass;
         result.modernCode = vectorParadigmRewritePass.rewrite(result.modernCode, transformationContext, changes);
         result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
+        const MemberApiCascadePass memberApiCascadePass;
+        result.modernCode = memberApiCascadePass.rewrite(result.modernCode, transformationContext, changes);
+        result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
+    }
+
+    if (shouldRunStructuralPass(options)) {
+        const ModernizationPolishPass polishPass;
+        result.modernCode = polishPass.rewrite(result.modernCode, options, transformationContext, changes);
     }
 
     if (options.compileVerificationEnabled || aggressiveAiLike) {
@@ -126,6 +136,11 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
             result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
             const VectorParadigmRewritePass vectorParadigmRewritePass;
             result.modernCode = vectorParadigmRewritePass.rewrite(result.modernCode, transformationContext, changes);
+            result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
+            const MemberApiCascadePass memberApiCascadePass;
+            result.modernCode = memberApiCascadePass.rewrite(result.modernCode, transformationContext, changes);
+            const ModernizationPolishPass polishPass;
+            result.modernCode = polishPass.rewrite(result.modernCode, options, transformationContext, changes);
             result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
 
             if (result.modernCode != beforeCleanup) {

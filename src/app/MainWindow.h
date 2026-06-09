@@ -14,6 +14,7 @@
 
 class QCheckBox;
 class QComboBox;
+class CppCodeEditor;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
@@ -95,9 +96,11 @@ private:
     QCheckBox* spaceshipOperatorCheckBox_ = nullptr;
     QCheckBox* stdFormatCheckBox_ = nullptr;
     QCheckBox* automaticCompileVerificationCheckBox_ = nullptr;
+    QCheckBox* editorAutoIndentCheckBox_ = nullptr;
+    QCheckBox* editorAutoCloseBracketsCheckBox_ = nullptr;
     QLineEdit* customInstructionEdit_ = nullptr;
-    QPlainTextEdit* inputEditor_ = nullptr;
-    QPlainTextEdit* outputEditor_ = nullptr;
+    CppCodeEditor* inputEditor_ = nullptr;
+    CppCodeEditor* outputEditor_ = nullptr;
     QPlainTextEdit* detailsEditor_ = nullptr;
     QPlainTextEdit* explanationEditor_ = nullptr;
     QPlainTextEdit* compileVerificationEditor_ = nullptr;

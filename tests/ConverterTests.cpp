@@ -431,7 +431,7 @@ void testIteratorLoopToRangeBasedLoop()
         "}\n");
 
     require(contains(result.modernCode, "for (const auto& value : values)"), "iterator printing loop should convert to range-based loop");
-    require(contains(result.modernCode, "std::cout << value << std::endl;"), "iterator dereference should become element variable");
+    require(contains(result.modernCode, "std::cout << value << '\\n';"), "iterator dereference should become element variable");
 }
 
 void testIndexLoopToRangeBasedLoop()
@@ -1405,6 +1405,175 @@ void testEmptyCleanupBlockAfterValueTypeModernizationIsRemoved()
     require(!contains(fixed, "items != nullptr"), "empty nullptr block should be removed");
     require(!contains(fixed, "if (items"), "empty cleanup if should not remain");
     require(hasAppliedRule(changes, "Remove empty cleanup block"), "empty cleanup block removal should be tracked");
+}
+
+void testVectorMemberGetterCascadesToContainerReference()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "struct Item\n"
+        "{\n"
+        "    int value;\n"
+        "};\n\n"
+        "class Store\n"
+        "{\n"
+        "public:\n"
+        "    explicit Store(int capacity)\n"
+        "        : count(capacity)\n"
+        "    {\n"
+        "        items = new Item[count];\n"
+        "    }\n\n"
+        "    const Item* getItems() const { return items; }\n"
+        "    int getCount() const { return count; }\n\n"
+        "    ~Store()\n"
+        "    {\n"
+        "        delete[] items;\n"
+        "    }\n\n"
+        "private:\n"
+        "    int count;\n"
+        "    Item* items;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<Item> items;"), "array member should become vector");
+    require(contains(result.modernCode, "const std::vector<Item>& getItems() const { return items; }"),
+            "whole-collection getter should return const vector reference");
+    require(contains(result.modernCode, "std::size_t getCount() const { return items.size(); }"),
+            "count getter should cascade to vector size");
+    require(!contains(result.modernCode, "const Item* getItems()"), "getter should not expose old array pointer type");
+    require(!contains(result.modernCode, "~Store()"), "cleanup-only destructor should be removed");
+    require(hasAppliedRule(result, "Vector getter return type cascade"), "vector getter cascade should be tracked");
+    require(hasAppliedRule(result, "Count getter to vector size"), "count getter cascade should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "vector member getter cascade sample should pass syntax verification");
+    }
+}
+
+void testVectorRawBufferGetterUsesDataOnlyWhenIntentIsClear()
+{
+    const RuleBasedConverterEngine converter;
+    const ConversionResult result = converter.convert(
+        "class Buffer\n"
+        "{\n"
+        "public:\n"
+        "    explicit Buffer(int capacity)\n"
+        "    {\n"
+        "        values = new int[capacity];\n"
+        "    }\n\n"
+        "    int* rawData() { return values; }\n\n"
+        "    ~Buffer()\n"
+        "    {\n"
+        "        delete[] values;\n"
+        "    }\n\n"
+        "private:\n"
+        "    int* values;\n"
+        "};\n",
+        structuralOptions());
+
+    require(contains(result.modernCode, "std::vector<int> values;"), "raw buffer storage should become vector");
+    require(contains(result.modernCode, "int* rawData() { return values.data(); }"),
+            "raw-intent getter should use vector.data()");
+    require(hasAppliedRule(result, "Vector raw buffer getter cascade"), "raw buffer getter cascade should be tracked");
+}
+
+void testRuntimeVectorGetterIsNotConstexpr()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <vector>\n"
+        "class Numbers\n"
+        "{\n"
+        "public:\n"
+        "    constexpr int getCount() const { return values.size(); }\n"
+        "private:\n"
+        "    std::vector<int> values;\n"
+        "};\n",
+        options);
+
+    require(!contains(result.modernCode, "constexpr int getCount()"), "runtime vector size getter should not remain constexpr");
+    require(contains(result.modernCode, "int getCount() const { return values.size(); }")
+                || contains(result.modernCode, "std::size_t getCount() const { return values.size(); }"),
+            "getter should remain available after constexpr cleanup");
+    require(hasAppliedRule(result, "Constexpr correctness cleanup"), "constexpr cleanup should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "constexpr cleanup sample should pass syntax verification");
+    }
+}
+
+void testMalformedEmptyDestructorBlocksAreRemoved()
+{
+    const RuleBasedConverterEngine converter;
+    const ConversionResult result = converter.convert(
+        "class EmptyCleanup\n"
+        "{\n"
+        "public:\n"
+        "    ~EmptyCleanup()\n"
+        "    {\n"
+        "        {\n"
+        "        }\n"
+        "    }\n"
+        "};\n",
+        structuralOptions());
+
+    require(!contains(result.modernCode, "~EmptyCleanup()"), "malformed empty destructor should be removed");
+    require(hasAppliedRule(result, "Rule of Zero destructor cleanup"), "empty destructor cleanup should be tracked");
+}
+
+void testContainerPolishModernizesInitializerAndMapInsert()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.useStructuredBindings = true;
+    const ConversionResult result = converter.convert(
+        "#include <map>\n"
+        "#include <string>\n"
+        "#include <vector>\n"
+        "void configure(std::map<int, std::string>& names)\n"
+        "{\n"
+        "    std::vector<int> values;\n"
+        "    values.push_back(1);\n"
+        "    values.push_back(2);\n"
+        "    values.push_back(3);\n"
+        "    names.insert(std::pair<int, std::string>(1, \"one\"));\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<int> values{1, 2, 3};"),
+            "consecutive push_back calls should become vector initializer list");
+    require(contains(result.modernCode, "names.emplace(1, \"one\");"), "pair insertion should become emplace");
+    require(hasAppliedRule(result, "Repeated push_back to initializer list"), "initializer-list polish should be tracked");
+    require(hasAppliedRule(result, "Map pair insert to emplace"), "map insertion polish should be tracked");
+}
+
+void testMapIteratorLoopUsesStructuredBindingAndNewline()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.useStructuredBindings = true;
+    const ConversionResult result = converter.convert(
+        "#include <iostream>\n"
+        "#include <map>\n"
+        "void print(const std::map<int, int>& values)\n"
+        "{\n"
+        "    for (std::map<int, int>::const_iterator it = values.begin(); it != values.end(); ++it)\n"
+        "    {\n"
+        "        std::cout << it->first << it->second << std::endl;\n"
+        "    }\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "for (const auto& [key, value] : values)"),
+            "map iterator loop should become structured binding range loop");
+    require(contains(result.modernCode, "std::cout << key << value << '\\n';"),
+            "simple std::endl output should become newline character");
+    require(!contains(result.modernCode, "std::endl"), "simple endl should not remain");
+    require(hasAppliedRule(result, "Map iterator loop to structured binding"), "map iterator rewrite should be tracked");
+    require(hasAppliedRule(result, "Stream newline cleanup") || hasAppliedRule(result, "Map iterator loop to structured binding"),
+            "newline cleanup should be tracked by polish or loop rewrite");
 }
 
 void testExplicitMutableIteratorLoopModernizes()
@@ -3082,6 +3251,12 @@ int main(int argc, char** argv)
     testValueTypePointerOperationScannerRemovesPointerLeftovers();
     testValueTypeNullptrEqualityBecomesValueStateCheck();
     testEmptyCleanupBlockAfterValueTypeModernizationIsRemoved();
+    testVectorMemberGetterCascadesToContainerReference();
+    testVectorRawBufferGetterUsesDataOnlyWhenIntentIsClear();
+    testRuntimeVectorGetterIsNotConstexpr();
+    testMalformedEmptyDestructorBlocksAreRemoved();
+    testContainerPolishModernizesInitializerAndMapInsert();
+    testMapIteratorLoopUsesStructuredBindingAndNewline();
     testExplicitMutableIteratorLoopModernizes();
     testIteratorLoopWithEraseIsPreservedWithWarning();
     testVectorGrowthEmulationCleanupModernizesAppend();

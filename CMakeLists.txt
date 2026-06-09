@@ -34,6 +34,8 @@ add_library(ModernCppConverterCore
     src/converter/DependentUsageRewritePass.cpp
     src/converter/ImpactCascadingCleanupPass.cpp
     src/converter/IncludeManager.cpp
+    src/converter/MemberApiCascadePass.cpp
+    src/converter/ModernizationPolishPass.cpp
     src/converter/OfflineModernizationPipeline.cpp
     src/converter/OrphanedGrowthSymbolCleanupPass.cpp
     src/converter/OrphanedTempBufferLoopCleanupPass.cpp
@@ -79,6 +81,12 @@ add_executable(ModernCppConverter
     src/main.cpp
     src/app/MainWindow.cpp
     src/app/MainWindow.h
+    src/editor/CppCodeEditor.cpp
+    src/editor/CppCodeEditor.h
+    src/editor/CppSyntaxHighlighter.cpp
+    src/editor/CppSyntaxHighlighter.h
+    src/editor/LineNumberArea.cpp
+    src/editor/LineNumberArea.h
 )
 
 target_link_libraries(ModernCppConverter

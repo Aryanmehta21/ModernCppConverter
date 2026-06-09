@@ -4,6 +4,7 @@
 #include "backend/BackendConfig.h"
 #include "converter/CompileVerifier.h"
 #include "converter/RuleBasedConverterEngine.h"
+#include "editor/CppCodeEditor.h"
 #include "repository/RepositoryCloneService.h"
 #include "repository/RepositoryModernizationService.h"
 
@@ -42,7 +43,15 @@
 
 namespace
 {
-QPlainTextEdit* createCodeEditor(const QString& placeholder, bool readOnly)
+CppCodeEditor* createCppCodeEditor(const QString& placeholder, bool readOnly)
+{
+    auto* editor = new CppCodeEditor;
+    editor->setPlaceholderText(placeholder);
+    editor->setReadOnly(readOnly);
+    return editor;
+}
+
+QPlainTextEdit* createPlainTextEditor(const QString& placeholder, bool readOnly)
 {
     auto* editor = new QPlainTextEdit;
     editor->setPlaceholderText(placeholder);
@@ -221,11 +230,11 @@ QWidget* MainWindow::createCodeConverterTab()
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(8);
 
-    inputEditor_ = createCodeEditor("Paste legacy C++ code here...", false);
-    outputEditor_ = createCodeEditor("Modernized code will appear here...", true);
-    detailsEditor_ = createCodeEditor("Conversion details will appear here...", true);
-    explanationEditor_ = createCodeEditor("Modern C++ explanation will appear here...", true);
-    compileVerificationEditor_ = createCodeEditor("Compile verification results will appear here...", true);
+    inputEditor_ = createCppCodeEditor("Paste legacy C++ code here...", false);
+    outputEditor_ = createCppCodeEditor("Modernized code will appear here...", true);
+    detailsEditor_ = createPlainTextEditor("Conversion details will appear here...", true);
+    explanationEditor_ = createPlainTextEditor("Modern C++ explanation will appear here...", true);
+    compileVerificationEditor_ = createPlainTextEditor("Compile verification results will appear here...", true);
 
     auto* codeSplitter = new QSplitter(Qt::Horizontal);
     codeSplitter->addWidget(labeledPanel("Input Code", inputEditor_));
@@ -290,6 +299,20 @@ QWidget* MainWindow::createOptionsPanel()
     advancedLayout->addWidget(new QLabel("Custom modernization instruction"));
     advancedLayout->addWidget(customInstructionEdit_);
     contentLayout->addWidget(advancedGroup);
+
+    QVBoxLayout* editorLayout = nullptr;
+    auto* editorGroup = createOptionGroup("Editor Settings", editorLayout);
+    editorAutoIndentCheckBox_ = addOption(editorLayout, "Auto-indent enabled");
+    editorAutoCloseBracketsCheckBox_ = addOption(editorLayout, "Auto-close brackets enabled");
+    editorAutoIndentCheckBox_->setChecked(true);
+    editorAutoCloseBracketsCheckBox_->setChecked(true);
+    if (inputEditor_ != nullptr) {
+        connect(editorAutoIndentCheckBox_, &QCheckBox::toggled, inputEditor_, &CppCodeEditor::setAutoIndentEnabled);
+        connect(editorAutoCloseBracketsCheckBox_, &QCheckBox::toggled, inputEditor_, &CppCodeEditor::setAutoCloseBracketsEnabled);
+        inputEditor_->setAutoIndentEnabled(editorAutoIndentCheckBox_->isChecked());
+        inputEditor_->setAutoCloseBracketsEnabled(editorAutoCloseBracketsCheckBox_->isChecked());
+    }
+    contentLayout->addWidget(editorGroup);
 
     QVBoxLayout* cxx11Layout = nullptr;
     auto* cxx11Group = createOptionGroup("C++11", cxx11Layout);
@@ -385,7 +408,7 @@ QWidget* MainWindow::createRepositoryPanel()
     auto* openReportButton = new QPushButton("Open Report Folder");
 
     repositoryStatusLabel_ = new QLabel("Repository mode ready");
-    repositoryReportEditor_ = createCodeEditor("Repository modernization status and report path will appear here...", true);
+    repositoryReportEditor_ = createPlainTextEditor("Repository modernization status and report path will appear here...", true);
 
     sourceLayout->addWidget(new QLabel("GitHub repository URL"));
     sourceLayout->addWidget(repositoryUrlEdit_);
@@ -430,7 +453,7 @@ QWidget* MainWindow::createDiagnosticsPanel()
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(8);
 
-    diagnosticsEditor_ = createCodeEditor("Application logs, backend status, compiler output, and conversion metadata will appear here...", true);
+    diagnosticsEditor_ = createPlainTextEditor("Application logs, backend status, compiler output, and conversion metadata will appear here...", true);
     layout->addWidget(labeledPanel("Logs / Diagnostics", diagnosticsEditor_));
     return panel;
 }
