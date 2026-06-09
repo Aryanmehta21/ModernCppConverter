@@ -32,14 +32,21 @@ add_library(ModernCppConverterCore
     src/converter/CompilerDiagnosticCleanupPass.cpp
     src/converter/CompileVerifier.cpp
     src/converter/DependentUsageRewritePass.cpp
+    src/converter/FilePointerModernizationPass.cpp
     src/converter/ImpactCascadingCleanupPass.cpp
     src/converter/IncludeManager.cpp
     src/converter/MemberApiCascadePass.cpp
     src/converter/ModernizationPolishPass.cpp
     src/converter/OfflineModernizationPipeline.cpp
+    src/converter/OwnershipGraphAnalyzer.cpp
+    src/converter/OwnershipGraphModernizationPass.cpp
+    src/converter/OwnershipSanityScanner.cpp
     src/converter/OrphanedGrowthSymbolCleanupPass.cpp
     src/converter/OrphanedTempBufferLoopCleanupPass.cpp
     src/converter/SafeReplacementEngine.cpp
+    src/converter/ScopeAwareSymbolTable.cpp
+    src/converter/ScopeLeakValidationPass.cpp
+    src/converter/SmartPointerCollectionPropagationPass.cpp
     src/converter/StructuralAnalyzers.cpp
     src/converter/StructuralModernizationEngine.cpp
     src/converter/TokenBasedStructureAnalyzer.cpp

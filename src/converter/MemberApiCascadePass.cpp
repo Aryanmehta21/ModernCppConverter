@@ -2,6 +2,7 @@
 
 #include "converter/IncludeManager.h"
 #include "converter/SafeReplacementEngine.h"
+#include "converter/StructuralAnalyzers.h"
 
 #include <algorithm>
 #include <cctype>
@@ -245,8 +246,7 @@ std::string rewriteVectorSizeGetters(std::string code,
         const std::string functionName = lowercase(match[2].str());
         const std::string returned = match[3].str();
         const bool countLike = functionName.find("count") != std::string::npos
-            || functionName.find("size") != std::string::npos
-            || functionName.find("length") != std::string::npos;
+            || functionName.find("size") != std::string::npos;
         const bool alreadyVectorSize = std::regex_match(returned,
                                                         std::regex(escapeRegex(record.symbolName) + R"(\.size\s*\(\s*\))"));
         if (!countLike && !alreadyVectorSize) {
@@ -320,6 +320,33 @@ std::string rewriteStringGetters(std::string code,
 
     return code;
 }
+
+template <typename RewriteFunction>
+std::string rewriteClassForRecord(std::string code,
+                                  const TypeChangeRecord& record,
+                                  const RewriteFunction& rewriteFunction)
+{
+    if (!record.isClassMember || record.scopeName.empty()) {
+        return code;
+    }
+
+    const ClassResourceAnalyzer analyzer;
+    const std::vector<ClassBlock> classes = analyzer.analyzeClasses(code);
+    for (auto iterator = classes.rbegin(); iterator != classes.rend(); ++iterator) {
+        if (iterator->name != record.scopeName) {
+            continue;
+        }
+
+        std::string classText = code.substr(iterator->start, iterator->end - iterator->start);
+        const std::string rewrittenClassText = rewriteFunction(std::move(classText));
+        if (rewrittenClassText != code.substr(iterator->start, iterator->end - iterator->start)) {
+            code.replace(iterator->start, iterator->end - iterator->start, rewrittenClassText);
+        }
+        break;
+    }
+
+    return code;
+}
 } // namespace
 
 std::string MemberApiCascadePass::rewrite(const std::string& code,
@@ -331,11 +358,16 @@ std::string MemberApiCascadePass::rewrite(const std::string& code,
 
     for (const TypeChangeRecord& record : context.typeChanges()) {
         if (isVectorRecord(record)) {
-            updated = rewriteWholeVectorGetters(std::move(updated), record, changes, changed);
-            updated = rewriteVectorIndexAccessors(std::move(updated), record, changes, changed);
-            updated = rewriteVectorSizeGetters(std::move(updated), record, changes, changed);
+            updated = rewriteClassForRecord(std::move(updated), record, [&](std::string classText) {
+                classText = rewriteWholeVectorGetters(std::move(classText), record, changes, changed);
+                classText = rewriteVectorIndexAccessors(std::move(classText), record, changes, changed);
+                classText = rewriteVectorSizeGetters(std::move(classText), record, changes, changed);
+                return classText;
+            });
         } else if (isStringRecord(record)) {
-            updated = rewriteStringGetters(std::move(updated), record, changes, changed);
+            updated = rewriteClassForRecord(std::move(updated), record, [&](std::string classText) {
+                return rewriteStringGetters(std::move(classText), record, changes, changed);
+            });
         }
     }
 

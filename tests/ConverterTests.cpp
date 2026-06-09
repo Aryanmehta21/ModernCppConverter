@@ -8,6 +8,11 @@
 #include "converter/ModernCppExplanationGenerator.h"
 #include "converter/OrphanedGrowthSymbolCleanupPass.h"
 #include "converter/OrphanedTempBufferLoopCleanupPass.h"
+#include "converter/OwnershipGraphAnalyzer.h"
+#include "converter/OwnershipSanityScanner.h"
+#include "converter/ScopeAwareSymbolTable.h"
+#include "converter/ScopeLeakValidationPass.h"
+#include "converter/SmartPointerCollectionPropagationPass.h"
 #include "converter/AstRepresentation.h"
 #include "converter/RawTextRepresentation.h"
 #include "converter/RuleBasedConverterEngine.h"
@@ -146,6 +151,8 @@ bool hasSuggestionRule(const ConversionResult& result, const std::string& ruleNa
         return !change.applied && contains(change.ruleName, ruleName);
     });
 }
+
+ModernizationOptions structuralOptions();
 
 void testNullConversion()
 {
@@ -664,6 +671,482 @@ void testGeneratedOwnershipSample()
         require(!(contains(change.ruleName, "Raw pointer") && !change.applied),
                 "converted generated ownership sample should not include duplicate raw pointer suggestions");
     }
+}
+
+void testOwnershipGraphAnalyzerClassifiesPointerCollection()
+{
+    const std::string legacy =
+        "struct Node {};\n"
+        "class Owner\n"
+        "{\n"
+        "public:\n"
+        "    explicit Owner(int count)\n"
+        "    {\n"
+        "        nodes = new Node*[count];\n"
+        "        for (int i = 0; i < count; ++i)\n"
+        "        {\n"
+        "            nodes[i] = new Node();\n"
+        "        }\n"
+        "    }\n"
+        "    ~Owner()\n"
+        "    {\n"
+        "        for (int i = 0; i < 4; ++i)\n"
+        "        {\n"
+        "            delete nodes[i];\n"
+        "        }\n"
+        "        delete[] nodes;\n"
+        "    }\n"
+        "private:\n"
+        "    Node** nodes;\n"
+        "};\n";
+
+    const OwnershipGraphAnalyzer analyzer;
+    const std::vector<OwnershipGraphNode> nodes = analyzer.analyze(legacy);
+
+    require(std::any_of(nodes.begin(), nodes.end(), [](const OwnershipGraphNode& node) {
+                return node.storageName == "nodes"
+                    && node.elementType == "Node"
+                    && node.classification == OwnershipClassification::SequentialCollectionOwnership
+                    && node.isPointerToPointer;
+            }),
+            "ownership analyzer should classify pointer-to-pointer ownership collections");
+}
+
+void testPointerToPointerCollectionModernizesToVectorUniquePtr()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "struct Node\n"
+        "{\n"
+        "    int value{};\n"
+        "};\n"
+        "class Owner\n"
+        "{\n"
+        "public:\n"
+        "    explicit Owner(int count)\n"
+        "        : count(count)\n"
+        "    {\n"
+        "        nodes = new Node*[count];\n"
+        "        for (int i = 0; i < count; ++i)\n"
+        "        {\n"
+        "            nodes[i] = new Node();\n"
+        "        }\n"
+        "    }\n"
+        "    ~Owner()\n"
+        "    {\n"
+        "        for (int i = 0; i < count; ++i)\n"
+        "        {\n"
+        "            delete nodes[i];\n"
+        "        }\n"
+        "        delete[] nodes;\n"
+        "    }\n"
+        "private:\n"
+        "    int count;\n"
+        "    Node** nodes;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<std::unique_ptr<Node>> nodes;"),
+            "pointer-to-pointer storage should become vector<unique_ptr>");
+    require(contains(result.modernCode, "nodes.reserve(count);"), "outer pointer array allocation should become vector reserve");
+    require(contains(result.modernCode, "nodes.push_back(std::make_unique<Node>());"),
+            "inner allocations should become make_unique push_back");
+    require(!contains(result.modernCode, "Node** nodes"), "raw pointer-to-pointer member should be removed");
+    require(!contains(result.modernCode, "delete nodes[i]"), "nested delete loop should be removed");
+    require(!contains(result.modernCode, "delete[] nodes"), "outer delete[] should be removed");
+    require(!contains(result.modernCode, "~Owner()"), "cleanup-only destructor should be removed after ownership graph modernization");
+    require(hasAppliedRule(result, "Pointer-to-pointer ownership collection to std::vector<std::unique_ptr>"),
+            "pointer-to-pointer ownership conversion should be tracked");
+    require(hasAppliedRule(result, "Nested delete loop elimination"), "nested delete loop removal should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "pointer-to-pointer ownership sample should pass syntax verification");
+    }
+}
+
+void testFixedPointerArrayModernizesToArrayUniquePtr()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "struct Widget {};\n"
+        "class FixedOwner\n"
+        "{\n"
+        "public:\n"
+        "    FixedOwner()\n"
+        "    {\n"
+        "        for (int i = 0; i < 3; ++i)\n"
+        "        {\n"
+        "            slots[i] = new Widget();\n"
+        "        }\n"
+        "    }\n"
+        "    ~FixedOwner()\n"
+        "    {\n"
+        "        for (int i = 0; i < 3; ++i)\n"
+        "        {\n"
+        "            delete slots[i];\n"
+        "        }\n"
+        "    }\n"
+        "private:\n"
+        "    Widget* slots[3];\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::array<std::unique_ptr<Widget>, 3> slots;"),
+            "fixed owning pointer array should become array<unique_ptr>");
+    require(contains(result.modernCode, "slots[i] = std::make_unique<Widget>();"),
+            "fixed pointer array element allocation should become make_unique");
+    require(!contains(result.modernCode, "Widget* slots[3]"), "raw fixed pointer array should be removed");
+    require(!contains(result.modernCode, "delete slots[i]"), "fixed array delete loop should be removed");
+    require(hasAppliedRule(result, "Fixed pointer array ownership to std::array<std::unique_ptr>"),
+            "fixed array ownership conversion should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "fixed pointer array ownership sample should pass syntax verification");
+    }
+}
+
+void testOwningRawPointerVectorModernizesToVectorUniquePtr()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <vector>\n"
+        "struct Entry {};\n"
+        "class EntrySet\n"
+        "{\n"
+        "public:\n"
+        "    void add()\n"
+        "    {\n"
+        "        entries.push_back(new Entry());\n"
+        "    }\n"
+        "    ~EntrySet()\n"
+        "    {\n"
+        "        for (auto entry : entries)\n"
+        "        {\n"
+        "            delete entry;\n"
+        "        }\n"
+        "    }\n"
+        "private:\n"
+        "    std::vector<Entry*> entries;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<std::unique_ptr<Entry>> entries;"),
+            "vector of owning raw pointers should become vector<unique_ptr>");
+    require(contains(result.modernCode, "entries.push_back(std::make_unique<Entry>());"),
+            "new object insertion should become make_unique");
+    require(!contains(result.modernCode, "std::vector<Entry*>"), "raw pointer vector type should be removed");
+    require(!contains(result.modernCode, "delete entry"), "delete loop should be removed");
+    require(hasAppliedRule(result, "Owning raw pointer container to std::vector<std::unique_ptr>"),
+            "owning raw pointer vector conversion should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "owning raw pointer vector sample should pass syntax verification");
+    }
+}
+
+void testStringLikeOwningClassProducesSuggestionOnly()
+{
+    const RuleBasedConverterEngine converter;
+    const ConversionResult result = converter.convert(
+        "#include <cstring>\n"
+        "class TextValue\n"
+        "{\n"
+        "public:\n"
+        "    explicit TextValue(const char* input)\n"
+        "    {\n"
+        "        data = new char[std::strlen(input) + 1];\n"
+        "        std::strcpy(data, input);\n"
+        "    }\n"
+        "    ~TextValue()\n"
+        "    {\n"
+        "        delete[] data;\n"
+        "    }\n"
+        "    const char* c_str() const { return data; }\n"
+        "private:\n"
+        "    char* data;\n"
+        "};\n",
+        structuralOptions());
+
+    require(contains(result.modernCode, "char* data;"), "string-like class redesign should not be auto-applied");
+    require(contains(result.modernCode, "delete[] data;"), "manual string buffer cleanup should remain for suggestion-only redesign");
+    require(hasSuggestionRule(result, "String ownership pattern detector"), "string ownership class should produce suggestion");
+}
+
+void testOwnershipSanityScannerRemovesPartialSmartCollectionCleanup()
+{
+    TransformationContext context;
+    context.registerTypeChange(TypeChangeRecord{
+        "items",
+        "Item**",
+        "std::vector<std::unique_ptr<Item>>",
+        "Owner",
+        true,
+        "Pointer-to-pointer ownership collection to std::vector<std::unique_ptr>",
+        {"remove nested delete loops"},
+        {},
+        false,
+    });
+
+    const std::string code =
+        "#include <memory>\n"
+        "#include <vector>\n"
+        "struct Item {};\n"
+        "struct Owner\n"
+        "{\n"
+        "    std::vector<std::unique_ptr<Item>> items;\n"
+        "    ~Owner()\n"
+        "    {\n"
+        "        for (int i = 0; i < 4; ++i)\n"
+        "        {\n"
+        "            delete items[i];\n"
+        "        }\n"
+        "        delete[] items;\n"
+        "    }\n"
+        "};\n";
+
+    std::vector<ConversionChange> changes;
+    const OwnershipSanityScanner scanner;
+    const std::string fixed = scanner.rewrite(code, context, changes);
+
+    require(!contains(fixed, "delete items[i]"), "sanity scanner should remove nested delete for smart collection");
+    require(!contains(fixed, "delete[] items"), "sanity scanner should remove delete[] for smart collection");
+    require(hasAppliedRule(changes, "Ownership sanity scanner"), "ownership sanity cleanup should be tracked");
+}
+
+void testUniquePtrCollectionTraversalPreservesIndexSafely()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <iostream>\n"
+        "#include <memory>\n"
+        "#include <vector>\n"
+        "struct Item { void print() const {} };\n"
+        "void printItems(const std::vector<std::unique_ptr<Item>>& items)\n"
+        "{\n"
+        "    for (int i = 0; i < items.size(); ++i)\n"
+        "    {\n"
+        "        if (items[i] != nullptr)\n"
+        "        {\n"
+        "            std::cout << i << std::endl;\n"
+        "            items[i]->print();\n"
+        "        }\n"
+        "    }\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::size_t index = 0;"), "unique_ptr traversal should preserve index when it is used");
+    require(contains(result.modernCode, "for (const auto& item : items)"), "unique_ptr traversal should become range-based loop");
+    require(contains(result.modernCode, "if (item)"), "nullptr check should become smart pointer truthiness");
+    require(contains(result.modernCode, "item->print();"), "element access should use the unique_ptr loop variable");
+    require(!contains(result.modernCode, "items[i]"), "indexed smart pointer access should be removed");
+    require(hasAppliedRule(result, "Unique_ptr collection loop to range-based for"), "unique_ptr loop polish should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "unique_ptr traversal polish should pass syntax verification");
+    }
+}
+
+void testUniquePtrCollectionPushBackDoesNotBecomeInitializerList()
+{
+    const RuleBasedConverterEngine converter;
+    const ConversionResult result = converter.convert(
+        "#include <memory>\n"
+        "#include <vector>\n"
+        "struct Item {};\n"
+        "void makeItems()\n"
+        "{\n"
+        "    std::vector<std::unique_ptr<Item>> items;\n"
+        "    items.push_back(std::make_unique<Item>());\n"
+        "    items.push_back(std::make_unique<Item>());\n"
+        "}\n",
+        structuralOptions());
+
+    require(contains(result.modernCode, "std::vector<std::unique_ptr<Item>> items;"),
+            "unique_ptr vector declaration should remain as a normal declaration");
+    require(contains(result.modernCode, "items.push_back(std::make_unique<Item>());"),
+            "unique_ptr insertions should remain push_back(make_unique)");
+    require(!contains(result.modernCode, "std::vector<std::unique_ptr<Item>> items{"),
+            "move-only unique_ptr collection should not become initializer-list construction");
+}
+
+void testSmartPointerCollectionPropagationFixesRawNewAndGets()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <array>\n"
+        "#include <memory>\n"
+        "struct Base\n"
+        "{\n"
+        "    virtual void run();\n"
+        "};\n"
+        "struct Derived : public Base\n"
+        "{\n"
+        "    void run();\n"
+        "};\n"
+        "void inspect(Base* item);\n"
+        "void makeItems()\n"
+        "{\n"
+        "    std::array<std::unique_ptr<Base>, 2> items;\n"
+        "    items[0] = std::make_unique<Derived>();\n"
+        "    items[1] = new Derived();\n"
+        "    inspect(items[1]);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "items[1] = std::make_unique<Derived>();"),
+            "raw new assigned to unique_ptr array element should become make_unique");
+    require(!contains(result.modernCode, "items[1] = new Derived"), "raw new assignment should not remain");
+    require(contains(result.modernCode, "inspect(items[1].get());"), "raw pointer callsite should receive .get()");
+    require(contains(result.modernCode, "virtual ~Base() = default;"), "polymorphic base should gain virtual destructor");
+    require(contains(result.modernCode, "void run() override;"), "derived override should be marked");
+    require(hasAppliedRule(result, "Smart pointer collection raw allocation to make_unique"),
+            "smart pointer allocation propagation should be tracked");
+    require(hasAppliedRule(result, "Smart pointer collection raw pointer callsite to get"),
+            "raw pointer callsite propagation should be tracked");
+    require(hasAppliedRule(result, "Add virtual destructor for polymorphic base"),
+            "virtual destructor modernization should be tracked");
+    require(hasAppliedRule(result, "Add override"),
+            "override modernization should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "smart pointer collection propagation sample should pass syntax verification");
+    }
+}
+
+void testSmartPointerVectorAppendAndPredicateUseMakeUniqueAndGet()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <memory>\n"
+        "#include <vector>\n"
+        "struct Item { bool ready() const { return true; } };\n"
+        "bool isReady(Item* item) { return item != nullptr && item->ready(); }\n"
+        "void build(std::vector<std::unique_ptr<Item>>& items)\n"
+        "{\n"
+        "    items.push_back(new Item());\n"
+        "    if (isReady(items[0]))\n"
+        "    {\n"
+        "    }\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "items.push_back(std::make_unique<Item>());"),
+            "raw pointer append into unique_ptr vector should use make_unique");
+    require(!contains(result.modernCode, "push_back(new Item"), "raw pointer append should not remain");
+    require(contains(result.modernCode, "isReady(items[0].get())"), "helper predicate expecting raw pointer should receive .get()");
+    require(hasAppliedRule(result, "Smart pointer collection raw allocation to make_unique"),
+            "vector append make_unique propagation should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "unique_ptr vector append propagation should pass syntax verification");
+    }
+}
+
+void testUniquePtrCollectionCountLoopBecomesCountIf()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.useLambdas = true;
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <memory>\n"
+        "#include <vector>\n"
+        "struct Item { bool enabled() const { return true; } };\n"
+        "bool isEnabled(Item* item) { return item != nullptr && item->enabled(); }\n"
+        "int countEnabled(const std::vector<std::unique_ptr<Item>>& items)\n"
+        "{\n"
+        "    int enabled = 0;\n"
+        "    for (std::size_t i = 0; i < items.size(); ++i)\n"
+        "    {\n"
+        "        if (isEnabled(items[i]))\n"
+        "        {\n"
+        "            ++enabled;\n"
+        "        }\n"
+        "    }\n"
+        "    return enabled;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "#include <algorithm>"), "count_if modernization should add algorithm include");
+    require(contains(result.modernCode, "auto enabled = std::count_if(items.begin(), items.end(), [](const auto& item)"),
+            "simple count loop over unique_ptr collection should become count_if");
+    require(contains(result.modernCode, "return isEnabled(item.get());"), "count_if predicate should pass raw pointer view to helper");
+    require(!contains(result.modernCode, "items[i]"), "indexing should be removed from count loop");
+    require(hasAppliedRule(result, "Smart pointer collection count loop to count_if"),
+            "count loop modernization should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "count_if unique_ptr sample should pass syntax verification");
+    }
+}
+
+void testFilePointerWriteModernizesToOfstream()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstdio>\n"
+        "void writeText(const char* path)\n"
+        "{\n"
+        "    FILE* file = fopen(path, \"w\");\n"
+        "    if (file == nullptr) { return; }\n"
+        "    fprintf(file, \"ok\\n\");\n"
+        "    fclose(file);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "#include <fstream>"), "FILE* RAII modernization should add fstream include");
+    require(contains(result.modernCode, "std::ofstream file(path);"), "simple write FILE* should become ofstream");
+    require(contains(result.modernCode, "if (!file) { return; }"), "null check should become stream state check");
+    require(contains(result.modernCode, "file << \"ok\\n\";"), "simple fprintf literal should become stream output");
+    require(!contains(result.modernCode, "fclose(file)"), "manual fclose should be removed");
+    require(hasAppliedRule(result, "FILE pointer to fstream RAII"), "FILE* RAII change should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "FILE* RAII sample should pass syntax verification");
+    }
+}
+
+void testRepositoryModeUsesSmartPointerPropagationPass()
+{
+    const std::filesystem::path root = makeTempDirectory("moderncpp_repo_smart_propagation");
+    writeTextFile(root / "src" / "smart.cpp",
+        "#include <vector>\n"
+        "struct Item {};\n"
+        "void observe(Item* item);\n"
+        "void build()\n"
+        "{\n"
+        "    std::vector<std::unique_ptr<Item>> items;\n"
+        "    items.push_back(new Item());\n"
+        "    observe(items[0]);\n"
+        "}\n");
+
+    RepositoryModernizationOptions options;
+    options.repositoryUrl = "https://github.com/example/smart-propagation";
+    options.outputWorkspaceFolder = root.parent_path();
+    options.modernizationLevel = OfflineModernizationLevel::Balanced;
+    options.compileVerificationEnabled = false;
+
+    RepositoryModernizationService service(std::make_unique<RuleBasedConverterEngine>());
+    const RepositoryModernizationResult result = service.modernizeRepository(options, root);
+    const std::string modernized = readTextFile(root / "src" / "smart.cpp");
+    const std::string report = readTextFile(root / "modernization_report.txt");
+
+    require(result.filesScanned == 1, "repository smart propagation should scan one source file");
+    require(result.filesModified == 1, "repository smart propagation should modify the source file");
+    require(contains(modernized, "items.push_back(std::make_unique<Item>());"),
+            "repository mode should propagate unique_ptr vector append to make_unique");
+    require(contains(modernized, "observe(items[0].get());"),
+            "repository mode should propagate raw pointer observer calls with .get()");
+    require(contains(report, "Smart pointer collection raw allocation to make_unique"),
+            "repository report should include smart pointer allocation propagation");
+    require(contains(report, "Smart pointer collection raw pointer callsite to get"),
+            "repository report should include .get() callsite propagation");
 }
 
 void testOfflineHelperComputationExtractedToLambda()
@@ -1449,6 +1932,126 @@ void testVectorMemberGetterCascadesToContainerReference()
     if (!result.compilerUsed.empty()) {
         require(result.compileVerificationPassed, "vector member getter cascade sample should pass syntax verification");
     }
+}
+
+void testLocalCollectionDoesNotLeakIntoUnrelatedClassGetter()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "class Status\n"
+        "{\n"
+        "public:\n"
+        "    int getLength() const { return length; }\n"
+        "private:\n"
+        "    int length;\n"
+        "};\n\n"
+        "void build(int count)\n"
+        "{\n"
+        "    int* values = new int[count];\n"
+        "    values[0] = 1;\n"
+        "    delete[] values;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "int getLength() const { return length; }"),
+            "unrelated class getter should not reference a local vector from another function");
+    require(!contains(result.modernCode, "return values.size();"),
+            "local collection should not leak into unrelated class API");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed, "scope leak prevention sample should pass syntax verification");
+    }
+}
+
+void testLengthGetterForIndependentMemberIsPreserved()
+{
+    const RuleBasedConverterEngine converter;
+    const ConversionResult result = converter.convert(
+        "struct Item {};\n"
+        "class Store\n"
+        "{\n"
+        "public:\n"
+        "    explicit Store(int count)\n"
+        "        : length(count)\n"
+        "    {\n"
+        "        items = new Item[count];\n"
+        "    }\n"
+        "    int getLength() const { return length; }\n"
+        "    ~Store()\n"
+        "    {\n"
+        "        delete[] items;\n"
+        "    }\n"
+        "private:\n"
+        "    int length;\n"
+        "    Item* items;\n"
+        "};\n",
+        structuralOptions());
+
+    require(contains(result.modernCode, "int getLength() const { return length; }"),
+            "independent length member getter should not be replaced with vector.size()");
+    require(!contains(result.modernCode, "getLength() const { return items.size(); }"),
+            "member API cascade should not guess that length mirrors vector storage");
+}
+
+void testScopeLeakValidatorRepairsWrongInClassSymbolWhenSafe()
+{
+    TransformationContext context;
+    context.registerTypeChange(TypeChangeRecord{
+        "items",
+        "Item*",
+        "std::vector<Item>",
+        "Store",
+        true,
+        "Raw dynamic array to std::vector",
+        {"member API cascade"},
+        {},
+        false,
+    });
+
+    const std::string code =
+        "#include <vector>\n"
+        "struct Item {};\n"
+        "class Store\n"
+        "{\n"
+        "public:\n"
+        "    std::size_t size() const { return localItems.size(); }\n"
+        "private:\n"
+        "    std::vector<Item> items;\n"
+        "};\n"
+        "void unrelated()\n"
+        "{\n"
+        "    std::vector<Item> localItems;\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const ScopeLeakValidationPass validator;
+    const std::string fixed = validator.validate(code,
+                                                 context,
+                                                 "error: use of undeclared identifier 'localItems'",
+                                                 changes);
+
+    require(contains(fixed, "return items.size();"), "scope leak validator should repair to visible member when unambiguous");
+    require(!contains(fixed, "return localItems.size();"), "out-of-scope local reference should be removed");
+    require(hasAppliedRule(changes, "Scope leak validation"), "scope leak repair should be tracked");
+}
+
+void testScopeAwareSymbolTableTracksClassMembers()
+{
+    const ScopeAwareSymbolTable table = ScopeAwareSymbolTable::build(
+        "class Store\n"
+        "{\n"
+        "public:\n"
+        "    void method()\n"
+        "    {\n"
+        "        int localValue = 0;\n"
+        "    }\n"
+        "private:\n"
+        "    int count;\n"
+        "};\n");
+
+    require(table.hasClassMember("Store", "count"), "scope table should track class data members");
+    require(!table.hasClassMember("Store", "localValue"), "scope table should not treat method locals as class members");
 }
 
 void testVectorRawBufferGetterUsesDataOnlyWhenIntentIsClear()
@@ -2937,6 +3540,97 @@ void testRepositoryModeUsesStructuralModernizationPipeline()
     require(std::filesystem::exists(root / "src" / "legacy.cpp.legacy_backup"), "repository structural pipeline should create backup");
 }
 
+void testRepositoryModeUsesOwnershipGraphPipeline()
+{
+    const std::filesystem::path root = makeTempDirectory("moderncpp_repo_ownership_graph");
+    writeTextFile(root / "src" / "ownership.cpp",
+        "struct Node {};\n"
+        "class Owner\n"
+        "{\n"
+        "public:\n"
+        "    explicit Owner(int count)\n"
+        "        : count(count)\n"
+        "    {\n"
+        "        nodes = new Node*[count];\n"
+        "        for (int i = 0; i < count; ++i)\n"
+        "        {\n"
+        "            nodes[i] = new Node();\n"
+        "        }\n"
+        "    }\n"
+        "    ~Owner()\n"
+        "    {\n"
+        "        for (int i = 0; i < count; ++i)\n"
+        "        {\n"
+        "            delete nodes[i];\n"
+        "        }\n"
+        "        delete[] nodes;\n"
+        "    }\n"
+        "private:\n"
+        "    int count;\n"
+        "    Node** nodes;\n"
+        "};\n");
+
+    RepositoryModernizationOptions options;
+    options.repositoryUrl = "https://github.com/example/ownership-graph";
+    options.outputWorkspaceFolder = root.parent_path();
+    options.modernizationLevel = OfflineModernizationLevel::Balanced;
+    options.compileVerificationEnabled = false;
+
+    RepositoryModernizationService service(std::make_unique<RuleBasedConverterEngine>());
+    const RepositoryModernizationResult result = service.modernizeRepository(options, root);
+    const std::string modernized = readTextFile(root / "src" / "ownership.cpp");
+    const std::string report = readTextFile(root / "modernization_report.txt");
+
+    require(result.filesScanned == 1, "repository ownership graph test should scan one source file");
+    require(result.filesModified == 1, "repository ownership graph test should modify the source file");
+    require(contains(modernized, "std::vector<std::unique_ptr<Node>> nodes;"),
+            "repository ownership graph pipeline should convert pointer-to-pointer storage");
+    require(contains(modernized, "nodes.push_back(std::make_unique<Node>());"),
+            "repository ownership graph pipeline should convert owned element allocations");
+    require(!contains(modernized, "delete nodes[i]"), "repository ownership graph pipeline should remove nested delete loop");
+    require(!contains(modernized, "delete[] nodes"), "repository ownership graph pipeline should remove outer delete[]");
+    require(contains(report, "Ownership graph modernization"), "repository report should include ownership graph modernization");
+    require(contains(report, "Nested delete loop elimination"), "repository report should include nested delete loop elimination");
+    require(std::filesystem::exists(root / "src" / "ownership.cpp.legacy_backup"),
+            "repository ownership graph pipeline should create backup");
+}
+
+void testRepositoryModeAppliesScopeLeakValidation()
+{
+    const std::filesystem::path root = makeTempDirectory("moderncpp_repo_scope_validation");
+    writeTextFile(root / "src" / "scope.cpp",
+        "class Metrics\n"
+        "{\n"
+        "public:\n"
+        "    int getLength() const { return length; }\n"
+        "private:\n"
+        "    int length;\n"
+        "};\n"
+        "void build(int count)\n"
+        "{\n"
+        "    int* values = new int[count];\n"
+        "    values[0] = 1;\n"
+        "    delete[] values;\n"
+        "}\n");
+
+    RepositoryModernizationOptions options;
+    options.repositoryUrl = "https://github.com/example/scope-validation";
+    options.outputWorkspaceFolder = root.parent_path();
+    options.modernizationLevel = OfflineModernizationLevel::Balanced;
+    options.compileVerificationEnabled = false;
+
+    RepositoryModernizationService service(std::make_unique<RuleBasedConverterEngine>());
+    const RepositoryModernizationResult result = service.modernizeRepository(options, root);
+    const std::string modernized = readTextFile(root / "src" / "scope.cpp");
+
+    require(result.filesScanned == 1, "repository scope validation should scan one source file");
+    require(contains(modernized, "int getLength() const { return length; }"),
+            "repository scope validation should preserve unrelated class getter");
+    require(!contains(modernized, "return values.size();"),
+            "repository scope validation should prevent local vector leakage into class getter");
+    require(contains(modernized, "std::vector<int> values"), "repository scope fixture should still modernize local array");
+}
+
 void testOfflineModeStillWorks()
 {
     auto backend = std::make_unique<FakeBackendClient>();
@@ -3226,6 +3920,18 @@ int main(int argc, char** argv)
     testDoesNotConvertAmbiguousOwnership();
     testStringViewAppliesOnlyWhenEnabledAndSafe();
     testGeneratedOwnershipSample();
+    testOwnershipGraphAnalyzerClassifiesPointerCollection();
+    testPointerToPointerCollectionModernizesToVectorUniquePtr();
+    testFixedPointerArrayModernizesToArrayUniquePtr();
+    testOwningRawPointerVectorModernizesToVectorUniquePtr();
+    testStringLikeOwningClassProducesSuggestionOnly();
+    testOwnershipSanityScannerRemovesPartialSmartCollectionCleanup();
+    testUniquePtrCollectionTraversalPreservesIndexSafely();
+    testUniquePtrCollectionPushBackDoesNotBecomeInitializerList();
+    testSmartPointerCollectionPropagationFixesRawNewAndGets();
+    testSmartPointerVectorAppendAndPredicateUseMakeUniqueAndGet();
+    testUniquePtrCollectionCountLoopBecomesCountIf();
+    testFilePointerWriteModernizesToOfstream();
     testOfflineHelperComputationExtractedToLambda();
     testOfflineFunctorToLambda();
     testOfflineAutoAndConstexprUsage();
@@ -3252,6 +3958,10 @@ int main(int argc, char** argv)
     testValueTypeNullptrEqualityBecomesValueStateCheck();
     testEmptyCleanupBlockAfterValueTypeModernizationIsRemoved();
     testVectorMemberGetterCascadesToContainerReference();
+    testLocalCollectionDoesNotLeakIntoUnrelatedClassGetter();
+    testLengthGetterForIndependentMemberIsPreserved();
+    testScopeLeakValidatorRepairsWrongInClassSymbolWhenSafe();
+    testScopeAwareSymbolTableTracksClassMembers();
     testVectorRawBufferGetterUsesDataOnlyWhenIntentIsClear();
     testRuntimeVectorGetterIsNotConstexpr();
     testMalformedEmptyDestructorBlocksAreRemoved();
@@ -3294,6 +4004,9 @@ int main(int argc, char** argv)
     testAiStyleStringViewParameterExplicitlyOwnsStringMember();
     testRepositoryModeUsesImprovedOfflinePipeline();
     testRepositoryModeUsesStructuralModernizationPipeline();
+    testRepositoryModeUsesOwnershipGraphPipeline();
+    testRepositoryModeAppliesScopeLeakValidation();
+    testRepositoryModeUsesSmartPointerPropagationPass();
     testOfflineModeStillWorks();
     testBackendHealthCheckParsing();
     testBackendUnavailableFallback();

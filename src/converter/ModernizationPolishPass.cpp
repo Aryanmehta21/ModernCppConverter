@@ -464,6 +464,106 @@ std::string modernizeGenericIteratorLoops(std::string code,
     return code;
 }
 
+std::vector<std::string> uniquePtrVectorNames(const std::string& code)
+{
+    std::vector<std::string> names;
+    const std::regex declarationPattern(R"((?:const\s+)?std::vector\s*<\s*std::unique_ptr\s*<[^;\n{}]+>\s*>\s*(?:const\s*)?(?:[&*]\s*)?([A-Za-z_]\w*))");
+    for (std::sregex_iterator iterator(code.begin(), code.end(), declarationPattern), end; iterator != end; ++iterator) {
+        const std::string name = (*iterator)[1].str();
+        if (std::find(names.begin(), names.end(), name) == names.end()) {
+            names.push_back(name);
+        }
+    }
+    return names;
+}
+
+std::string modernizeUniquePtrCollectionIndexLoops(std::string code,
+                                                   const ModernizationOptions& options,
+                                                   std::vector<ConversionChange>& changes)
+{
+    if (!options.useRangeBasedFor) {
+        return code;
+    }
+
+    for (const std::string& collection : uniquePtrVectorNames(code)) {
+        const std::regex loopPattern(
+            R"((^[ \t]*)for\s*\(\s*(?:int|size_t|std::size_t)\s+([A-Za-z_]\w*)\s*=\s*0\s*;\s*\2\s*<\s*)"
+                + escapeRegex(collection)
+                + R"(\.size\s*\(\s*\)\s*;\s*(?:\+\+\2|\2\+\+)\s*\)\s*\n\1\{\s*\n([\s\S]*?)\n\1\})",
+            std::regex::ECMAScript | std::regex::multiline);
+
+        std::smatch match;
+        std::string search = code;
+        std::size_t consumed = 0;
+        while (std::regex_search(search, match, loopPattern)) {
+            const std::string indent = match[1].str();
+            const std::string indexName = match[2].str();
+            std::string body = match[3].str();
+            if (body.find("delete ") != std::string::npos
+                || body.find(collection + ".erase") != std::string::npos
+                || body.find(collection + ".insert") != std::string::npos) {
+                consumed += static_cast<std::size_t>(match.position() + match.length());
+                search = match.suffix().str();
+                continue;
+            }
+
+            const std::string indexedExpression = escapeRegex(collection) + R"(\s*\[\s*)" + escapeRegex(indexName) + R"(\s*\])";
+            const std::string bodyWithoutIndexed = std::regex_replace(body, std::regex(indexedExpression), "");
+            const bool needsIndex = std::regex_search(bodyWithoutIndexed, std::regex("\\b" + escapeRegex(indexName) + "\\b"));
+            std::string rewrittenBody = body;
+            rewrittenBody = std::regex_replace(rewrittenBody,
+                                               std::regex(indexedExpression + R"(\s*!=\s*nullptr)"),
+                                               "item");
+            rewrittenBody = std::regex_replace(rewrittenBody,
+                                               std::regex(indexedExpression + R"(\s*==\s*nullptr)"),
+                                               "!item");
+            rewrittenBody = std::regex_replace(rewrittenBody,
+                                               std::regex(indexedExpression + R"(\s*->)"),
+                                               "item->");
+            rewrittenBody = std::regex_replace(rewrittenBody,
+                                               std::regex(indexedExpression),
+                                               "item");
+            if (needsIndex) {
+                rewrittenBody = std::regex_replace(rewrittenBody,
+                                                   std::regex("\\b" + escapeRegex(indexName) + "\\b"),
+                                                   "index");
+            }
+
+            if (std::regex_search(rewrittenBody, std::regex(indexedExpression))) {
+                consumed += static_cast<std::size_t>(match.position() + match.length());
+                search = match.suffix().str();
+                continue;
+            }
+
+            std::ostringstream replacement;
+            if (needsIndex) {
+                replacement << indent << "std::size_t index = 0;\n";
+            }
+            replacement << indent << "for (const auto& item : " << collection << ")\n"
+                        << indent << "{\n"
+                        << rewrittenBody;
+            if (needsIndex) {
+                replacement << "\n" << indent << "    ++index;";
+            }
+            replacement << "\n" << indent << "}";
+
+            const std::string replacementText = replacement.str();
+            code.replace(consumed + static_cast<std::size_t>(match.position()),
+                         static_cast<std::size_t>(match.length()),
+                         replacementText);
+            addAppliedChange(changes,
+                             "Unique_ptr collection loop to range-based for",
+                             trim(match[0].str()),
+                             trim(replacementText),
+                             "Converted index traversal over a vector of unique_ptr into range traversal while preserving index use when needed.");
+            consumed += static_cast<std::size_t>(match.position()) + replacementText.size();
+            search = code.substr(consumed);
+        }
+    }
+
+    return code;
+}
+
 std::string modernizeVectorPushBackInitializers(std::string code, std::vector<ConversionChange>& changes)
 {
     const std::vector<std::string> lines = splitLines(code);
@@ -482,6 +582,10 @@ std::string modernizeVectorPushBackInitializers(std::string code, std::vector<Co
         const std::string indent = declarationMatch[1].str();
         const std::string type = trim(declarationMatch[2].str());
         const std::string name = declarationMatch[3].str();
+        if (type.find("unique_ptr") != std::string::npos) {
+            rewritten.push_back(lines[index]);
+            continue;
+        }
         std::vector<std::string> values;
         std::size_t scan = index + 1;
         const std::regex pushPattern("^" + escapeRegex(indent) + escapeRegex(name)
@@ -489,6 +593,11 @@ std::string modernizeVectorPushBackInitializers(std::string code, std::vector<Co
         for (; scan < lines.size(); ++scan) {
             std::smatch pushMatch;
             if (!std::regex_match(lines[scan], pushMatch, pushPattern)) {
+                break;
+            }
+            if (pushMatch[1].str().find("std::make_unique") != std::string::npos
+                || pushMatch[1].str().find("std::unique_ptr") != std::string::npos) {
+                values.clear();
                 break;
             }
             values.push_back(trim(pushMatch[1].str()));
@@ -579,6 +688,7 @@ std::string ModernizationPolishPass::rewrite(const std::string& code,
     updated = removeIncorrectRuntimeConstexpr(updated, changes);
 
     if (options.useRangeBasedFor) {
+        updated = modernizeUniquePtrCollectionIndexLoops(std::move(updated), options, changes);
         updated = modernizeMapIteratorLoops(std::move(updated), options, changes);
         updated = modernizeGenericIteratorLoops(std::move(updated), options, changes);
         updated = modernizeRangeLoopsToStructuredBindings(std::move(updated), options, changes);

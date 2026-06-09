@@ -3,6 +3,9 @@
 #include "converter/DependentUsageRewritePass.h"
 #include "converter/OrphanedGrowthSymbolCleanupPass.h"
 #include "converter/OrphanedTempBufferLoopCleanupPass.h"
+#include "converter/OwnershipSanityScanner.h"
+#include "converter/ScopeLeakValidationPass.h"
+#include "converter/SmartPointerCollectionPropagationPass.h"
 #include "converter/VectorParadigmRewritePass.h"
 
 #include <algorithm>
@@ -121,6 +124,17 @@ std::string CompilerDiagnosticCleanupPass::run(const std::string& code,
     updated = orphanedTempBufferLoopCleanupPass.rewrite(updated, context, compilerOutput, changes);
     const VectorParadigmRewritePass vectorParadigmRewritePass;
     updated = vectorParadigmRewritePass.rewrite(updated, context, changes);
+    ModernizationOptions retryOptions;
+    retryOptions.useSmartPointers = true;
+    retryOptions.applySafeOwnershipModernization = true;
+    retryOptions.useRangeBasedFor = true;
+    retryOptions.useLambdas = true;
+    const SmartPointerCollectionPropagationPass smartPointerCollectionPropagationPass;
+    updated = smartPointerCollectionPropagationPass.rewrite(updated, retryOptions, context, changes);
+    const OwnershipSanityScanner ownershipSanityScanner;
+    updated = ownershipSanityScanner.rewrite(updated, context, changes);
+    const ScopeLeakValidationPass scopeLeakValidationPass;
+    updated = scopeLeakValidationPass.validate(updated, context, compilerOutput, changes);
     updated = orphanedGrowthSymbolCleanupPass.rewrite(updated, context, compilerOutput, changes);
     updated = orphanedTempBufferLoopCleanupPass.rewrite(updated, context, compilerOutput, changes);
 

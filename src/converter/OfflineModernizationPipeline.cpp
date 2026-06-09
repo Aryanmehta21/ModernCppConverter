@@ -3,9 +3,14 @@
 #include "converter/AggressiveRewriteEngine.h"
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
+#include "converter/FilePointerModernizationPass.h"
 #include "converter/ImpactCascadingCleanupPass.h"
 #include "converter/MemberApiCascadePass.h"
 #include "converter/ModernizationPolishPass.h"
+#include "converter/OwnershipGraphModernizationPass.h"
+#include "converter/OwnershipSanityScanner.h"
+#include "converter/ScopeLeakValidationPass.h"
+#include "converter/SmartPointerCollectionPropagationPass.h"
 #include "converter/StructuralModernizationEngine.h"
 #include "converter/TransformationContext.h"
 #include "converter/VectorParadigmRewritePass.h"
@@ -89,6 +94,8 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     if (shouldRunStructuralPass(options)) {
         const StructuralModernizationEngine structuralEngine;
         result.modernCode = structuralEngine.modernize(result.modernCode, options, changes, transformationContext);
+        const OwnershipGraphModernizationPass ownershipGraphModernizationPass;
+        result.modernCode = ownershipGraphModernizationPass.modernize(result.modernCode, options, transformationContext, changes);
     }
 
     if (aggressiveAiLike) {
@@ -110,12 +117,22 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         const VectorParadigmRewritePass vectorParadigmRewritePass;
         result.modernCode = vectorParadigmRewritePass.rewrite(result.modernCode, transformationContext, changes);
         result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
+        const SmartPointerCollectionPropagationPass smartPointerCollectionPropagationPass;
+        result.modernCode = smartPointerCollectionPropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
         const MemberApiCascadePass memberApiCascadePass;
         result.modernCode = memberApiCascadePass.rewrite(result.modernCode, transformationContext, changes);
         result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
+        const OwnershipSanityScanner ownershipSanityScanner;
+        result.modernCode = ownershipSanityScanner.rewrite(result.modernCode, transformationContext, changes);
+        const ScopeLeakValidationPass scopeLeakValidationPass;
+        result.modernCode = scopeLeakValidationPass.validate(result.modernCode, transformationContext, {}, changes);
     }
 
     if (shouldRunStructuralPass(options)) {
+        const SmartPointerCollectionPropagationPass smartPointerCollectionPropagationPass;
+        result.modernCode = smartPointerCollectionPropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
+        const FilePointerModernizationPass filePointerModernizationPass;
+        result.modernCode = filePointerModernizationPass.rewrite(result.modernCode, changes);
         const ModernizationPolishPass polishPass;
         result.modernCode = polishPass.rewrite(result.modernCode, options, transformationContext, changes);
     }
@@ -137,8 +154,16 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
             const VectorParadigmRewritePass vectorParadigmRewritePass;
             result.modernCode = vectorParadigmRewritePass.rewrite(result.modernCode, transformationContext, changes);
             result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
+            const SmartPointerCollectionPropagationPass smartPointerCollectionPropagationPass;
+            result.modernCode = smartPointerCollectionPropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
             const MemberApiCascadePass memberApiCascadePass;
             result.modernCode = memberApiCascadePass.rewrite(result.modernCode, transformationContext, changes);
+            const OwnershipSanityScanner ownershipSanityScanner;
+            result.modernCode = ownershipSanityScanner.rewrite(result.modernCode, transformationContext, changes);
+            const ScopeLeakValidationPass scopeLeakValidationPass;
+            result.modernCode = scopeLeakValidationPass.validate(result.modernCode, transformationContext, verification.output, changes);
+            const FilePointerModernizationPass filePointerModernizationPass;
+            result.modernCode = filePointerModernizationPass.rewrite(result.modernCode, changes);
             const ModernizationPolishPass polishPass;
             result.modernCode = polishPass.rewrite(result.modernCode, options, transformationContext, changes);
             result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
