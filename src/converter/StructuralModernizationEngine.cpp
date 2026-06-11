@@ -624,7 +624,7 @@ std::string StructuralModernizationEngine::modernizeEnums(const std::string& cod
     }
 
     std::string updated = code;
-    static const std::regex enumPattern(R"(\benum\s+(?!class\b)([A-Za-z_]\w*)\s*\{([^{}]+)\}\s*;)",
+    static const std::regex enumPattern(R"(\benum\s+(?!class\b)([A-Za-z_]\w*)\s*(?::\s*([^\{\n]+?))?\s*\{([^{}]+)\}\s*;)",
                                         std::regex::ECMAScript);
     std::smatch match;
     std::string search = updated;
@@ -633,7 +633,8 @@ std::string StructuralModernizationEngine::modernizeEnums(const std::string& cod
     while (std::regex_search(search, match, enumPattern)) {
         const std::size_t position = consumed + static_cast<std::size_t>(match.position());
         const std::string enumName = match[1].str();
-        const std::string body = match[2].str();
+        const std::string underlyingType = trim(match[2].str());
+        const std::string body = match[3].str();
         std::vector<std::string> enumerators;
         std::stringstream bodyStream(body);
         std::string enumerator;
@@ -671,7 +672,9 @@ std::string StructuralModernizationEngine::modernizeEnums(const std::string& cod
             continue;
         }
 
-        const std::string replacement = "enum class " + enumName + "\n{" + body + "};";
+        const std::string replacement = "enum class " + enumName
+            + (underlyingType.empty() ? "" : " : " + underlyingType)
+            + "\n{" + body + "};";
         std::string prefix = updated.substr(0, position);
         std::string suffix = updated.substr(position + static_cast<std::size_t>(match.length()));
         for (const std::string& name : enumerators) {

@@ -1,20 +1,36 @@
 #include "converter/OfflineModernizationPipeline.h"
 
 #include "converter/AggressiveRewriteEngine.h"
+#include "converter/AlgorithmModernizationPass.h"
+#include "converter/AutoPtrRemovalPass.h"
+#include "converter/ClassResourceAnalyzerPass.h"
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
-#include "converter/FilePointerModernizationPass.h"
+#include "converter/EnumToStringCandidatePass.h"
+#include "converter/FileIoModernizationPass.h"
+#include "converter/FunctorToLambdaPass.h"
 #include "converter/ImpactCascadingCleanupPass.h"
+#include "converter/IteratorModernizationPass.h"
 #include "converter/MemberApiCascadePass.h"
 #include "converter/ModernizationPolishPass.h"
 #include "converter/OwnershipGraphModernizationPass.h"
 #include "converter/OwnershipSanityScanner.h"
+#include "converter/PolymorphicSafetyPass.h"
+#include "converter/RuleOfZeroPass.h"
 #include "converter/ScopeLeakValidationPass.h"
+#include "converter/ScopedEnumCastValidationPass.h"
+#include "converter/ScopedEnumOutputPropagationPass.h"
+#include "converter/ScopedEnumOutputValidator.h"
+#include "converter/SemanticConsistencyValidator.h"
+#include "converter/SemanticModernizationValidator.h"
 #include "converter/SmartPointerCollectionPropagationPass.h"
+#include "converter/SmartPointerTypePropagationPass.h"
 #include "converter/StructuralModernizationEngine.h"
 #include "converter/TransformationContext.h"
 #include "converter/VectorParadigmRewritePass.h"
 
+#include <algorithm>
+#include <cctype>
 #include <regex>
 #include <sstream>
 
@@ -35,6 +51,26 @@ bool shouldRunOwnershipConsistencyPass(const ModernizationOptions& options)
 bool shouldRunStructuralPass(const ModernizationOptions& options)
 {
     return options.offlineModernizationLevel != OfflineModernizationLevel::Conservative;
+}
+
+std::string lowercase(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
+}
+
+bool hasScopedEnumOutputDiagnostic(const std::string& compilerOutput)
+{
+    const std::string loweredCompilerOutput = lowercase(compilerOutput);
+    return loweredCompilerOutput.find("no viable overloaded 'operator<<'") != std::string::npos
+        || loweredCompilerOutput.find("no match for 'operator<<'") != std::string::npos
+        || loweredCompilerOutput.find("invalid operands to binary expression") != std::string::npos
+        || loweredCompilerOutput.find("formatter") != std::string::npos
+        || loweredCompilerOutput.find("std::format") != std::string::npos
+        || loweredCompilerOutput.find("fmt::format") != std::string::npos
+        || loweredCompilerOutput.find("cannot format") != std::string::npos;
 }
 
 std::string ensureInclude(std::string code, const std::string& includeLine)
@@ -92,8 +128,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     TransformationContext transformationContext;
 
     if (shouldRunStructuralPass(options)) {
-        const StructuralModernizationEngine structuralEngine;
-        result.modernCode = structuralEngine.modernize(result.modernCode, options, changes, transformationContext);
+        const AutoPtrRemovalPass autoPtrRemovalPass;
+        result.modernCode = autoPtrRemovalPass.rewrite(result.modernCode, changes);
+        const ClassResourceAnalyzerPass classResourceAnalyzerPass;
+        result.modernCode = classResourceAnalyzerPass.rewrite(result.modernCode, options, transformationContext, changes);
         const OwnershipGraphModernizationPass ownershipGraphModernizationPass;
         result.modernCode = ownershipGraphModernizationPass.modernize(result.modernCode, options, transformationContext, changes);
     }
@@ -117,8 +155,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         const VectorParadigmRewritePass vectorParadigmRewritePass;
         result.modernCode = vectorParadigmRewritePass.rewrite(result.modernCode, transformationContext, changes);
         result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
-        const SmartPointerCollectionPropagationPass smartPointerCollectionPropagationPass;
-        result.modernCode = smartPointerCollectionPropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
+        const SmartPointerTypePropagationPass smartPointerTypePropagationPass;
+        result.modernCode = smartPointerTypePropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
+        const PolymorphicSafetyPass polymorphicSafetyPass;
+        result.modernCode = polymorphicSafetyPass.rewrite(result.modernCode, options, transformationContext, changes);
         const MemberApiCascadePass memberApiCascadePass;
         result.modernCode = memberApiCascadePass.rewrite(result.modernCode, transformationContext, changes);
         result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
@@ -126,25 +166,47 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         result.modernCode = ownershipSanityScanner.rewrite(result.modernCode, transformationContext, changes);
         const ScopeLeakValidationPass scopeLeakValidationPass;
         result.modernCode = scopeLeakValidationPass.validate(result.modernCode, transformationContext, {}, changes);
+        const RuleOfZeroPass ruleOfZeroPass;
+        result.modernCode = ruleOfZeroPass.rewrite(result.modernCode, transformationContext, changes);
     }
 
     if (shouldRunStructuralPass(options)) {
-        const SmartPointerCollectionPropagationPass smartPointerCollectionPropagationPass;
-        result.modernCode = smartPointerCollectionPropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
-        const FilePointerModernizationPass filePointerModernizationPass;
-        result.modernCode = filePointerModernizationPass.rewrite(result.modernCode, changes);
-        const ModernizationPolishPass polishPass;
-        result.modernCode = polishPass.rewrite(result.modernCode, options, transformationContext, changes);
+        const SmartPointerTypePropagationPass smartPointerTypePropagationPass;
+        result.modernCode = smartPointerTypePropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
+        const PolymorphicSafetyPass polymorphicSafetyPass;
+        result.modernCode = polymorphicSafetyPass.rewrite(result.modernCode, options, transformationContext, changes);
+        const FileIoModernizationPass fileIoModernizationPass;
+        result.modernCode = fileIoModernizationPass.rewrite(result.modernCode, changes);
+        const FunctorToLambdaPass functorToLambdaPass;
+        result.modernCode = functorToLambdaPass.rewrite(result.modernCode, changes);
+        const AlgorithmModernizationPass algorithmModernizationPass;
+        result.modernCode = algorithmModernizationPass.rewrite(result.modernCode, options, transformationContext, changes);
+        const IteratorModernizationPass iteratorModernizationPass;
+        result.modernCode = iteratorModernizationPass.rewrite(result.modernCode, options, transformationContext, changes);
+        const ScopedEnumCastValidationPass scopedEnumCastValidationPass;
+        result.modernCode = scopedEnumCastValidationPass.validateAndNormalize(result.modernCode, changes);
+        const ScopedEnumOutputPropagationPass scopedEnumOutputPropagationPass;
+        result.modernCode = scopedEnumOutputPropagationPass.rewrite(result.modernCode, options, changes);
+        const ScopedEnumOutputValidator scopedEnumOutputValidator;
+        result.modernCode = scopedEnumOutputValidator.validateAndRepair(result.modernCode, options, changes);
+        const EnumToStringCandidatePass enumToStringCandidatePass;
+        enumToStringCandidatePass.suggest(result.modernCode, changes);
+        const SemanticConsistencyValidator semanticConsistencyValidator;
+        result.modernCode = semanticConsistencyValidator.validateAndRepair(result.modernCode, options, transformationContext, {}, changes);
+        const SemanticModernizationValidator semanticModernizationValidator;
+        result.modernCode = semanticModernizationValidator.validateAndRepair(result.modernCode, options, transformationContext, {}, changes);
     }
 
-    if (options.compileVerificationEnabled || aggressiveAiLike) {
+    if (options.compileVerificationEnabled || aggressiveAiLike || shouldRunStructuralPass(options)) {
         CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(result.modernCode, options.targetStandard);
         result.compileVerificationEnabled = verification.verificationEnabled;
         result.compileVerificationPassed = verification.passed;
         result.compilerUsed = verification.compilerUsed;
         result.compilerOutput = verification.output;
 
-        if (verification.compilerFound && !verification.passed && !transformationContext.empty()) {
+        if (verification.compilerFound
+            && !verification.passed
+            && (!transformationContext.empty() || hasScopedEnumOutputDiagnostic(verification.output))) {
             const std::string beforeCleanup = result.modernCode;
             const CompilerDiagnosticCleanupPass compilerDiagnosticCleanupPass;
             result.modernCode = compilerDiagnosticCleanupPass.run(result.modernCode, transformationContext, verification.output, changes);
@@ -154,19 +216,37 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
             const VectorParadigmRewritePass vectorParadigmRewritePass;
             result.modernCode = vectorParadigmRewritePass.rewrite(result.modernCode, transformationContext, changes);
             result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
-            const SmartPointerCollectionPropagationPass smartPointerCollectionPropagationPass;
-            result.modernCode = smartPointerCollectionPropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
+            const SmartPointerTypePropagationPass smartPointerTypePropagationPass;
+            result.modernCode = smartPointerTypePropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
+            const PolymorphicSafetyPass polymorphicSafetyPass;
+            result.modernCode = polymorphicSafetyPass.rewrite(result.modernCode, options, transformationContext, changes);
             const MemberApiCascadePass memberApiCascadePass;
             result.modernCode = memberApiCascadePass.rewrite(result.modernCode, transformationContext, changes);
             const OwnershipSanityScanner ownershipSanityScanner;
             result.modernCode = ownershipSanityScanner.rewrite(result.modernCode, transformationContext, changes);
             const ScopeLeakValidationPass scopeLeakValidationPass;
             result.modernCode = scopeLeakValidationPass.validate(result.modernCode, transformationContext, verification.output, changes);
-            const FilePointerModernizationPass filePointerModernizationPass;
-            result.modernCode = filePointerModernizationPass.rewrite(result.modernCode, changes);
-            const ModernizationPolishPass polishPass;
-            result.modernCode = polishPass.rewrite(result.modernCode, options, transformationContext, changes);
+            const RuleOfZeroPass ruleOfZeroPass;
+            result.modernCode = ruleOfZeroPass.rewrite(result.modernCode, transformationContext, changes);
+            const FileIoModernizationPass fileIoModernizationPass;
+            result.modernCode = fileIoModernizationPass.rewrite(result.modernCode, changes);
+            const FunctorToLambdaPass functorToLambdaPass;
+            result.modernCode = functorToLambdaPass.rewrite(result.modernCode, changes);
+            const AlgorithmModernizationPass algorithmModernizationPass;
+            result.modernCode = algorithmModernizationPass.rewrite(result.modernCode, options, transformationContext, changes);
+            const IteratorModernizationPass iteratorModernizationPass;
+            result.modernCode = iteratorModernizationPass.rewrite(result.modernCode, options, transformationContext, changes);
+            const ScopedEnumCastValidationPass scopedEnumCastValidationPass;
+            result.modernCode = scopedEnumCastValidationPass.validateAndNormalize(result.modernCode, changes);
+            const ScopedEnumOutputPropagationPass scopedEnumOutputPropagationPass;
+            result.modernCode = scopedEnumOutputPropagationPass.rewrite(result.modernCode, options, changes);
+            const ScopedEnumOutputValidator scopedEnumOutputValidator;
+            result.modernCode = scopedEnumOutputValidator.validateAndRepair(result.modernCode, options, changes);
             result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
+            const SemanticConsistencyValidator semanticConsistencyValidator;
+            result.modernCode = semanticConsistencyValidator.validateAndRepair(result.modernCode, options, transformationContext, verification.output, changes);
+            const SemanticModernizationValidator semanticModernizationValidator;
+            result.modernCode = semanticModernizationValidator.validateAndRepair(result.modernCode, options, transformationContext, verification.output, changes);
 
             if (result.modernCode != beforeCleanup) {
                 result.compileVerificationAutoFixAttempted = true;

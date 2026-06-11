@@ -921,7 +921,7 @@ std::string addVirtualDestructors(std::string code,
             continue;
         }
 
-        const std::regex destructorPattern(R"(\b(?:virtual\s+)?~)" + escapeRegex(block.name) + R"(\s*\()");
+        const std::regex destructorPattern(R"((?:virtual\s+)?~)" + escapeRegex(block.name) + R"(\s*\()");
         std::smatch destructorMatch;
         std::string replacement = block.text;
         if (std::regex_search(block.text, destructorMatch, destructorPattern)) {

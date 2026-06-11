@@ -89,7 +89,7 @@ void addSuggestion(std::vector<ConversionChange>& changes,
 
 bool containsCFileApi(const std::string& code)
 {
-    return std::regex_search(code, std::regex(R"(\b(?:FILE|fopen|fclose|fprintf|fread|fwrite|std::fopen|std::fclose|std::fprintf)\b)"));
+    return std::regex_search(code, std::regex(R"(\b(?:FILE|fopen|fclose|fprintf|fputs|fread|fwrite|std::fopen|std::fclose|std::fprintf|std::fputs)\b)"));
 }
 } // namespace
 
@@ -120,10 +120,14 @@ std::string FilePointerModernizationPass::rewrite(const std::string& code,
 
         std::size_t fcloseLine = std::string::npos;
         std::vector<std::size_t> fprintfLines;
+        std::vector<std::size_t> fputsLines;
         const std::regex fclosePattern(R"(^[ \t]*(?:std::)?fclose\s*\(\s*)" + escapeRegex(fileName) + R"(\s*\)\s*;\s*$)");
         const std::regex fprintfPattern(std::string(R"re(^([ \t]*)(?:std::)?fprintf\s*\(\s*)re")
                                         + escapeRegex(fileName)
                                         + R"re(\s*,\s*"((?:\\.|[^"\\])*)"\s*\)\s*;\s*$)re");
+        const std::regex fputsPattern(std::string(R"re(^([ \t]*)(?:std::)?fputs\s*\(\s*"((?:\\.|[^"\\])*)"\s*,\s*)re")
+                                      + escapeRegex(fileName)
+                                      + R"re(\s*\)\s*;\s*$)re");
         for (std::size_t scan = index + 1; scan < lines.size(); ++scan) {
             if (std::regex_match(lines[scan], fclosePattern)) {
                 fcloseLine = scan;
@@ -132,6 +136,11 @@ std::string FilePointerModernizationPass::rewrite(const std::string& code,
             std::smatch fprintfMatch;
             if (std::regex_match(lines[scan], fprintfMatch, fprintfPattern)) {
                 fprintfLines.push_back(scan);
+                continue;
+            }
+            std::smatch fputsMatch;
+            if (std::regex_match(lines[scan], fputsMatch, fputsPattern)) {
+                fputsLines.push_back(scan);
                 continue;
             }
             if (lines[scan].find(fileName) != std::string::npos
@@ -146,7 +155,7 @@ std::string FilePointerModernizationPass::rewrite(const std::string& code,
             }
         }
 
-        if (fcloseLine == std::string::npos || fprintfLines.empty()) {
+        if (fcloseLine == std::string::npos || (fprintfLines.empty() && fputsLines.empty())) {
             continue;
         }
 
@@ -173,6 +182,11 @@ std::string FilePointerModernizationPass::rewrite(const std::string& code,
             std::smatch fprintfMatch;
             std::regex_match(lines[fprintfLine], fprintfMatch, fprintfPattern);
             lines[fprintfLine] = fprintfMatch[1].str() + fileName + " << \"" + fprintfMatch[2].str() + "\";";
+        }
+        for (const std::size_t fputsLine : fputsLines) {
+            std::smatch fputsMatch;
+            std::regex_match(lines[fputsLine], fputsMatch, fputsPattern);
+            lines[fputsLine] = fputsMatch[1].str() + fileName + " << \"" + fputsMatch[2].str() + "\";";
         }
         lines[fcloseLine].clear();
         changed = true;
@@ -215,11 +229,13 @@ std::string FilePointerModernizationPass::rewrite(const std::string& code,
         "fopen",
         "fclose",
         "fprintf",
+        "fputs",
         "fread",
         "fwrite",
         "std::fopen",
         "std::fclose",
         "std::fprintf",
+        "std::fputs",
     });
     if (containsCFileApi(updated)) {
         return updated;

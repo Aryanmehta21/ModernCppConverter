@@ -61,6 +61,21 @@ If any remain:
 
 Do not return known-invalid code.
 
+## Enterprise Semantic Modernization Rules
+
+For Phase 4 and all future modernization work:
+
+- Never modernize only part of an ownership graph.
+- Never modernize a container without modernizing all interactions with that container.
+- Never convert storage types without propagating API changes.
+- Never introduce `std::unique_ptr` or `std::shared_ptr` without ownership validation.
+- Every polymorphic hierarchy must be validated.
+- Every transformation must pass semantic validation.
+- Prefer Rule of Zero whenever ownership becomes automatic.
+- Prefer STL algorithms over manual loops when semantics are equivalent.
+- Prefer range-based loops over iterator loops when safe.
+- Reject partial refactors.
+
 ## Build
 
 ```sh

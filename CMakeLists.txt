@@ -28,12 +28,21 @@ add_library(ModernCppConverterCore
     src/backend/BackendConfig.cpp
     src/app/ConversionCoordinator.cpp
     src/converter/AggressiveRewriteEngine.cpp
+    src/converter/AlgorithmModernizationPass.cpp
+    src/converter/AutoPtrRemovalPass.cpp
+    src/converter/ClassResourceAnalyzerPass.cpp
+    src/converter/ClassContextResolver.cpp
     src/converter/ClangAstStructureAnalyzer.cpp
     src/converter/CompilerDiagnosticCleanupPass.cpp
     src/converter/CompileVerifier.cpp
     src/converter/DependentUsageRewritePass.cpp
+    src/converter/DestructorDeclarationValidationPass.cpp
+    src/converter/EnumToStringCandidatePass.cpp
     src/converter/FilePointerModernizationPass.cpp
+    src/converter/FileIoModernizationPass.cpp
+    src/converter/FunctorToLambdaPass.cpp
     src/converter/ImpactCascadingCleanupPass.cpp
+    src/converter/IteratorModernizationPass.cpp
     src/converter/IncludeManager.cpp
     src/converter/MemberApiCascadePass.cpp
     src/converter/ModernizationPolishPass.cpp
@@ -41,16 +50,26 @@ add_library(ModernCppConverterCore
     src/converter/OwnershipGraphAnalyzer.cpp
     src/converter/OwnershipGraphModernizationPass.cpp
     src/converter/OwnershipSanityScanner.cpp
+    src/converter/PolymorphicContractPass.cpp
+    src/converter/PolymorphicSafetyPass.cpp
     src/converter/OrphanedGrowthSymbolCleanupPass.cpp
     src/converter/OrphanedTempBufferLoopCleanupPass.cpp
     src/converter/SafeReplacementEngine.cpp
     src/converter/ScopeAwareSymbolTable.cpp
     src/converter/ScopeLeakValidationPass.cpp
+    src/converter/ScopedEnumCastValidationPass.cpp
+    src/converter/ScopedEnumOutputPropagationPass.cpp
+    src/converter/ScopedEnumOutputValidator.cpp
+    src/converter/SemanticConsistencyValidator.cpp
+    src/converter/SemanticModernizationValidator.cpp
     src/converter/SmartPointerCollectionPropagationPass.cpp
+    src/converter/SmartPointerSinkPropagationPass.cpp
+    src/converter/SmartPointerTypePropagationPass.cpp
     src/converter/StructuralAnalyzers.cpp
     src/converter/StructuralModernizationEngine.cpp
     src/converter/TokenBasedStructureAnalyzer.cpp
     src/converter/TransformationContext.cpp
+    src/converter/RuleOfZeroPass.cpp
     src/converter/VectorAppendMethodRewritePass.cpp
     src/converter/VectorEmulationEliminationPass.cpp
     src/converter/VectorParadigmRewritePass.cpp

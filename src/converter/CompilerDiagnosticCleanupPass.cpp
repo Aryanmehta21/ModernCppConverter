@@ -5,7 +5,12 @@
 #include "converter/OrphanedTempBufferLoopCleanupPass.h"
 #include "converter/OwnershipSanityScanner.h"
 #include "converter/ScopeLeakValidationPass.h"
+#include "converter/ScopedEnumCastValidationPass.h"
+#include "converter/ScopedEnumOutputPropagationPass.h"
+#include "converter/ScopedEnumOutputValidator.h"
+#include "converter/SemanticConsistencyValidator.h"
 #include "converter/SmartPointerCollectionPropagationPass.h"
+#include "converter/SmartPointerTypePropagationPass.h"
 #include "converter/VectorParadigmRewritePass.h"
 
 #include <algorithm>
@@ -105,6 +110,18 @@ bool hasKnownDiagnostic(const std::string& compilerOutput, const TransformationC
 
     return false;
 }
+
+bool hasScopedEnumOutputDiagnostic(const std::string& compilerOutput)
+{
+    const std::string loweredCompilerOutput = lowercase(compilerOutput);
+    return loweredCompilerOutput.find("no viable overloaded 'operator<<'") != std::string::npos
+        || loweredCompilerOutput.find("no match for 'operator<<'") != std::string::npos
+        || loweredCompilerOutput.find("invalid operands to binary expression") != std::string::npos
+        || loweredCompilerOutput.find("formatter") != std::string::npos
+        || loweredCompilerOutput.find("std::format") != std::string::npos
+        || loweredCompilerOutput.find("fmt::format") != std::string::npos
+        || loweredCompilerOutput.find("cannot format") != std::string::npos;
+}
 } // namespace
 
 std::string CompilerDiagnosticCleanupPass::run(const std::string& code,
@@ -112,12 +129,16 @@ std::string CompilerDiagnosticCleanupPass::run(const std::string& code,
                                                const std::string& compilerOutput,
                                                std::vector<ConversionChange>& changes) const
 {
-    if (context.empty() || !hasKnownDiagnostic(compilerOutput, context)) {
+    const bool enumOutputDiagnostic = hasScopedEnumOutputDiagnostic(compilerOutput);
+    if ((!enumOutputDiagnostic && context.empty()) || (!enumOutputDiagnostic && !hasKnownDiagnostic(compilerOutput, context))) {
         return code;
     }
 
-    const DependentUsageRewritePass dependentUsageRewritePass;
-    std::string updated = dependentUsageRewritePass.rewrite(code, context, changes);
+    std::string updated = code;
+    if (!context.empty()) {
+        const DependentUsageRewritePass dependentUsageRewritePass;
+        updated = dependentUsageRewritePass.rewrite(updated, context, changes);
+    }
     const OrphanedGrowthSymbolCleanupPass orphanedGrowthSymbolCleanupPass;
     updated = orphanedGrowthSymbolCleanupPass.rewrite(updated, context, compilerOutput, changes);
     const OrphanedTempBufferLoopCleanupPass orphanedTempBufferLoopCleanupPass;
@@ -129,12 +150,20 @@ std::string CompilerDiagnosticCleanupPass::run(const std::string& code,
     retryOptions.applySafeOwnershipModernization = true;
     retryOptions.useRangeBasedFor = true;
     retryOptions.useLambdas = true;
-    const SmartPointerCollectionPropagationPass smartPointerCollectionPropagationPass;
-    updated = smartPointerCollectionPropagationPass.rewrite(updated, retryOptions, context, changes);
+    const SmartPointerTypePropagationPass smartPointerTypePropagationPass;
+    updated = smartPointerTypePropagationPass.rewrite(updated, retryOptions, context, changes);
     const OwnershipSanityScanner ownershipSanityScanner;
     updated = ownershipSanityScanner.rewrite(updated, context, changes);
     const ScopeLeakValidationPass scopeLeakValidationPass;
     updated = scopeLeakValidationPass.validate(updated, context, compilerOutput, changes);
+    const SemanticConsistencyValidator semanticConsistencyValidator;
+    updated = semanticConsistencyValidator.validateAndRepair(updated, retryOptions, context, compilerOutput, changes);
+    const ScopedEnumCastValidationPass scopedEnumCastValidationPass;
+    updated = scopedEnumCastValidationPass.validateAndNormalize(updated, changes);
+    const ScopedEnumOutputPropagationPass scopedEnumOutputPropagationPass;
+    updated = scopedEnumOutputPropagationPass.rewrite(updated, retryOptions, changes);
+    const ScopedEnumOutputValidator scopedEnumOutputValidator;
+    updated = scopedEnumOutputValidator.validateAndRepair(updated, retryOptions, changes);
     updated = orphanedGrowthSymbolCleanupPass.rewrite(updated, context, compilerOutput, changes);
     updated = orphanedTempBufferLoopCleanupPass.rewrite(updated, context, compilerOutput, changes);
 
