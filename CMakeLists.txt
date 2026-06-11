@@ -28,13 +28,18 @@ add_library(ModernCppConverterCore
     src/backend/BackendConfig.cpp
     src/app/ConversionCoordinator.cpp
     src/converter/AggressiveRewriteEngine.cpp
+    src/converter/AlgorithmPolishPass.cpp
     src/converter/AlgorithmModernizationPass.cpp
     src/converter/AutoPtrRemovalPass.cpp
     src/converter/ClassResourceAnalyzerPass.cpp
     src/converter/ClassContextResolver.cpp
+    src/converter/ClassStringBufferModernizationPass.cpp
     src/converter/ClangAstStructureAnalyzer.cpp
     src/converter/CompilerDiagnosticCleanupPass.cpp
     src/converter/CompileVerifier.cpp
+    src/converter/ConcurrencyRaiiModernizationPass.cpp
+    src/converter/ContainerPolishPass.cpp
+    src/converter/CrossFunctionTypePropagationPass.cpp
     src/converter/DependentUsageRewritePass.cpp
     src/converter/DestructorDeclarationValidationPass.cpp
     src/converter/EnumToStringCandidatePass.cpp
@@ -46,11 +51,14 @@ add_library(ModernCppConverterCore
     src/converter/IncludeManager.cpp
     src/converter/MemberApiCascadePass.cpp
     src/converter/ModernizationPolishPass.cpp
+    src/converter/ModernizationPolishValidator.cpp
     src/converter/OfflineModernizationPipeline.cpp
     src/converter/OwnershipGraphAnalyzer.cpp
     src/converter/OwnershipGraphModernizationPass.cpp
     src/converter/OwnershipSanityScanner.cpp
+    src/converter/OverrideEnforcementPass.cpp
     src/converter/PolymorphicContractPass.cpp
+    src/converter/PolymorphicContractPolishPass.cpp
     src/converter/PolymorphicSafetyPass.cpp
     src/converter/OrphanedGrowthSymbolCleanupPass.cpp
     src/converter/OrphanedTempBufferLoopCleanupPass.cpp
@@ -67,9 +75,12 @@ add_library(ModernCppConverterCore
     src/converter/SmartPointerTypePropagationPass.cpp
     src/converter/StructuralAnalyzers.cpp
     src/converter/StructuralModernizationEngine.cpp
+    src/converter/StringViewPolishPass.cpp
+    src/converter/StructuredBindingPass.cpp
     src/converter/TokenBasedStructureAnalyzer.cpp
     src/converter/TransformationContext.cpp
     src/converter/RuleOfZeroPass.cpp
+    src/converter/RuleOfZeroPolishPass.cpp
     src/converter/VectorAppendMethodRewritePass.cpp
     src/converter/VectorEmulationEliminationPass.cpp
     src/converter/VectorParadigmRewritePass.cpp

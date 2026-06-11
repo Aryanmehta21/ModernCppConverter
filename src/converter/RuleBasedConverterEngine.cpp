@@ -1154,30 +1154,76 @@ public:
                std::vector<ConversionChange>& changes) const override
     {
         static const std::regex stringParamPattern(R"(const\s+std::string\s*&\s+([A-Za-z_]\w*))");
-        static const std::regex safeSignaturePattern(R"(const\s+std::string\s*&\s+([A-Za-z_]\w*))");
         const std::string code = representation.sourceText();
 
         if (options.useStringView && options.applyStringViewWhenSafe) {
-            std::string updated;
-            std::string remaining = code;
+            const std::regex safeFunctionPattern(
+                R"((^[ \t]*(?:[A-Za-z_:][A-Za-z0-9_:<>,\s*&]*\s+)+[A-Za-z_]\w*\s*\([^)]*?)const\s+std::string\s*&\s+([A-Za-z_]\w*)([^)]*\)\s*(?:const\s*)?\{([\s\S]*?)^\s*\}))",
+                std::regex::ECMAScript | std::regex::multiline);
+            auto escapes = [](const std::string& body, const std::string& parameter) {
+                return std::regex_search(body, std::regex(R"(\breturn\s+)" + parameter + R"(\b)"))
+                    || std::regex_search(body, std::regex(R"(\b[A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*)*\s*=\s*)" + parameter + R"(\b)"))
+                    || std::regex_search(body, std::regex(R"(\b(?:push_back|emplace_back|insert|assign)\s*\([^;\n]*\b)" + parameter + R"(\b)"));
+            };
+
+            std::string updated = code;
             std::smatch match;
+            std::string search = updated;
+            std::size_t consumed = 0;
             bool changed = false;
-            while (std::regex_search(remaining, match, safeSignaturePattern)) {
-                const std::string before = match[0].str();
-                const std::string after = "std::string_view " + match[1].str();
+            while (std::regex_search(search, match, safeFunctionPattern)) {
+                const std::string parameter = match[2].str();
+                if (escapes(match[4].str(), parameter)) {
+                    consumed += static_cast<std::size_t>(match.position() + match.length());
+                    search = match.suffix().str();
+                    continue;
+                }
+
+                const std::string before = "const std::string& " + parameter;
+                const std::string after = "std::string_view " + parameter;
+                const std::size_t replacementPosition = consumed
+                    + static_cast<std::size_t>(match.position())
+                    + static_cast<std::size_t>(match[1].length());
+                updated.replace(replacementPosition, before.size(), after);
                 addAppliedChange(changes,
                                  name(),
                                  before,
                                  after,
                                  "The parameter is read-only at the function boundary. std::string_view can avoid unnecessary string construction for callers.");
-                updated += match.prefix().str();
-                updated += after;
-                remaining = match.suffix().str();
                 changed = true;
+                consumed = replacementPosition + after.size();
+                search = updated.substr(consumed);
+            }
+
+            const std::regex declarationParameterPattern(R"(const\s+std::string\s*&\s+([A-Za-z_]\w*))",
+                                                        std::regex::ECMAScript);
+            search = updated;
+            consumed = 0;
+            while (std::regex_search(search, match, declarationParameterPattern)) {
+                const std::size_t position = consumed + static_cast<std::size_t>(match.position());
+                const std::size_t semicolon = updated.find(';', position);
+                const std::size_t openBrace = updated.find('{', position);
+                if (semicolon == std::string::npos || (openBrace != std::string::npos && openBrace < semicolon)) {
+                    consumed += static_cast<std::size_t>(match.position() + match.length());
+                    search = match.suffix().str();
+                    continue;
+                }
+
+                const std::string parameter = match[1].str();
+                const std::string before = match[0].str();
+                const std::string after = "std::string_view " + parameter;
+                updated.replace(position, before.size(), after);
+                addAppliedChange(changes,
+                                 name(),
+                                 before,
+                                 after,
+                                 "The declaration uses a read-only string parameter. std::string_view can avoid unnecessary string construction for callers.");
+                changed = true;
+                consumed = position + after.size();
+                search = updated.substr(consumed);
             }
 
             if (changed) {
-                updated += remaining;
                 updated = ensureInclude(updated, "#include <string_view>");
                 representation.replaceSourceText(updated);
                 return;

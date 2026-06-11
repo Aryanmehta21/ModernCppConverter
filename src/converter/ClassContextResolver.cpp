@@ -75,7 +75,8 @@ std::vector<std::string> splitBases(const std::string& baseList)
 
 bool hasVirtualMethod(const std::string& classText)
 {
-    return std::regex_search(classText, std::regex(R"(\bvirtual\s+(?!~)[^;{}()]+\s+[A-Za-z_]\w*\s*\()"));
+    return std::regex_search(classText,
+                             std::regex(R"(\bvirtual\s+(?!~)[A-Za-z_:][A-Za-z0-9_:<>,\s*&]*\s+[A-Za-z_]\w*\s*\([^;{}]*\))"));
 }
 
 DestructorContext findDestructor(const ClassBlock& block, const std::string& classText)

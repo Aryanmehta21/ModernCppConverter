@@ -1,11 +1,16 @@
 #include "converter/OfflineModernizationPipeline.h"
 
 #include "converter/AggressiveRewriteEngine.h"
+#include "converter/AlgorithmPolishPass.h"
 #include "converter/AlgorithmModernizationPass.h"
 #include "converter/AutoPtrRemovalPass.h"
 #include "converter/ClassResourceAnalyzerPass.h"
+#include "converter/ClassStringBufferModernizationPass.h"
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
+#include "converter/ConcurrencyRaiiModernizationPass.h"
+#include "converter/ContainerPolishPass.h"
+#include "converter/CrossFunctionTypePropagationPass.h"
 #include "converter/EnumToStringCandidatePass.h"
 #include "converter/FileIoModernizationPass.h"
 #include "converter/FunctorToLambdaPass.h"
@@ -13,10 +18,14 @@
 #include "converter/IteratorModernizationPass.h"
 #include "converter/MemberApiCascadePass.h"
 #include "converter/ModernizationPolishPass.h"
+#include "converter/ModernizationPolishValidator.h"
 #include "converter/OwnershipGraphModernizationPass.h"
 #include "converter/OwnershipSanityScanner.h"
+#include "converter/OverrideEnforcementPass.h"
+#include "converter/PolymorphicContractPolishPass.h"
 #include "converter/PolymorphicSafetyPass.h"
 #include "converter/RuleOfZeroPass.h"
+#include "converter/RuleOfZeroPolishPass.h"
 #include "converter/ScopeLeakValidationPass.h"
 #include "converter/ScopedEnumCastValidationPass.h"
 #include "converter/ScopedEnumOutputPropagationPass.h"
@@ -26,6 +35,8 @@
 #include "converter/SmartPointerCollectionPropagationPass.h"
 #include "converter/SmartPointerTypePropagationPass.h"
 #include "converter/StructuralModernizationEngine.h"
+#include "converter/StringViewPolishPass.h"
+#include "converter/StructuredBindingPass.h"
 #include "converter/TransformationContext.h"
 #include "converter/VectorParadigmRewritePass.h"
 
@@ -134,6 +145,8 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         result.modernCode = classResourceAnalyzerPass.rewrite(result.modernCode, options, transformationContext, changes);
         const OwnershipGraphModernizationPass ownershipGraphModernizationPass;
         result.modernCode = ownershipGraphModernizationPass.modernize(result.modernCode, options, transformationContext, changes);
+        const ClassStringBufferModernizationPass classStringBufferModernizationPass;
+        result.modernCode = classStringBufferModernizationPass.rewrite(result.modernCode, changes);
     }
 
     if (aggressiveAiLike) {
@@ -157,6 +170,8 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         result.modernCode = impactCascadingCleanupPass.run(result.modernCode, transformationContext, changes);
         const SmartPointerTypePropagationPass smartPointerTypePropagationPass;
         result.modernCode = smartPointerTypePropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
+        const CrossFunctionTypePropagationPass crossFunctionTypePropagationPass;
+        result.modernCode = crossFunctionTypePropagationPass.rewrite(result.modernCode, changes);
         const PolymorphicSafetyPass polymorphicSafetyPass;
         result.modernCode = polymorphicSafetyPass.rewrite(result.modernCode, options, transformationContext, changes);
         const MemberApiCascadePass memberApiCascadePass;
@@ -173,6 +188,8 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     if (shouldRunStructuralPass(options)) {
         const SmartPointerTypePropagationPass smartPointerTypePropagationPass;
         result.modernCode = smartPointerTypePropagationPass.rewrite(result.modernCode, options, transformationContext, changes);
+        const CrossFunctionTypePropagationPass crossFunctionTypePropagationPass;
+        result.modernCode = crossFunctionTypePropagationPass.rewrite(result.modernCode, changes);
         const PolymorphicSafetyPass polymorphicSafetyPass;
         result.modernCode = polymorphicSafetyPass.rewrite(result.modernCode, options, transformationContext, changes);
         const FileIoModernizationPass fileIoModernizationPass;
@@ -195,6 +212,67 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         result.modernCode = semanticConsistencyValidator.validateAndRepair(result.modernCode, options, transformationContext, {}, changes);
         const SemanticModernizationValidator semanticModernizationValidator;
         result.modernCode = semanticModernizationValidator.validateAndRepair(result.modernCode, options, transformationContext, {}, changes);
+
+        const ModernizationPolishValidator polishValidator;
+        auto applyPolish = [&](const std::string& passName, auto&& transform) {
+            const std::string before = result.modernCode;
+            const std::size_t changeCountBefore = changes.size();
+            const std::string candidate = transform(before);
+            if (candidate == before) {
+                return;
+            }
+            std::string reason;
+            if (polishValidator.isValid(candidate, reason)) {
+                result.modernCode = candidate;
+                return;
+            }
+            changes.resize(changeCountBefore);
+            changes.push_back(ConversionChange{
+                passName,
+                before,
+                {},
+                "Skipped polish candidate because validation failed: " + reason,
+                false,
+                false,
+            });
+        };
+
+        applyPolish("Polymorphic contract polish", [&](const std::string& input) {
+            const PolymorphicContractPolishPass pass;
+            return pass.rewrite(input, changes);
+        });
+        applyPolish("Override enforcement", [&](const std::string& input) {
+            const OverrideEnforcementPass pass;
+            return pass.rewrite(input, changes);
+        });
+        applyPolish("Iterator modernization polish", [&](const std::string& input) {
+            const IteratorModernizationPass pass;
+            return pass.rewrite(input, options, transformationContext, changes);
+        });
+        applyPolish("Structured binding polish", [&](const std::string& input) {
+            const StructuredBindingPass pass;
+            return pass.rewrite(input, options, transformationContext, changes);
+        });
+        applyPolish("Algorithm polish", [&](const std::string& input) {
+            const AlgorithmPolishPass pass;
+            return pass.rewrite(input, options, transformationContext, changes);
+        });
+        applyPolish("Container polish", [&](const std::string& input) {
+            const ContainerPolishPass pass;
+            return pass.rewrite(input, changes);
+        });
+        applyPolish("Concurrency RAII modernization", [&](const std::string& input) {
+            const ConcurrencyRaiiModernizationPass pass;
+            return pass.rewrite(input, options, changes);
+        });
+        applyPolish("Rule of Zero polish", [&](const std::string& input) {
+            const RuleOfZeroPolishPass pass;
+            return pass.rewrite(input, changes);
+        });
+        applyPolish("String view polish", [&](const std::string& input) {
+            const StringViewPolishPass pass;
+            return pass.rewrite(input, options, changes);
+        });
     }
 
     if (options.compileVerificationEnabled || aggressiveAiLike || shouldRunStructuralPass(options)) {

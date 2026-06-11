@@ -47,6 +47,13 @@ bool hasAppliedRule(const ConversionResult& result, const std::string& ruleName)
     });
 }
 
+bool hasSuggestionRule(const ConversionResult& result, const std::string& ruleName)
+{
+    return std::any_of(result.changes.begin(), result.changes.end(), [&ruleName](const ConversionChange& change) {
+        return !change.applied && contains(change.ruleName, ruleName);
+    });
+}
+
 ModernizationOptions enterpriseOptions()
 {
     ModernizationOptions options;
@@ -166,7 +173,7 @@ void runPolymorphismTests()
         enterpriseOptions());
 
     require(contains(nameResult.modernCode, "virtual ~GeneratedNameTarget() = default;"),
-            "generated destructor name should exactly match enclosing class name");
+            "generated destructor name should exactly match enclosing class name\nOutput:\n" + nameResult.modernCode);
     require(!contains(nameResult.modernCode, "~Nearby") && !contains(nameResult.modernCode, "~prose"),
             "destructor generator must not use nearby comment/prose tokens");
     requireCompilePassIfCompilerAvailable(nameResult, "generated polymorphic destructor should compile");
@@ -706,6 +713,348 @@ void runScopedEnumOutputTests()
             "member-access static_cast syntax should not remain after validation");
 }
 
+void runFinalPolishTests()
+{
+    const RuleBasedConverterEngine converter;
+
+    const ConversionResult polymorphicResult = converter.convert(
+        "struct Interface\n"
+        "{\n"
+        "    virtual void configure(int value) noexcept;\n"
+        "};\n"
+        "struct Implementation : public Interface\n"
+        "{\n"
+        "    virtual ~Implementation()\n"
+        "    {\n"
+        "    }\n"
+        "    virtual void configure(int value) noexcept;\n"
+        "};\n",
+        enterpriseOptions());
+
+    require(contains(polymorphicResult.modernCode, "virtual ~Interface() = default;"),
+            "polymorphic base should receive virtual destructor\nOutput:\n" + polymorphicResult.modernCode);
+    require(contains(polymorphicResult.modernCode, "~Implementation() override"),
+            "derived destructor should use override when base destructor is virtual");
+    require(contains(polymorphicResult.modernCode, "void configure(int value) noexcept override;"),
+            "derived method should receive override while preserving noexcept");
+    requireCompilePassIfCompilerAvailable(polymorphicResult, "polymorphic polish should compile");
+
+    const ConversionResult iteratorResult = converter.convert(
+        "#include <vector>\n"
+        "int sum(const std::vector<int>& values)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (std::vector<int>::const_iterator it = values.begin(); it != values.end(); ++it)\n"
+        "    {\n"
+        "        total += *it;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n",
+        enterpriseOptions());
+
+    require(contains(iteratorResult.modernCode, "for (const auto& value : values)"),
+            "explicit const_iterator loop should become range-based for");
+    requireCompilePassIfCompilerAvailable(iteratorResult, "iterator polish should compile");
+
+    const ConversionResult mapResult = converter.convert(
+        "#include <iostream>\n"
+        "#include <map>\n"
+        "void print(const std::map<int, int>& values)\n"
+        "{\n"
+        "    for (std::map<int, int>::const_iterator it = values.begin(); it != values.end(); ++it)\n"
+        "    {\n"
+        "        std::cout << it->first << it->second << std::endl;\n"
+        "    }\n"
+        "}\n",
+        enterpriseOptions());
+
+    require(contains(mapResult.modernCode, "for (const auto& [key, value] : values)"),
+            "map iterator loop should become structured binding");
+    requireCompilePassIfCompilerAvailable(mapResult, "structured binding polish should compile");
+
+    const ConversionResult containerResult = converter.convert(
+        "#include <map>\n"
+        "#include <string>\n"
+        "#include <vector>\n"
+        "struct Record\n"
+        "{\n"
+        "    Record(int, const std::string&) {}\n"
+        "};\n"
+        "void build()\n"
+        "{\n"
+        "    std::map<int, std::string> names;\n"
+        "    names.insert(std::pair<int, std::string>(1, \"one\"));\n"
+        "    std::vector<Record> records;\n"
+        "    records.push_back(Record(7, \"seven\"));\n"
+        "}\n",
+        enterpriseOptions());
+
+    require(contains(containerResult.modernCode, "names.emplace(1, \"one\");"),
+            "pair insert should become emplace");
+    require(contains(containerResult.modernCode, "records.emplace_back(7, \"seven\");"),
+            "push_back temporary should become emplace_back");
+    requireCompilePassIfCompilerAvailable(containerResult, "container polish should compile");
+
+    const ConversionResult ruleOfZeroResult = converter.convert(
+        "#include <string>\n"
+        "#include <vector>\n"
+        "struct Holder\n"
+        "{\n"
+        "    Holder() = default;\n"
+        "    ~Holder() = default;\n"
+        "    Holder(const Holder&) = default;\n"
+        "    Holder& operator=(const Holder&) = default;\n"
+        "    std::vector<std::string> values;\n"
+        "};\n",
+        enterpriseOptions());
+
+    require(!contains(ruleOfZeroResult.modernCode, "~Holder() = default;"),
+            "explicit default destructor should be removed by Rule of Zero polish");
+    require(!contains(ruleOfZeroResult.modernCode, "Holder(const Holder&) = default;"),
+            "explicit default copy constructor should be removed by Rule of Zero polish");
+    require(!contains(ruleOfZeroResult.modernCode, "operator=(const Holder&) = default;"),
+            "explicit default copy assignment should be removed by Rule of Zero polish");
+    requireCompilePassIfCompilerAvailable(ruleOfZeroResult, "Rule of Zero polish should compile");
+
+    ModernizationOptions stringViewOptions = enterpriseOptions();
+    stringViewOptions.applyStringViewWhenSafe = true;
+    const ConversionResult stringViewResult = converter.convert(
+        "#include <iostream>\n"
+        "#include <string>\n"
+        "void show(const std::string& name)\n"
+        "{\n"
+        "    std::cout << name << '\\n';\n"
+        "}\n",
+        stringViewOptions);
+
+    require(contains(stringViewResult.modernCode, "#include <string_view>"),
+            "string_view polish should add string_view include when applied");
+    require(contains(stringViewResult.modernCode, "void show(std::string_view name)"),
+            "safe read-only string parameter should become string_view when enabled");
+    requireCompilePassIfCompilerAvailable(stringViewResult, "string_view polish should compile");
+
+    const ConversionResult unsafeStringViewResult = converter.convert(
+        "#include <string>\n"
+        "std::string stored;\n"
+        "void store(const std::string& name)\n"
+        "{\n"
+        "    stored = name;\n"
+        "}\n",
+        stringViewOptions);
+
+    require(contains(unsafeStringViewResult.modernCode, "const std::string& name"),
+            "escaping string parameter should not be auto-converted to string_view\nOutput:\n" + unsafeStringViewResult.modernCode);
+    requireCompilePassIfCompilerAvailable(unsafeStringViewResult, "unsafe string_view candidate should remain compilable");
+}
+
+void runRegressionModernizationTests()
+{
+    const RuleBasedConverterEngine converter;
+
+    const ConversionResult crossFunctionResult = converter.convert(
+        "#include <memory>\n"
+        "#include <vector>\n"
+        "struct Item {};\n"
+        "void inspectAll(const std::vector<Item*>& items)\n"
+        "{\n"
+        "    for (Item* item : items)\n"
+        "    {\n"
+        "        (void)item;\n"
+        "    }\n"
+        "}\n"
+        "void run()\n"
+        "{\n"
+        "    std::vector<Item*> items;\n"
+        "    items.push_back(new Item());\n"
+        "    inspectAll(items);\n"
+        "    for (Item* item : items)\n"
+        "    {\n"
+        "        delete item;\n"
+        "    }\n"
+        "}\n",
+        enterpriseOptions());
+
+    require(contains(crossFunctionResult.modernCode, "std::vector<std::unique_ptr<Item>> items;"),
+            "owning raw pointer vector should become vector<unique_ptr>");
+    const bool signatureUpdated = contains(crossFunctionResult.modernCode, "inspectAll(const std::vector<std::unique_ptr<Item>>& items)")
+        || contains(crossFunctionResult.modernCode, "inspectAll(const std::vector<std::unique_ptr<Item> >& items)");
+    const bool callAdapted = contains(crossFunctionResult.modernCode, ".get()")
+        && contains(crossFunctionResult.modernCode, "std::vector<Item*>")
+        && !contains(crossFunctionResult.modernCode, "inspectAll(items);");
+    require(signatureUpdated || callAdapted,
+            "vector<unique_ptr<T>> should not be passed directly to vector<T*> APIs\nOutput:\n" + crossFunctionResult.modernCode);
+    requireCompilePassIfCompilerAvailable(crossFunctionResult, "cross-function smart pointer propagation should compile");
+
+    const ConversionResult stringBufferResult = converter.convert(
+        "#include <cstring>\n"
+        "#include <string>\n"
+        "class TextBuffer\n"
+        "{\n"
+        "public:\n"
+        "    explicit TextBuffer(const char* input)\n"
+        "    {\n"
+        "        text = new char[std::strlen(input) + 1];\n"
+        "        std::strcpy(text, input);\n"
+        "    }\n"
+        "    TextBuffer(const TextBuffer& other)\n"
+        "    {\n"
+        "        text = new char[std::strlen(other.text) + 1];\n"
+        "        std::strcpy(text, other.text);\n"
+        "    }\n"
+        "    TextBuffer& operator=(const TextBuffer& other)\n"
+        "    {\n"
+        "        if (this != &other)\n"
+        "        {\n"
+        "            delete[] text;\n"
+        "            text = new char[std::strlen(other.text) + 1];\n"
+        "            std::strcpy(text, other.text);\n"
+        "        }\n"
+        "        return *this;\n"
+        "    }\n"
+        "    ~TextBuffer()\n"
+        "    {\n"
+        "        delete[] text;\n"
+        "    }\n"
+        "    const char* c_str() const { return text; }\n"
+        "    std::size_t length() const { return std::strlen(text); }\n"
+        "private:\n"
+        "    char* text;\n"
+        "};\n",
+        enterpriseOptions());
+
+    require(contains(stringBufferResult.modernCode, "std::string text;"),
+            "owned class char* text buffer should become std::string\nOutput:\n" + stringBufferResult.modernCode);
+    require(!contains(stringBufferResult.modernCode, "new char["), "string buffer modernization should remove new char[]");
+    require(!contains(stringBufferResult.modernCode, "delete[] text"), "string buffer modernization should remove delete[]");
+    require(!contains(stringBufferResult.modernCode, "std::strcpy"), "string buffer modernization should remove strcpy");
+    require(contains(stringBufferResult.modernCode, "return text.c_str();"), "C string getter should return std::string::c_str()");
+    require(contains(stringBufferResult.modernCode, "return text.size();"), "length getter should return std::string::size()");
+    require(!contains(stringBufferResult.modernCode, "~TextBuffer()"), "cleanup-only destructor should be removed after string modernization");
+    requireCompilePassIfCompilerAvailable(stringBufferResult, "class string buffer modernization should compile");
+
+    const ConversionResult mutexResult = converter.convert(
+        "#include <mutex>\n"
+        "std::mutex gate;\n"
+        "int value = 0;\n"
+        "void update()\n"
+        "{\n"
+        "    gate.lock();\n"
+        "    ++value;\n"
+        "    gate.unlock();\n"
+        "}\n",
+        enterpriseOptions());
+
+    require(contains(mutexResult.modernCode, "std::lock_guard<std::mutex>") || contains(mutexResult.modernCode, "std::scoped_lock"),
+            "same-scope mutex lock/unlock should become an RAII guard\nOutput:\n" + mutexResult.modernCode);
+    require(!contains(mutexResult.modernCode, "gate.unlock();"), "safe mutex RAII conversion should remove manual unlock");
+    requireCompilePassIfCompilerAvailable(mutexResult, "mutex RAII modernization should compile");
+
+    const ConversionResult unsafeMutexResult = converter.convert(
+        "#include <mutex>\n"
+        "std::mutex gate;\n"
+        "int value = 0;\n"
+        "void update(bool skip)\n"
+        "{\n"
+        "    gate.lock();\n"
+        "    if (skip)\n"
+        "    {\n"
+        "        gate.unlock();\n"
+        "        return;\n"
+        "    }\n"
+        "    ++value;\n"
+        "    gate.unlock();\n"
+        "}\n",
+        enterpriseOptions());
+
+    require(contains(unsafeMutexResult.modernCode, "gate.lock();") && contains(unsafeMutexResult.modernCode, "gate.unlock();"),
+            "branching lock/unlock should remain unchanged when RAII conversion is unsafe");
+    require(hasSuggestionRule(unsafeMutexResult, "mutex") || hasSuggestionRule(unsafeMutexResult, "lock"),
+            "unsafe lock/unlock pattern should emit a modernization suggestion");
+    requireCompilePassIfCompilerAvailable(unsafeMutexResult, "unsafe mutex pattern should remain compilable");
+
+    const ConversionResult threadResult = converter.convert(
+        "#include <thread>\n"
+        "void work() {}\n"
+        "void run()\n"
+        "{\n"
+        "    std::thread worker(work);\n"
+        "    worker.join();\n"
+        "}\n",
+        enterpriseOptions());
+
+    require(contains(threadResult.modernCode, "std::thread worker(work);"),
+            "thread join modernization should remain conservative by default");
+    require(hasSuggestionRule(threadResult, "thread") || hasSuggestionRule(threadResult, "jthread"),
+            "manual thread join should emit a RAII/jthread suggestion");
+    requireCompilePassIfCompilerAvailable(threadResult, "thread suggestion-only modernization should compile");
+
+    const ConversionResult functorResult = converter.convert(
+        "#include <algorithm>\n"
+        "#include <vector>\n"
+        "struct IsLarge\n"
+        "{\n"
+        "    bool operator()(int value) const { return value > 10; }\n"
+        "};\n"
+        "bool hasLarge(const std::vector<int>& values)\n"
+        "{\n"
+        "    return std::any_of(values.begin(), values.end(), IsLarge());\n"
+        "}\n",
+        enterpriseOptions());
+
+    require(contains(functorResult.modernCode, "[](const auto& item)"),
+            "single-use predicate functor should become an inline lambda");
+    require(!contains(functorResult.modernCode, "struct IsLarge"), "obsolete single-use functor should be removed");
+    requireCompilePassIfCompilerAvailable(functorResult, "functor-to-lambda regression should compile");
+
+    const ConversionResult loopResult = converter.convert(
+        "#include <iostream>\n"
+        "#include <map>\n"
+        "#include <vector>\n"
+        "void printValues(const std::vector<int>& values, const std::map<int, int>& lookup)\n"
+        "{\n"
+        "    for (std::vector<int>::const_iterator it = values.begin(); it != values.end(); ++it)\n"
+        "    {\n"
+        "        std::cout << *it << std::endl;\n"
+        "    }\n"
+        "    for (std::map<int, int>::const_iterator it = lookup.begin(); it != lookup.end(); ++it)\n"
+        "    {\n"
+        "        std::cout << it->first << it->second << std::endl;\n"
+        "    }\n"
+        "}\n",
+        enterpriseOptions());
+
+    require(contains(loopResult.modernCode, "for (const auto& value : values)"),
+            "safe vector iterator loop should become range-for");
+    require(contains(loopResult.modernCode, "for (const auto& [key, value] : lookup)"),
+            "safe map iterator loop should become structured binding");
+    requireCompilePassIfCompilerAvailable(loopResult, "iterator and structured binding regression should compile");
+
+    const std::filesystem::path root = makeTempDirectory("moderncpp_regression_repo");
+    writeTextFile(root / "src" / "legacy.cpp",
+        "#include <mutex>\n"
+        "std::mutex gate;\n"
+        "int value = 0;\n"
+        "void update()\n"
+        "{\n"
+        "    gate.lock();\n"
+        "    ++value;\n"
+        "    gate.unlock();\n"
+        "}\n");
+
+    RepositoryModernizationOptions repoOptions;
+    repoOptions.repositoryUrl = "https://github.com/example/regression";
+    repoOptions.outputWorkspaceFolder = root.parent_path();
+    repoOptions.modernizationLevel = OfflineModernizationLevel::Balanced;
+    repoOptions.compileVerificationEnabled = false;
+
+    RepositoryModernizationService service(std::make_unique<RuleBasedConverterEngine>());
+    const RepositoryModernizationResult repoResult = service.modernizeRepository(repoOptions, root);
+    const std::string repoModernized = readTextFile(root / "src" / "legacy.cpp");
+    require(repoResult.filesModified == 1, "repository regression fixture should be modified");
+    require(contains(repoModernized, "std::lock_guard<std::mutex>") || contains(repoModernized, "std::scoped_lock"),
+            "repository mode should use the same mutex RAII modernization pipeline");
+}
+
 void runRepositoryModeTests()
 {
     const std::filesystem::path root = makeTempDirectory("moderncpp_phase4_repo");
@@ -801,6 +1150,12 @@ int main(int argc, char** argv)
     }
     if (suite == "scoped-enum" || suite == "all") {
         runScopedEnumOutputTests();
+    }
+    if (suite == "polish" || suite == "all") {
+        runFinalPolishTests();
+    }
+    if (suite == "regression" || suite == "all") {
+        runRegressionModernizationTests();
     }
     if (suite == "repository" || suite == "all") {
         runRepositoryModeTests();

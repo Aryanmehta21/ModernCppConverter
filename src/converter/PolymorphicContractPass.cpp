@@ -134,6 +134,8 @@ std::string ensureVirtualDestructor(std::string classText,
                                     const ClassContext& context,
                                     std::vector<ConversionChange>& changes)
 {
+    classText = std::regex_replace(classText, std::regex(R"(\bvirtual\s*virtual\b)"), "virtual");
+
     if (!context.hasVirtualMethods) {
         return classText;
     }

@@ -1,6 +1,7 @@
 #include "converter/SemanticConsistencyValidator.h"
 
 #include "converter/DependentUsageRewritePass.h"
+#include "converter/CrossFunctionTypePropagationPass.h"
 #include "converter/FunctorToLambdaPass.h"
 #include "converter/OwnershipSanityScanner.h"
 #include "converter/PolymorphicContractPass.h"
@@ -59,6 +60,8 @@ std::string SemanticConsistencyValidator::validateAndRepair(const std::string& c
     std::string updated = code;
     const SmartPointerTypePropagationPass smartPointerTypePropagationPass;
     updated = smartPointerTypePropagationPass.rewrite(updated, options, context, changes);
+    const CrossFunctionTypePropagationPass crossFunctionTypePropagationPass;
+    updated = crossFunctionTypePropagationPass.rewrite(updated, changes);
     const PolymorphicContractPass polymorphicContractPass;
     updated = polymorphicContractPass.rewrite(updated, changes);
     const FunctorToLambdaPass functorToLambdaPass;
@@ -76,7 +79,7 @@ std::string SemanticConsistencyValidator::validateAndRepair(const std::string& c
 
     for (const TypeChangeRecord& record : context.typeChanges()) {
         if (isSmartPointerCollection(record)) {
-            const std::regex rawNewPattern(escapeRegex(record.symbolName) + R"((?:\s*\[[^\]]+\]|\s*\.\s*(?:push_back|emplace_back)\s*\()\s*(?:=)?\s*new\s+)");
+            const std::regex rawNewPattern(escapeRegex(record.symbolName) + R"((\s*\[[^\]]+\]|\s*\.\s*(push_back|emplace_back)\s*\()\s*(=)?\s*new\s+)");
             if (std::regex_search(updated, rawNewPattern)) {
                 addSuggestion(changes,
                               "Semantic consistency validator",
@@ -86,7 +89,7 @@ std::string SemanticConsistencyValidator::validateAndRepair(const std::string& c
         }
 
         if (record.newType.starts_with("std::vector<") || record.newType == "std::string" || record.newType.starts_with("std::array<")) {
-            const std::regex pointerOperationPattern(escapeRegex(record.symbolName) + R"(\s*(?:==|!=|=)\s*nullptr|delete\s*(?:\[\s*\])?\s*)" + escapeRegex(record.symbolName));
+            const std::regex pointerOperationPattern(escapeRegex(record.symbolName) + R"(\s*(==|!=|=)\s*nullptr|delete\s*(\[\s*\])?\s*)" + escapeRegex(record.symbolName));
             if (std::regex_search(updated, pointerOperationPattern)) {
                 addSuggestion(changes,
                               "Semantic consistency validator",
