@@ -415,6 +415,10 @@ std::string VectorGrowthEmulationCleanupPass::rewrite(const std::string& code,
         for (std::sregex_iterator iterator(updated.begin(), updated.end(), appendProbePattern), end; iterator != end; ++iterator) {
             appendCountSymbols.insert((*iterator)[1].str());
         }
+        const std::regex postIncrementAppendProbePattern(targetExpression + R"(\s*\[\s*([A-Za-z_]\w*)\s*\+\+\s*\](?:\s*\.\s*[A-Za-z_]\w*)?\s*=)");
+        for (std::sregex_iterator iterator(updated.begin(), updated.end(), postIncrementAppendProbePattern), end; iterator != end; ++iterator) {
+            appendCountSymbols.insert((*iterator)[1].str());
+        }
 
         const bool hasAppendPattern = !appendCountSymbols.empty();
 
@@ -576,6 +580,21 @@ std::string VectorGrowthEmulationCleanupPass::rewrite(const std::string& code,
                 return replacement + trailingComment;
             }
 
+            const std::regex vectorConstructionPattern("^([ \\t]*)std::vector\\s*<\\s*" + escapeRegex(elementType)
+                                                       + R"(\s*>\s+)" + escapeRegex(record.symbolName)
+                                                       + R"(\s*\(\s*([^)]+)\s*\)\s*;\s*$)");
+            if (hasAppendPattern && std::regex_match(codePart, match, vectorConstructionPattern)) {
+                const std::string replacement = match[1].str() + "std::vector<" + elementType + "> " + record.symbolName + ";\n"
+                    + match[1].str() + record.symbolName + ".reserve(" + trim(match[2].str()) + ");";
+                changed = true;
+                addAppliedChange(changes,
+                                 "Vector growth reserve modernization",
+                                 trim(codePart),
+                                 trim(replacement),
+                                 "The raw array is used with append-style indexing, so the converted std::vector keeps capacity with reserve() instead of pre-sizing elements.");
+                return replacement + trailingComment;
+            }
+
             const std::regex resizePattern("^([ \\t]*)(" + targetExpression + ")\\.resize\\(([^)]+)\\)\\s*;\\s*$");
             if (hasAppendPattern && std::regex_match(codePart, match, resizePattern)) {
                 const std::string replacement = match[1].str() + trim(match[2].str()) + ".reserve(" + trim(match[3].str()) + ");";
@@ -656,6 +675,27 @@ std::string VectorGrowthEmulationCleanupPass::rewrite(const std::string& code,
                              trim(appendMatch[0].str()),
                              trim(replacement),
                              "Replaced indexed append plus count increment with std::vector::push_back().");
+            appendConsumed = appendPosition + replacement.size();
+            appendSearch = updated.substr(appendConsumed);
+        }
+
+        const std::regex postIncrementAppendPattern("(^[ \\t]*)(" + targetExpression
+                                                       + ")\\s*\\[\\s*([A-Za-z_]\\w*)\\s*\\+\\+\\s*\\]\\s*=\\s*([^;]+)\\s*;",
+                                                   std::regex::ECMAScript | std::regex::multiline);
+        appendSearch = updated;
+        appendConsumed = 0;
+        while (std::regex_search(appendSearch, appendMatch, postIncrementAppendPattern)) {
+            const std::string replacement = appendMatch[1].str() + record.symbolName + ".push_back(" + trim(appendMatch[4].str()) + ");";
+            const std::size_t appendPosition = appendConsumed + static_cast<std::size_t>(appendMatch.position());
+            updated.replace(appendPosition,
+                            static_cast<std::size_t>(appendMatch.length()),
+                            replacement);
+            changed = true;
+            addAppliedChange(changes,
+                             "Indexed append to vector push_back",
+                             trim(appendMatch[0].str()),
+                             trim(replacement),
+                             "Replaced post-increment indexed append with std::vector::push_back().");
             appendConsumed = appendPosition + replacement.size();
             appendSearch = updated.substr(appendConsumed);
         }

@@ -554,7 +554,8 @@ std::string removeCstringIfUnused(std::string code)
     return includeManager.removeIncludeIfUnused(
         std::move(code),
         "#include <cstring>",
-        {"std::strcpy", "std::strncpy", "std::strcmp", "std::strlen", "strcpy(", "strncpy(", "strcmp(", "strlen("});
+        {"std::strcpy", "std::strncpy", "std::strcat", "std::strcmp", "std::strlen",
+         "strcpy(", "strncpy(", "strcat(", "strcmp(", "strlen("});
 }
 
 } // namespace
@@ -750,8 +751,8 @@ std::string StructuralModernizationEngine::modernizeCharBuffers(const std::strin
         const std::string name = match[2].str();
         const std::string size = match[3].str();
         const std::string targetExpression = accessExpressionRegex(name);
-        const bool textUsage = std::regex_search(updated, std::regex(R"(\b(?:std::)?str(?:n?cpy|cmp|len)\s*\(\s*)" + targetExpression))
-            || std::regex_search(updated, std::regex(R"(\b(?:std::)?str(?:n?cpy|cmp|len)\s*\([^;]*,\s*)" + targetExpression));
+        const bool textUsage = std::regex_search(updated, std::regex(R"(\b(?:std::)?(?:strncpy|strcpy|strcat|strcmp|strlen)\s*\(\s*)" + targetExpression))
+            || std::regex_search(updated, std::regex(R"(\b(?:std::)?(?:strncpy|strcpy|strcat|strcmp|strlen)\s*\([^;]*,\s*)" + targetExpression));
 
         if (!textUsage) {
             addSuggestion(changes,
@@ -846,7 +847,7 @@ std::string StructuralModernizationEngine::modernizeDynamicArrays(const std::str
     bool changed = false;
 
     static const std::regex localArrayPattern(
-        R"((^[ \t]*)(?!char\b)([A-Za-z_:][A-Za-z0-9_:]*(?:\s*<[^;\n{}]+>)?)\s*\*\s*([A-Za-z_]\w*)\s*=\s*new\s+\2\s*\[\s*([^\]]+)\s*\]\s*;\s*(//.*)?)",
+        R"((^[ \t]*)(?!char\b)([A-Za-z_:][A-Za-z0-9_:]*(?:\s*<[^;\n{}]+>)?)\s*\*\s*([A-Za-z_]\w*)\s*=\s*new\s+\2\s*\[\s*([^\]]+)\s*\]\s*;[ \t]*(//.*)?)",
         std::regex::ECMAScript | std::regex::multiline);
     std::string search = updated;
     std::smatch match;

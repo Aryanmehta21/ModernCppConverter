@@ -38,6 +38,7 @@ add_library(ModernCppConverterCore
     src/converter/CompilerDiagnosticCleanupPass.cpp
     src/converter/CompileVerifier.cpp
     src/converter/ConcurrencyRaiiModernizationPass.cpp
+    src/converter/ContainerModernizationCleanupPass.cpp
     src/converter/ContainerPolishPass.cpp
     src/converter/CrossFunctionTypePropagationPass.cpp
     src/converter/CrossScopeTypePropagationPass.cpp
@@ -46,6 +47,7 @@ add_library(ModernCppConverterCore
     src/converter/EnumToStringCandidatePass.cpp
     src/converter/FilePointerModernizationPass.cpp
     src/converter/FileIoModernizationPass.cpp
+    src/converter/FunctionPointerModernizationPass.cpp
     src/converter/AutoDeductionPass.cpp
     src/converter/FunctionalModernizationPass.cpp
     src/converter/FunctionalModernizationValidator.cpp
@@ -56,6 +58,7 @@ add_library(ModernCppConverterCore
     src/converter/IteratorModernizationPass.cpp
     src/converter/IncludeManager.cpp
     src/converter/MemberApiCascadePass.cpp
+    src/converter/MallocFreeModernizationPass.cpp
     src/converter/ModernizationPolishPass.cpp
     src/converter/ModernizationPolishValidator.cpp
     src/converter/OfflineModernizationPipeline.cpp
@@ -68,8 +71,10 @@ add_library(ModernCppConverterCore
     src/converter/PolymorphicContractPass.cpp
     src/converter/PolymorphicContractPolishPass.cpp
     src/converter/PolymorphicSafetyPass.cpp
+    src/converter/PrintfModernizationPass.cpp
     src/converter/QualityModernizationPass.cpp
     src/converter/RangeForModernizationPass.cpp
+    src/converter/ReturnTypePropagationPass.cpp
     src/converter/OrphanedGrowthSymbolCleanupPass.cpp
     src/converter/OrphanedTempBufferLoopCleanupPass.cpp
     src/converter/SafeReplacementEngine.cpp

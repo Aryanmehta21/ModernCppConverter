@@ -116,6 +116,33 @@ bool cleanupOnlyBody(std::string body)
                body.end());
     return body.empty();
 }
+
+bool classHasUnconvertedRawOwnedResource(const std::string& classText)
+{
+    const std::regex rawMemberPattern(R"(\b(?:char|wchar_t|unsigned\s+char|[A-Za-z_][A-Za-z0-9_:<>]*)\s*\*\s*([A-Za-z_]\w*)\s*(?:=\s*(?:nullptr|NULL|0))?\s*;)");
+    for (std::sregex_iterator it(classText.begin(), classText.end(), rawMemberPattern), end; it != end; ++it) {
+        const std::string member = (*it)[1].str();
+        const std::string escaped = std::regex_replace(member, std::regex(R"([-[\]{}()*+?.,\^$|#\s])"), R"(\$&)");
+        const bool deleted = std::regex_search(classText, std::regex(R"(delete\s*(?:\[\s*\])?\s*)" + escaped + R"(\b)"));
+        const bool allocated = std::regex_search(classText, std::regex(R"(\b)" + escaped + R"(\s*=\s*new\b)"))
+            || std::regex_search(classText, std::regex(R"(\b)" + escaped + R"(\s*\(\s*new\b)"));
+        if (deleted || allocated) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool classStillNeedsManualOwnershipCleanup(const std::string& code, const std::string& className)
+{
+    const ClassResourceAnalyzer analyzer;
+    for (const ClassBlock& block : analyzer.analyzeClasses(code)) {
+        if (block.name == className) {
+            return classHasUnconvertedRawOwnedResource(block.text);
+        }
+    }
+    return false;
+}
 } // namespace
 
 std::string RuleOfZeroPass::rewrite(const std::string& code,
@@ -164,6 +191,11 @@ std::string RuleOfZeroPass::rewrite(const std::string& code,
             continue;
         }
         const std::string body = updated.substr(openBrace + 1, closeBrace - openBrace - 1);
+        if (classStillNeedsManualOwnershipCleanup(updated, className)) {
+            consumed = closeBrace + 1;
+            search = updated.substr(consumed);
+            continue;
+        }
         if (!cleanupOnlyBody(body)) {
             consumed = closeBrace + 1;
             search = updated.substr(consumed);

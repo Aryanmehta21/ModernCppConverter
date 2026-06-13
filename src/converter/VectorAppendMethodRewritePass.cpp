@@ -127,6 +127,24 @@ std::string VectorAppendMethodRewritePass::rewrite(const std::string& code,
                 }
             }
 
+            const std::regex postIncrementAppendPattern("^([ \\t]*)(" + targetExpression
+                                                          + ")\\s*\\[\\s*([A-Za-z_]\\w*)\\s*\\+\\+\\s*\\]\\s*=\\s*([^;]+)\\s*;\\s*$");
+            if (std::regex_match(codePart, match, postIncrementAppendPattern)) {
+                const std::string replacement = match[1].str() + record.symbolName + ".push_back(" + trim(match[4].str()) + ");";
+                changed = true;
+                addAppliedChange(changes,
+                                 "Vector append method rewrite",
+                                 trim(codePart),
+                                 trim(replacement),
+                                 "Rewrote post-increment indexed vector append to push_back so std::vector owns growth safely.");
+                addAppliedChange(changes,
+                                 "Indexed append to vector push_back",
+                                 trim(codePart),
+                                 trim(replacement),
+                                 "Converted post-increment append-style indexed write into std::vector::push_back().");
+                return replacement + trailingComment;
+            }
+
             return line;
         });
 

@@ -576,6 +576,18 @@ std::string DependentUsageRewritePass::rewriteStringUsages(const std::string& co
                 changed = true;
             }
 
+            const std::regex strcatPattern("^([ \\t]*)(?:std::)?strcat\\s*\\(\\s*(" + targetExpression + ")\\s*,\\s*([^;]+?)\\s*\\)\\s*;\\s*$");
+            if (std::regex_match(rewritten, match, strcatPattern)) {
+                const std::string replacement = match[1].str() + trim(match[2].str()) + " += " + trim(match[3].str()) + ";";
+                addAppliedChange(changes,
+                                 "Replace C-string concatenation with string append",
+                                 trim(rewritten),
+                                 trim(replacement),
+                                 "Updated strcat after the destination became std::string.");
+                rewritten = replacement;
+                changed = true;
+            }
+
             const std::regex nullTerminationPattern("^[ \\t]*(" + targetExpression + ")\\s*\\[[^;\\n]+\\]\\s*=\\s*'\\\\0'\\s*;\\s*$");
             if (std::regex_match(rewritten, match, nullTerminationPattern)) {
                 addAppliedChange(changes,
@@ -593,6 +605,12 @@ std::string DependentUsageRewritePass::rewriteStringUsages(const std::string& co
                                            "$1 == $2");
             rewritten = std::regex_replace(rewritten,
                                            std::regex("(?:std::)?strcmp\\s*\\(\\s*(" + targetExpression + ")\\s*,\\s*([^)]+?)\\s*\\)\\s*!=\\s*0"),
+                                           "$1 != $2");
+            rewritten = std::regex_replace(rewritten,
+                                           std::regex("(?:std::)?strcmp\\s*\\(\\s*([^,]+?)\\s*,\\s*(" + targetExpression + ")\\s*\\)\\s*==\\s*0"),
+                                           "$1 == $2");
+            rewritten = std::regex_replace(rewritten,
+                                           std::regex("(?:std::)?strcmp\\s*\\(\\s*([^,]+?)\\s*,\\s*(" + targetExpression + ")\\s*\\)\\s*!=\\s*0"),
                                            "$1 != $2");
             if (rewritten != beforeComparisonRewrite) {
                 addAppliedChange(changes,
@@ -637,7 +655,8 @@ std::string DependentUsageRewritePass::rewriteStringUsages(const std::string& co
             updated = includeManager.ensureInclude(updated, "#include <string>");
             updated = includeManager.removeIncludeIfUnused(updated,
                                                            "#include <cstring>",
-                                                           {"std::strcpy", "std::strncpy", "std::strcmp", "std::strlen", "strcpy(", "strncpy(", "strcmp(", "strlen("});
+                                                           {"std::strcpy", "std::strncpy", "std::strcat", "std::strcmp", "std::strlen",
+                                                            "strcpy(", "strncpy(", "strcat(", "strcmp(", "strlen("});
         }
     }
 
@@ -720,7 +739,8 @@ std::string DependentUsageRewritePass::runConsistencyChecks(const std::string& c
 
         if (isStringRecord(record)) {
             const std::vector<std::pair<std::regex, std::string>> invalidPatterns{
-                {std::regex(R"((?:std::)?str(?:n?cpy|cmp|len)\s*\(\s*)" + targetExpression), "C-string API still targets converted std::string"},
+                {std::regex(R"((?:std::)?(?:strncpy|strcpy|strcat|strcmp|strlen)\s*\(\s*)" + targetExpression), "C-string API still targets converted std::string"},
+                {std::regex(R"((?:std::)?(?:strcmp)\s*\([^;\n,]+,\s*)" + targetExpression), "C-string API still targets converted std::string"},
                 {std::regex(R"(sizeof\s*\(\s*)" + targetExpression + R"(\s*\))"), "sizeof used as buffer size on converted std::string"},
                 {std::regex(targetExpression + R"(\s*\[[^;\n]+\]\s*=\s*'\\0')"), "manual null termination on converted std::string"},
             };

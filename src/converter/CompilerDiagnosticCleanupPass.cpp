@@ -78,6 +78,7 @@ bool hasKnownDiagnosticForRecord(const std::string& loweredCompilerOutput, const
     if (isStringRecord(record)) {
         return loweredCompilerOutput.find("strncpy") != std::string::npos
             || loweredCompilerOutput.find("strcpy") != std::string::npos
+            || loweredCompilerOutput.find("strcat") != std::string::npos
             || loweredCompilerOutput.find("strcmp") != std::string::npos
             || loweredCompilerOutput.find("strlen") != std::string::npos
             || loweredCompilerOutput.find("std::string") != std::string::npos

@@ -9,15 +9,18 @@
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
 #include "converter/ConcurrencyRaiiModernizationPass.h"
+#include "converter/ContainerModernizationCleanupPass.h"
 #include "converter/ContainerPolishPass.h"
 #include "converter/CrossFunctionTypePropagationPass.h"
 #include "converter/CrossScopeTypePropagationPass.h"
 #include "converter/EnumToStringCandidatePass.h"
 #include "converter/FileIoModernizationPass.h"
+#include "converter/FunctionPointerModernizationPass.h"
 #include "converter/FunctionalModernizationPass.h"
 #include "converter/FunctorToLambdaPass.h"
 #include "converter/ImpactCascadingCleanupPass.h"
 #include "converter/IteratorModernizationPass.h"
+#include "converter/MallocFreeModernizationPass.h"
 #include "converter/MemberApiCascadePass.h"
 #include "converter/ModernizationPolishPass.h"
 #include "converter/ModernizationPolishValidator.h"
@@ -28,7 +31,9 @@
 #include "converter/PassByValueToConstRefPass.h"
 #include "converter/PolymorphicContractPolishPass.h"
 #include "converter/PolymorphicSafetyPass.h"
+#include "converter/PrintfModernizationPass.h"
 #include "converter/QualityModernizationPass.h"
+#include "converter/ReturnTypePropagationPass.h"
 #include "converter/RuleOfZeroPass.h"
 #include "converter/RuleOfZeroPolishPass.h"
 #include "converter/ScopeLeakValidationPass.h"
@@ -346,6 +351,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
             const OwnershipGraphModernizationPass pass;
             return pass.modernize(input, options, transformationContext, changes);
         });
+        runTracedPass("MallocFreeModernizationPass", [&](const std::string& input) {
+            const MallocFreeModernizationPass pass;
+            return pass.rewrite(input, options, transformationContext, changes);
+        });
         runTracedPass("ClassStringBufferModernizationPass", [&](const std::string& input) {
             const ClassStringBufferModernizationPass pass;
             return pass.rewrite(input, changes);
@@ -378,6 +387,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
             const ImpactCascadingCleanupPass pass;
             return pass.run(input, transformationContext, changes);
         });
+        runTracedPass("ContainerModernizationCleanupPass", [&](const std::string& input) {
+            const ContainerModernizationCleanupPass pass;
+            return pass.rewrite(input, transformationContext, changes);
+        });
         runTracedPass("VectorParadigmRewritePass", [&](const std::string& input) {
             const VectorParadigmRewritePass pass;
             return pass.rewrite(input, transformationContext, changes);
@@ -405,6 +418,14 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         runTracedPass("MemberApiCascadePass", [&](const std::string& input) {
             const MemberApiCascadePass pass;
             return pass.rewrite(input, transformationContext, changes);
+        });
+        runTracedPass("ContainerModernizationCleanupPass", [&](const std::string& input) {
+            const ContainerModernizationCleanupPass pass;
+            return pass.rewrite(input, transformationContext, changes);
+        });
+        runTracedPass("ReturnTypePropagationPass", [&](const std::string& input) {
+            const ReturnTypePropagationPass pass;
+            return pass.rewrite(input, changes);
         });
         runTracedPass("ImpactCascadingCleanupPass", [&](const std::string& input) {
             const ImpactCascadingCleanupPass pass;
@@ -444,6 +465,14 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         runTracedPass("FileIoModernizationPass", [&](const std::string& input) {
             const FileIoModernizationPass pass;
             return pass.rewrite(input, changes);
+        });
+        runTracedPass("PrintfModernizationPass", [&](const std::string& input) {
+            const PrintfModernizationPass pass;
+            return pass.rewrite(input, options, changes);
+        });
+        runTracedPass("FunctionPointerModernizationPass", [&](const std::string& input) {
+            const FunctionPointerModernizationPass pass;
+            return pass.rewrite(input, options, changes);
         });
         runTracedPass("FunctorToLambdaPass", [&](const std::string& input) {
             const FunctorToLambdaPass pass;
@@ -485,6 +514,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         runTracedPass("SemanticModernizationValidator", [&](const std::string& input) {
             const SemanticModernizationValidator pass;
             return pass.validateAndRepair(input, options, transformationContext, {}, changes);
+        });
+        runTracedPass("ReturnTypePropagationPass", [&](const std::string& input) {
+            const ReturnTypePropagationPass pass;
+            return pass.rewrite(input, changes);
         });
 
         const ModernizationPolishValidator polishValidator;
@@ -587,6 +620,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                 const ImpactCascadingCleanupPass pass;
                 return pass.run(input, transformationContext, changes);
             });
+            runTracedPass("ContainerModernizationCleanupPass", [&](const std::string& input) {
+                const ContainerModernizationCleanupPass pass;
+                return pass.rewrite(input, transformationContext, changes);
+            });
             runTracedPass("VectorParadigmRewritePass", [&](const std::string& input) {
                 const VectorParadigmRewritePass pass;
                 return pass.rewrite(input, transformationContext, changes);
@@ -610,6 +647,14 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
             runTracedPass("MemberApiCascadePass", [&](const std::string& input) {
                 const MemberApiCascadePass pass;
                 return pass.rewrite(input, transformationContext, changes);
+            });
+            runTracedPass("ContainerModernizationCleanupPass", [&](const std::string& input) {
+                const ContainerModernizationCleanupPass pass;
+                return pass.rewrite(input, transformationContext, changes);
+            });
+            runTracedPass("ReturnTypePropagationPass", [&](const std::string& input) {
+                const ReturnTypePropagationPass pass;
+                return pass.rewrite(input, changes);
             });
             runTracedPass("OwnershipSanityScanner", [&](const std::string& input) {
                 const OwnershipSanityScanner pass;

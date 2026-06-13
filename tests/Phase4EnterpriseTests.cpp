@@ -1375,11 +1375,11 @@ void runQualitySprintTests()
         "    strlen(text);\n"
         "}\n",
         options);
-    require(contains(cHeaderResult.modernCode, "#include <cstdio>")
+    require(contains(cHeaderResult.modernCode, "#include <iostream>")
                 && contains(cHeaderResult.modernCode, "#include <cstring>"),
-            "C headers should become C++ headers\nOutput:\n" + cHeaderResult.modernCode);
-    require(contains(cHeaderResult.modernCode, "std::printf") && contains(cHeaderResult.modernCode, "std::strlen"),
-            "C header modernization should qualify standard C symbols");
+            "C headers and converted printf output should use the required C++ headers\nOutput:\n" + cHeaderResult.modernCode);
+    require(contains(cHeaderResult.modernCode, "std::cout << text;") && contains(cHeaderResult.modernCode, "std::strlen"),
+            "C header modernization should qualify remaining C symbols and printf modernization should use iostream output");
     requireCompilePassIfCompilerAvailable(cHeaderResult, "C header modernization should compile");
 
     const ConversionResult constantResult = converter.convert(
@@ -1440,7 +1440,7 @@ void runQualitySprintTests()
     const RepositoryModernizationResult repoResult = service.modernizeRepository(repoOptions, root);
     const std::string repoModernized = readTextFile(root / "src" / "legacy.cpp");
     require(repoResult.filesModified == 1, "repository quality fixture should be modified");
-    require(contains(repoModernized, "#include <cstdio>"), "repository mode should apply C header modernization");
+    require(contains(repoModernized, "#include <iostream>"), "repository mode should apply printf output modernization");
     require(contains(repoModernized, "std::swap(left, right);")
                 || (contains(repoModernized, "using std::swap;") && contains(repoModernized, "swap(left, right);")),
             "repository mode should use the same swap modernization pass");

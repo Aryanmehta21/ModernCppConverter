@@ -10,6 +10,7 @@
 #include "converter/OrphanedTempBufferLoopCleanupPass.h"
 #include "converter/OwnershipGraphAnalyzer.h"
 #include "converter/OwnershipSanityScanner.h"
+#include "converter/ReturnTypePropagationPass.h"
 #include "converter/ScopeAwareSymbolTable.h"
 #include "converter/ScopeLeakValidationPass.h"
 #include "converter/SmartPointerCollectionPropagationPass.h"
@@ -39,6 +40,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 
@@ -185,6 +187,244 @@ void testTypedefConversion()
     require(contains(result.changes.front().ruleName, "typedef"), "typedef conversion should record its rule name");
     require(result.changes.front().before == "typedef unsigned long Size;", "typedef conversion should track the original line");
     require(result.changes.front().after == "using Size = unsigned long;", "typedef conversion should track the transformed line");
+}
+
+void testFunctionPointerTypedefAndLocalCallbackModernization()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <iostream>\n"
+        "typedef int (*Transform)(int);\n"
+        "int increment(int value) { return value + 1; }\n"
+        "void run()\n"
+        "{\n"
+        "    int (*callback)(int) = &increment;\n"
+        "    std::cout << callback(1) << '\\n';\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "using Transform = int (*)(int);"),
+            "function pointer typedef should become a using alias");
+    require(contains(result.modernCode, "auto callback = &increment;"),
+            "local function pointer initialized from a callable should use auto");
+    require(!contains(result.modernCode, "typedef int (*Transform)(int);"),
+            "legacy function pointer typedef should be removed");
+    require(hasAppliedRule(result, "Function pointer typedef to using"),
+            "function pointer typedef modernization should be tracked");
+    require(hasAppliedRule(result, "Function pointer local callback to auto"),
+            "local function pointer auto modernization should be tracked");
+    require(result.compileVerificationPassed,
+            "function pointer typedef/local callback modernization should pass syntax verification\n"
+            + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+}
+
+void testStoredCallbackUsesStdFunctionConservatively()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "void consume(int) {}\n"
+        "class CallbackStore\n"
+        "{\n"
+        "public:\n"
+        "    CallbackStore() : callback(nullptr) {}\n"
+        "    void setCallback(void (*next)(int))\n"
+        "    {\n"
+        "        callback = next;\n"
+        "    }\n"
+        "    void notify(int value)\n"
+        "    {\n"
+        "        if (callback != nullptr)\n"
+        "        {\n"
+        "            callback(value);\n"
+        "        }\n"
+        "    }\n"
+        "private:\n"
+        "    void (*callback)(int);\n"
+        "};\n"
+        "void run()\n"
+        "{\n"
+        "    CallbackStore store;\n"
+        "    store.setCallback(&consume);\n"
+        "    store.notify(3);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "#include <functional>"),
+            "stored callback modernization should add <functional>");
+    require(contains(result.modernCode, "std::function<void(int)> callback;"),
+            "private stored callback should become std::function");
+    require(contains(result.modernCode, "void setCallback(std::function<void(int)> next)"),
+            "visible local setter feeding callback storage should accept std::function");
+    require(contains(result.modernCode, "if (callback)"),
+            "converted std::function callback should use boolean emptiness checks");
+    require(!contains(result.modernCode, "void (*callback)(int)"),
+            "stored raw callback field should be removed");
+    require(!contains(result.modernCode, "void (*next)(int)"),
+            "stored callback setter parameter should be updated");
+    require(hasAppliedRule(result, "Stored callback pointer to std::function"),
+            "stored callback modernization should be tracked");
+    require(result.compileVerificationPassed,
+            "stored callback std::function modernization should pass syntax verification\n"
+            + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+}
+
+void testRawFunctionPointerParameterPreservedWhenNotStored()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "void apply(void (*callback)(int))\n"
+        "{\n"
+        "    callback(7);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "void apply(void (*callback)(int))"),
+            "non-stored raw callback parameter should remain a function pointer");
+    require(!contains(result.modernCode, "std::function"),
+            "std::function should not be introduced for simple observing callback parameters");
+    require(hasSuggestionRule(result, "Function pointer parameter preserved"),
+            "preserved raw function pointer parameter should produce a conservative suggestion");
+    require(result.compileVerificationPassed,
+            "preserved raw function pointer parameter sample should still pass syntax verification\n"
+            + result.compilerOutput);
+}
+
+void testPrintfSimpleTextModernizesToCout()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <cstdio>\n"
+        "void greet()\n"
+        "{\n"
+        "    printf(\"ready\\n\");\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "#include <iostream>"),
+            "printf text modernization should add iostream");
+    require(contains(result.modernCode, "std::cout << \"ready\\n\";"),
+            "simple printf text should become std::cout output");
+    require(!contains(result.modernCode, "printf("), "converted printf should be removed");
+    require(!contains(result.modernCode, "#include <cstdio>"), "cstdio include should be removed when no C stdio APIs remain");
+    require(hasAppliedRule(result, "printf-family output to iostream"), "printf text modernization should be tracked");
+    require(result.compileVerificationPassed,
+            "simple printf text modernization should pass syntax verification\n"
+            + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+}
+
+void testPrintfValuesModernizeToIostreamChain()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <cstdio>\n"
+        "void report(const char* name, int count, unsigned long total)\n"
+        "{\n"
+        "    std::printf(\"Name: %s count=%d total=%lu\\n\", name, count, total);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::cout << \"Name: \" << name << \" count=\" << count << \" total=\" << total << \"\\n\";"),
+            "simple printf format values should become an iostream chain\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::printf"), "converted std::printf should be removed");
+    require(hasAppliedRule(result, "printf-family output to iostream"), "printf value modernization should be tracked");
+    require(result.compileVerificationPassed,
+            "printf value modernization should pass syntax verification\n"
+            + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+}
+
+void testPrintfValuesCanUseStdFormatWhenEnabled()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.useStdFormatForStreams = true;
+    options.targetStandard = CppStandard::Cpp20;
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <cstdio>\n"
+        "void report(int count)\n"
+        "{\n"
+        "    printf(\"count=%d\\n\", count);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "#include <format>"), "std::format printf modernization should add format include");
+    require(contains(result.modernCode, "std::cout << std::format(\"count={}\\n\", count);"),
+            "printf format values should use std::format when the C++20 format option is enabled");
+    require(hasAppliedRule(result, "printf-family output to std::format"), "printf std::format modernization should be tracked");
+    require(result.compilerUsed.empty() || result.compileVerificationPassed,
+            "printf std::format modernization should compile where compiler supports <format>\n"
+            + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+}
+
+void testFprintfStdoutAndStderrModernizeToStreams()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <cstdio>\n"
+        "void report(const char* message, int code)\n"
+        "{\n"
+        "    fprintf(stdout, \"message: %s\\n\", message);\n"
+        "    std::fprintf(stderr, \"error: %d\\n\", code);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::cout << \"message: \" << message << \"\\n\";"),
+            "fprintf(stdout, ...) should become std::cout");
+    require(contains(result.modernCode, "std::cerr << \"error: \" << code << \"\\n\";"),
+            "fprintf(stderr, ...) should become std::cerr");
+    require(!contains(result.modernCode, "fprintf(stdout"), "converted stdout fprintf should be removed");
+    require(!contains(result.modernCode, "std::fprintf(stderr"), "converted stderr fprintf should be removed");
+    require(result.compileVerificationPassed,
+            "fprintf stdout/stderr modernization should pass syntax verification\n"
+            + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+}
+
+void testUnsafePrintfFormatsRemainSuggestions()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <cstdio>\n"
+        "void report(int value, double ratio, FILE* file)\n"
+        "{\n"
+        "    printf(\"value=%04d\\n\", value);\n"
+        "    printf(\"ratio=%.2f\\n\", ratio);\n"
+        "    fprintf(file, \"value=%d\\n\", value);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "printf(\"value=%04d\\n\", value);"),
+            "width-formatted printf should remain unchanged");
+    require(contains(result.modernCode, "printf(\"ratio=%.2f\\n\", ratio);"),
+            "precision/floating printf should remain unchanged");
+    require(contains(result.modernCode, "fprintf(file, \"value=%d\\n\", value);"),
+            "arbitrary FILE* fprintf should remain unchanged for FILE I/O pass/manual review");
+    require(hasSuggestionRule(result, "printf-family output modernization suggestion"),
+            "unsafe printf-family calls should produce suggestions");
+    require(result.compileVerificationPassed,
+            "unsafe printf preservation sample should still pass syntax verification\n"
+            + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
 }
 
 void testSuggestionGeneration()
@@ -565,6 +805,290 @@ void testConvertsNewWithConstructorArgsToMakeUnique()
     require(!contains(result.modernCode, "delete controller"), "matching delete with constructor args should be removed");
 }
 
+void testUniquePtrOwnerPassedToRawObserverUsesGet()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "class Device\n"
+        "{\n"
+        "public:\n"
+        "    void ping() {}\n"
+        "};\n\n"
+        "void inspect(Device* device)\n"
+        "{\n"
+        "    if (device != nullptr)\n"
+        "    {\n"
+        "        device->ping();\n"
+        "    }\n"
+        "}\n\n"
+        "void run()\n"
+        "{\n"
+        "    Device* device = new Device();\n"
+        "    inspect(device);\n"
+        "    delete device;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "auto device = std::make_unique<Device>();"),
+            "local new/delete owner should become unique_ptr");
+    require(contains(result.modernCode, "inspect(device.get());"),
+            "unique_ptr owner passed to visible raw observer should use .get()\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "inspect(device);"),
+            "unique_ptr should not be passed directly to a raw pointer sink");
+    require(!contains(result.modernCode, "delete device"), "manual delete should be removed");
+    require(hasAppliedRule(result, "Smart pointer sink propagation"), "raw sink propagation should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "unique_ptr raw observer propagation should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testClassRawPointerMemberDeletesCopyAndDefaultsMove()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "struct Resource\n"
+        "{\n"
+        "    int value = 0;\n"
+        "};\n\n"
+        "class Owner\n"
+        "{\n"
+        "public:\n"
+        "    Owner()\n"
+        "        : resource(new Resource())\n"
+        "    {\n"
+        "    }\n\n"
+        "    Owner(const Owner& other)\n"
+        "        : resource(new Resource(*other.resource))\n"
+        "    {\n"
+        "    }\n\n"
+        "    Owner& operator=(const Owner& other)\n"
+        "    {\n"
+        "        if (this != &other)\n"
+        "        {\n"
+        "            delete resource;\n"
+        "            resource = new Resource(*other.resource);\n"
+        "        }\n"
+        "        return *this;\n"
+        "    }\n\n"
+        "    ~Owner()\n"
+        "    {\n"
+        "        delete resource;\n"
+        "        resource = nullptr;\n"
+        "    }\n\n"
+        "    Resource* getResource() const\n"
+        "    {\n"
+        "        return resource;\n"
+        "    }\n\n"
+        "private:\n"
+        "    Resource* resource;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::unique_ptr<Resource> resource;"),
+            "owned raw pointer member should become unique_ptr\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "resource(std::make_unique<Resource>())"),
+            "constructor initializer new should become make_unique");
+    require(contains(result.modernCode, "Owner(const Owner&) = delete;"),
+            "copy constructor should be deleted for unique ownership");
+    require(contains(result.modernCode, "Owner& operator=(const Owner&) = delete;"),
+            "copy assignment should be deleted for unique ownership");
+    require(contains(result.modernCode, "Owner(Owner&&) noexcept = default;"),
+            "move constructor should be defaulted for unique ownership");
+    require(contains(result.modernCode, "Owner& operator=(Owner&&) noexcept = default;"),
+            "move assignment should be defaulted for unique ownership");
+    require(contains(result.modernCode, "return resource.get();"),
+            "raw observer getter should return unique_ptr::get()");
+    require(!contains(result.modernCode, "delete resource"), "manual member delete should be removed");
+    require(!contains(result.modernCode, "~Owner()"), "cleanup-only destructor should be removed");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "member unique_ptr copy/move modernization should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testMallocSingleObjectModernizesToUniquePtr()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstdlib>\n"
+        "struct Record\n"
+        "{\n"
+        "    int value = 0;\n"
+        "};\n\n"
+        "int readValue()\n"
+        "{\n"
+        "    Record* record = (Record*)malloc(sizeof(Record));\n"
+        "    record->value = 7;\n"
+        "    free(record);\n"
+        "    return 7;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "#include <memory>"), "malloc single-object conversion should add memory include");
+    require(contains(result.modernCode, "auto record = std::make_unique<Record>();"),
+            "single-object malloc/free should become make_unique");
+    require(!contains(result.modernCode, "malloc("), "converted single-object malloc should be removed");
+    require(!contains(result.modernCode, "free(record)"), "converted single-object free should be removed");
+    require(!contains(result.modernCode, "#include <cstdlib>"), "cstdlib include should be removed when malloc/free are gone");
+    require(hasAppliedRule(result, "malloc/free ownership to std::unique_ptr"),
+            "single-object malloc/free conversion should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "single-object malloc/free conversion should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testMallocArrayModernizesToVector()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstdlib>\n"
+        "int sum(int count)\n"
+        "{\n"
+        "    int* values = (int*)malloc(count * sizeof(int));\n"
+        "    values[0] = 1;\n"
+        "    values[count - 1] = 2;\n"
+        "    free(values);\n"
+        "    return count;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "#include <vector>"), "malloc array conversion should add vector include");
+    require(contains(result.modernCode, "std::vector<int> values(count);"), "array malloc/free should become vector sized by element count");
+    require(!contains(result.modernCode, "malloc("), "converted array malloc should be removed");
+    require(!contains(result.modernCode, "free(values)"), "converted array free should be removed");
+    require(hasAppliedRule(result, "malloc/free array ownership to std::vector"),
+            "array malloc/free conversion should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "array malloc/free conversion should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testCallocAndByteBufferModernizeToVector()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstdlib>\n"
+        "void build(int count, int byteCount)\n"
+        "{\n"
+        "    int* values = static_cast<int*>(calloc(count, sizeof(int)));\n"
+        "    unsigned char* bytes = (unsigned char*)malloc(byteCount);\n"
+        "    values[0] = 3;\n"
+        "    bytes[0] = 4;\n"
+        "    free(values);\n"
+        "    free(bytes);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<int> values(count);"), "calloc array should become vector");
+    require(contains(result.modernCode, "std::vector<unsigned char> bytes(byteCount);"), "raw byte malloc should become byte vector");
+    require(!contains(result.modernCode, "calloc("), "converted calloc should be removed");
+    require(!contains(result.modernCode, "malloc("), "converted byte malloc should be removed");
+    require(!contains(result.modernCode, "free(values)"), "converted calloc free should be removed");
+    require(!contains(result.modernCode, "free(bytes)"), "converted byte free should be removed");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "calloc and byte-buffer conversion should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testMallocMemberCleanupDestructorModernizesToRuleOfZero()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstdlib>\n"
+        "struct Resource\n"
+        "{\n"
+        "    int value = 0;\n"
+        "};\n\n"
+        "class Owner\n"
+        "{\n"
+        "public:\n"
+        "    Owner()\n"
+        "    {\n"
+        "        resource = (Resource*)malloc(sizeof(Resource));\n"
+        "    }\n\n"
+        "    ~Owner()\n"
+        "    {\n"
+        "        if (resource != nullptr)\n"
+        "        {\n"
+        "            free(resource);\n"
+        "            resource = nullptr;\n"
+        "        }\n"
+        "    }\n\n"
+        "    int value() const\n"
+        "    {\n"
+        "        return resource->value;\n"
+        "    }\n\n"
+        "private:\n"
+        "    Resource* resource;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::unique_ptr<Resource> resource;"),
+            "malloc-owned member should become unique_ptr\nConverted code:\n" + result.modernCode
+                + "\nDiagnostics:\n"
+                + std::accumulate(result.diagnosticMessages.begin(), result.diagnosticMessages.end(), std::string{}, [](std::string acc, const std::string& message) {
+                      return std::move(acc) + message + "\n";
+                  }));
+    require(contains(result.modernCode, "resource = std::make_unique<Resource>();"),
+            "member malloc allocation should become make_unique assignment");
+    require(!contains(result.modernCode, "free(resource)"), "member free cleanup should be removed");
+    require(!contains(result.modernCode, "~Owner()"), "cleanup-only destructor should be removed after malloc/free RAII conversion");
+    require(hasAppliedRule(result, "malloc/free member ownership to std::unique_ptr"),
+            "member malloc/free conversion should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "member malloc/free conversion should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testMallocReallocAndEscapingOwnershipRemainUnchanged()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    const ConversionResult result = converter.convert(
+        "#include <cstdlib>\n"
+        "extern void consume(void*);\n"
+        "void resizeAndConsume(int count)\n"
+        "{\n"
+        "    int* values = (int*)malloc(count * sizeof(int));\n"
+        "    values = (int*)realloc(values, count * 2 * sizeof(int));\n"
+        "    free(values);\n"
+        "    int* external = (int*)malloc(sizeof(int));\n"
+        "    consume(external);\n"
+        "    free(external);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "realloc(values"), "realloc-heavy malloc ownership should remain unchanged");
+    require(contains(result.modernCode, "consume(external);"), "malloc pointer passed to unknown C API should remain unchanged");
+    require(!contains(result.modernCode, "std::vector<int> values"), "realloc candidate should not become vector");
+    require(!contains(result.modernCode, "std::make_unique<int>()"), "escaping malloc candidate should not become unique_ptr");
+    require(hasSuggestionRule(result, "malloc/free ownership modernization"),
+            "unsafe malloc/free ownership should emit a review suggestion");
+}
+
 void testOwnershipConversionDoesNotDuplicateSuggestions()
 {
     const RuleBasedConverterEngine converter;
@@ -859,6 +1383,8 @@ void testOwningRawPointerVectorModernizesToVectorUniquePtr()
 void testStringLikeOwningClassProducesSuggestionOnly()
 {
     const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
     const ConversionResult result = converter.convert(
         "#include <cstring>\n"
         "class TextValue\n"
@@ -877,11 +1403,23 @@ void testStringLikeOwningClassProducesSuggestionOnly()
         "private:\n"
         "    char* data;\n"
         "};\n",
-        structuralOptions());
+        options);
 
-    require(contains(result.modernCode, "char* data;"), "string-like class redesign should not be auto-applied");
-    require(contains(result.modernCode, "delete[] data;"), "manual string buffer cleanup should remain for suggestion-only redesign");
-    require(hasSuggestionRule(result, "String ownership pattern detector"), "string ownership class should produce suggestion");
+    require(contains(result.modernCode, "std::string data;"),
+            "internally owned text buffer should become std::string\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "data = input;"),
+            "strcpy initialization should become string assignment\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "return data.c_str();"),
+            "C-string compatibility getter should return std::string::c_str()\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "char* data;"), "raw char* text member should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "delete[] data;"), "manual string buffer cleanup should be removed after conversion\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::strcpy"), "strcpy should be removed after string conversion\nConverted code:\n" + result.modernCode);
+    require(hasAppliedRule(result, "Class raw char buffer to std::string"), "string ownership class conversion should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "string-like owning class modernization should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
 }
 
 void testOwnershipSanityScannerRemovesPartialSmartCollectionCleanup()
@@ -1502,6 +2040,182 @@ void testStructuralCharBufferMemberModernizesToString()
     require(hasAppliedRule(result, "C-string comparison to std::string comparison"), "C-string comparison conversion should be tracked");
 }
 
+void testClassMultipleOwnedCharTextMembersModernizeTogether()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <cstring>\n"
+        "class LabelPair\n"
+        "{\n"
+        "public:\n"
+        "    LabelPair(const char* leftInput, const char* rightInput)\n"
+        "    {\n"
+        "        left = new char[std::strlen(leftInput) + 1];\n"
+        "        std::strcpy(left, leftInput);\n"
+        "        right = new char[std::strlen(rightInput) + 1];\n"
+        "        std::strcpy(right, rightInput);\n"
+        "    }\n\n"
+        "    LabelPair(const LabelPair& other)\n"
+        "    {\n"
+        "        left = new char[std::strlen(other.left) + 1];\n"
+        "        std::strcpy(left, other.left);\n"
+        "        right = new char[std::strlen(other.right) + 1];\n"
+        "        std::strcpy(right, other.right);\n"
+        "    }\n\n"
+        "    LabelPair& operator=(const LabelPair& other)\n"
+        "    {\n"
+        "        if (this != &other)\n"
+        "        {\n"
+        "            delete[] left;\n"
+        "            left = new char[std::strlen(other.left) + 1];\n"
+        "            std::strcpy(left, other.left);\n"
+        "            delete[] right;\n"
+        "            right = new char[std::strlen(other.right) + 1];\n"
+        "            std::strcpy(right, other.right);\n"
+        "        }\n"
+        "        return *this;\n"
+        "    }\n\n"
+        "    ~LabelPair()\n"
+        "    {\n"
+        "        delete[] left;\n"
+        "        delete[] right;\n"
+        "    }\n\n"
+        "    void appendRight(const char* suffix)\n"
+        "    {\n"
+        "        std::strcat(right, suffix);\n"
+        "    }\n\n"
+        "    const char* leftText() const { return left; }\n"
+        "    const char* rightText() const { return right; }\n\n"
+        "private:\n"
+        "    char* left;\n"
+        "    char* right;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::string left;"), "first owned text member should become std::string\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::string right;"), "second owned text member should become std::string\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "right += suffix;"), "strcat on converted text member should become +=\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "return left.c_str();"), "compatibility getter should return c_str for first string");
+    require(contains(result.modernCode, "return right.c_str();"), "compatibility getter should return c_str for second string");
+    require(!contains(result.modernCode, "char* left;"), "first raw char* member should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "char* right;"), "second raw char* member should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "new char["), "manual text allocation should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "delete[]"), "manual text cleanup should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::strcpy"), "strcpy should be removed after string conversion\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::strcat"), "strcat should be removed after string conversion\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "~LabelPair()"), "cleanup-only destructor should be removed after all text buffers convert");
+    require(!contains(result.modernCode, "LabelPair(const LabelPair& other)"), "cleanup-only copy constructor should be removed after all text buffers convert");
+    require(!contains(result.modernCode, "operator=(const LabelPair& other)"), "cleanup-only copy assignment should be removed after all text buffers convert");
+    require(!contains(result.modernCode, "#include <cstring>"), "cstring include should be removed when no C-string APIs remain");
+    require(hasAppliedRule(result, "Class raw char buffer to std::string"), "class string buffer conversion should be tracked");
+    require(hasAppliedRule(result, "Rule of Zero after string buffer modernization"), "safe Rule of Zero cleanup should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "multi-member char* to string modernization should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testRuleOfZeroPreservesCleanupWhenRawCharOwnershipRemains()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <cstring>\n"
+        "class MixedBuffers\n"
+        "{\n"
+        "public:\n"
+        "    MixedBuffers(const char* input, int size)\n"
+        "    {\n"
+        "        title = new char[std::strlen(input) + 1];\n"
+        "        std::strcpy(title, input);\n"
+        "        bytes = new char[size];\n"
+        "    }\n\n"
+        "    ~MixedBuffers()\n"
+        "    {\n"
+        "        delete[] title;\n"
+        "        delete[] bytes;\n"
+        "    }\n\n"
+        "    const char* titleText() const { return title; }\n"
+        "private:\n"
+        "    char* title;\n"
+        "    char* bytes;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::string title;"), "clear text buffer should become std::string\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "char* bytes;"), "unclear raw buffer should be preserved\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "~MixedBuffers()"), "destructor should remain while raw owning buffer remains\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "delete[] bytes;"), "cleanup for preserved raw buffer should remain\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "delete[] title;"), "cleanup for converted string buffer should be removed\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "return title.c_str();"), "getter for converted string should preserve C-string API");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "mixed converted/preserved char buffer class should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testStringModernizationRemovesTemporaryConcatBuffer()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <cstring>\n"
+        "class TextLog\n"
+        "{\n"
+        "public:\n"
+        "    explicit TextLog(const char* input)\n"
+        "    {\n"
+        "        text = new char[std::strlen(input) + 1];\n"
+        "        std::strcpy(text, input);\n"
+        "    }\n\n"
+        "    ~TextLog()\n"
+        "    {\n"
+        "        delete[] text;\n"
+        "    }\n\n"
+        "    void append(const char* suffix)\n"
+        "    {\n"
+        "        char* combined = new char[std::strlen(text) + std::strlen(suffix) + 1];\n"
+        "        std::strcpy(combined, text);\n"
+        "        std::strcat(combined, suffix);\n"
+        "        delete[] text;\n"
+        "        text = combined;\n"
+        "    }\n\n"
+        "    const char* c_str() const { return text; }\n\n"
+        "private:\n"
+        "    char* text;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::string text;"),
+            "owned text member should become std::string\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "text += suffix;"),
+            "temporary concatenation buffer should become std::string append\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "return text.c_str();"),
+            "C-string compatibility getter should return c_str()\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "combined"), "temporary concat buffer should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "new char["), "temporary char allocation should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::strcpy"), "strcpy should be removed after string conversion\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::strcat"), "strcat should be removed after string conversion\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "delete[] text"), "delete[] for converted string member should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "#include <cstring>"), "cstring include should be removed when no C-string APIs remain");
+    require(hasAppliedRule(result, "Temporary C-string concat buffer to std::string append"),
+            "temporary concat buffer cleanup should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "temporary concat buffer cleanup should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
 void testStructuralRawDynamicArrayModernizesToVector()
 {
     const RuleBasedConverterEngine converter;
@@ -1935,12 +2649,14 @@ void testDependentVectorCleanupUpdatesAllUsages()
     require(!contains(result.modernCode, "values = nullptr"), "pointer-style vector null assignment should be removed");
     require(!contains(result.modernCode, "values != nullptr"), "vector nullptr checks should be removed or unwrapped");
     require(contains(result.modernCode, "values[0] = 1;"), "body guarded by old pointer null check should be preserved");
-    require(contains(result.modernCode, "ArrayOwner(const ArrayOwner&) = default;"), "manual copy constructor should become defaulted");
+    require(!contains(result.modernCode, "ArrayOwner(const ArrayOwner&) = default;"),
+            "manual copy constructor should be removed once vector copy is enough");
     require(contains(result.modernCode, "ArrayOwner& operator=(const ArrayOwner&) = default;"), "manual copy assignment should become defaulted");
     require(!contains(result.modernCode, "~ArrayOwner()"), "cleanup-only destructor should be removed after dependent cleanup");
     require(hasAppliedRule(result, "Replace raw array allocation with vector resize"), "dependent vector allocation cleanup should be tracked");
     require(hasAppliedRule(result, "Remove nullptr check after vector modernization"), "dependent vector nullptr cleanup should be tracked");
     require(hasAppliedRule(result, "Remove obsolete copy constructor after vector modernization"), "copy constructor cleanup should be tracked");
+    require(hasAppliedRule(result, "Post-vector Rule of Zero copy constructor removal"), "post-vector copy constructor polish should be tracked");
     require(hasAppliedRule(result, "Remove obsolete copy assignment after vector modernization"), "copy assignment cleanup should be tracked");
     require(hasAppliedRule(result, "Rule of Zero cascade cleanup"), "copy operation cleanup should be tracked");
     require(hasAppliedRule(result, "Vector cascade cleanup"), "vector cascade cleanup should be tracked");
@@ -2004,6 +2720,79 @@ void testDependentStringCleanupUpdatesAllUsages()
     require(hasAppliedRule(result, "String cascade cleanup"), "string cascade cleanup should be tracked");
     if (!result.compilerUsed.empty()) {
         require(result.compileVerificationPassed, "dependent string cleanup sample should pass syntax verification");
+    }
+}
+
+void testDependentStringCleanupRewritesConcatAndSymmetricCompare()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstring>\n"
+        "class TextBuffer\n"
+        "{\n"
+        "public:\n"
+        "    void reset(const char* input)\n"
+        "    {\n"
+        "        std::strcpy(text, input);\n"
+        "    }\n\n"
+        "    void append(const char* suffix)\n"
+        "    {\n"
+        "        std::strcat(text, suffix);\n"
+        "    }\n\n"
+        "    bool sameAs(const char* input) const\n"
+        "    {\n"
+        "        return std::strcmp(input, text) == 0;\n"
+        "    }\n\n"
+        "private:\n"
+        "    char text[64];\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::string text;"), "char buffer should become std::string for C-string concat/compare usage");
+    require(contains(result.modernCode, "text = input;"), "strcpy destination should become string assignment");
+    require(contains(result.modernCode, "text += suffix;"), "strcat destination should become string append");
+    require(contains(result.modernCode, "return input == text;"), "strcmp with converted string as second argument should become symmetric string comparison");
+    require(!contains(result.modernCode, "strcat"), "strcat should not remain against converted std::string");
+    require(!contains(result.modernCode, "strcmp"), "strcmp should not remain against converted std::string");
+    require(!contains(result.modernCode, "strcpy"), "strcpy should not remain against converted std::string");
+    require(!contains(result.modernCode, "#include <cstring>"), "cstring include should be removed when C-string APIs are gone");
+    require(hasAppliedRule(result, "Replace C-string concatenation with string append"), "strcat cleanup should be tracked");
+    require(hasAppliedRule(result, "Replace C-string comparison with string comparison"), "symmetric strcmp cleanup should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "dependent string concat/compare cleanup sample should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testStringCleanupHandlesConcatOnlyTextUsage()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstring>\n"
+        "struct Message\n"
+        "{\n"
+        "    char text[48];\n"
+        "};\n\n"
+        "void append(Message& message, const char* suffix)\n"
+        "{\n"
+        "    strcat(message.text, suffix);\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::string text;"), "strcat-only text storage should still become std::string");
+    require(contains(result.modernCode, "message.text += suffix;"), "unqualified strcat should become std::string append");
+    require(!contains(result.modernCode, "strcat"), "unqualified strcat should be removed after string conversion");
+    require(!contains(result.modernCode, "#include <cstring>"), "cstring include should be removed after strcat cleanup");
+    require(hasAppliedRule(result, "Replace C-string concatenation with string append"), "strcat-only cleanup should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "strcat-only string conversion should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
     }
 }
 
@@ -2598,9 +3387,13 @@ void testVectorGrowthEmulationCleanupModernizesAppend()
         options);
 
     require(contains(result.modernCode, "std::vector<int> values;"), "growth storage should become vector");
-    require(contains(result.modernCode, "values.reserve(capacity);"), "initial vector allocation should become reserve");
+    require(contains(result.modernCode, "values.reserve(2);"), "allocation-only capacity should collapse to reserve literal");
     require(contains(result.modernCode, "values.push_back(value);"), "indexed append should become push_back");
     require(contains(result.modernCode, "return values.size();"), "count mirror getter should become vector size");
+    require(!contains(result.modernCode, "std::size_t count;"), "stale count mirror should be removed");
+    require(!contains(result.modernCode, "std::size_t capacity;"), "stale allocation capacity should be removed");
+    require(!contains(result.modernCode, "count(0)"), "stale count initializer should be removed");
+    require(!contains(result.modernCode, "capacity(2)"), "stale capacity initializer should be removed");
     require(!contains(result.modernCode, "int* grown"), "temporary growth buffer should be removed");
     require(!contains(result.modernCode, "new int["), "growth new[] should be removed");
     require(!contains(result.modernCode, "delete[] values"), "delete[] for vector should be removed");
@@ -2614,6 +3407,107 @@ void testVectorGrowthEmulationCleanupModernizesAppend()
     require(hasAppliedRule(result, "Indexed append to vector push_back"), "push_back rewrite should be tracked");
     if (!result.compilerUsed.empty()) {
         require(result.compileVerificationPassed, "vector growth cleanup sample should pass syntax verification");
+    }
+}
+
+void testVectorPostIncrementAppendBecomesPushBack()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstddef>\n"
+        "class PacketLog\n"
+        "{\n"
+        "public:\n"
+        "    PacketLog()\n"
+        "        : values(nullptr), count(0), capacity(2)\n"
+        "    {\n"
+        "        values = new int[capacity];\n"
+        "    }\n\n"
+        "    void append(int value)\n"
+        "    {\n"
+        "        if (count >= capacity)\n"
+        "        {\n"
+        "            int expanded = capacity * 2;\n"
+        "            int* replacement = new int[expanded];\n"
+        "            for (int index = 0; index < count; ++index)\n"
+        "            {\n"
+        "                replacement[index] = values[index];\n"
+        "            }\n"
+        "            delete[] values;\n"
+        "            values = replacement;\n"
+        "            capacity = expanded;\n"
+        "        }\n"
+        "        values[count++] = value;\n"
+        "    }\n\n"
+        "    int size() const\n"
+        "    {\n"
+        "        return count;\n"
+        "    }\n\n"
+        "    ~PacketLog()\n"
+        "    {\n"
+        "        delete[] values;\n"
+        "    }\n\n"
+        "private:\n"
+        "    int* values;\n"
+        "    int count;\n"
+        "    int capacity;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<int> values;"), "post-increment append storage should become vector");
+    require(contains(result.modernCode, "values.reserve(2);"), "append-style allocation capacity should collapse to reserve literal");
+    require(contains(result.modernCode, "values.push_back(value);"), "post-increment indexed append should become push_back");
+    require(contains(result.modernCode, "return values.size();"), "count mirror getter should become vector size");
+    require(!contains(result.modernCode, "int count;"), "stale count mirror member should be removed");
+    require(!contains(result.modernCode, "int capacity;"), "stale allocation capacity member should be removed");
+    require(!contains(result.modernCode, "count(0)"), "stale count initializer should be removed");
+    require(!contains(result.modernCode, "capacity(2)"), "stale capacity initializer should be removed");
+    require(!contains(result.modernCode, "values[count++]"), "post-increment vector indexing should not remain");
+    require(!contains(result.modernCode, "replacement"), "manual growth temp buffer should be removed");
+    require(!contains(result.modernCode, "expanded"), "manual growth capacity temporary should be removed");
+    require(!contains(result.modernCode, "delete[] values"), "delete[] for vector storage should be removed");
+    require(!contains(result.modernCode, "~PacketLog()"), "cleanup-only destructor should be removed");
+    require(hasAppliedRule(result, "Indexed append to vector push_back"), "post-increment push_back rewrite should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "post-increment append vector modernization should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testLocalRawArrayAppendUsesReserveAndPushBack()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstddef>\n"
+        "int buildValues(int limit)\n"
+        "{\n"
+        "    int* values = new int[limit];\n"
+        "    int count = 0;\n"
+        "    values[count++] = 3;\n"
+        "    values[count++] = 5;\n"
+        "    delete[] values;\n"
+        "    return count;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<int> values;"),
+            "local append array should become an empty vector\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "values.reserve(limit);"), "local append array capacity should become reserve");
+    require(contains(result.modernCode, "values.push_back(3);"), "first local append should become push_back");
+    require(contains(result.modernCode, "values.push_back(5);"), "second local append should become push_back");
+    require(contains(result.modernCode, "return values.size();"), "local count mirror return should become vector size");
+    require(!contains(result.modernCode, "std::vector<int> values(limit);"), "append-style vector should not be pre-sized");
+    require(!contains(result.modernCode, "values[count++]"), "local post-increment append indexing should not remain");
+    require(!contains(result.modernCode, "delete[] values"), "local delete[] should be removed");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "local post-increment append vector modernization should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
     }
 }
 
@@ -2721,6 +3615,370 @@ void testVectorEmulationEliminatesFieldAppendGrowth()
     if (!result.compilerUsed.empty()) {
         require(result.compileVerificationPassed, "field append vector cleanup sample should pass syntax verification");
     }
+}
+
+void testContainerModernizationCleanupRemovesGenericGrowthSystem()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstddef>\n"
+        "struct Slot\n"
+        "{\n"
+        "    int id;\n"
+        "    int level;\n"
+        "};\n\n"
+        "class SlotLog\n"
+        "{\n"
+        "public:\n"
+        "    SlotLog()\n"
+        "        : records(nullptr), used(0), allocationLimit(2)\n"
+        "    {\n"
+        "        records = new Slot[allocationLimit];\n"
+        "    }\n\n"
+        "    SlotLog(const SlotLog& other)\n"
+        "        : records(new Slot[other.allocationLimit]), used(other.used), allocationLimit(other.allocationLimit)\n"
+        "    {\n"
+        "        for (int cursor = 0; cursor < used; ++cursor)\n"
+        "        {\n"
+        "            records[cursor] = other.records[cursor];\n"
+        "        }\n"
+        "    }\n\n"
+        "    ~SlotLog()\n"
+        "    {\n"
+        "        if (records != nullptr)\n"
+        "        {\n"
+        "            delete[] records;\n"
+        "            records = nullptr;\n"
+        "        }\n"
+        "    }\n\n"
+        "    void add(int id, int level)\n"
+        "    {\n"
+        "        if (used >= allocationLimit)\n"
+        "        {\n"
+        "            int scratchLimit = allocationLimit * 2;\n"
+        "            Slot* scratchStore = new Slot[scratchLimit];\n"
+        "            for (int cursor = 0; cursor < used; ++cursor)\n"
+        "            {\n"
+        "                scratchStore[cursor] = records[cursor];\n"
+        "            }\n"
+        "            delete[] records;\n"
+        "            records = scratchStore;\n"
+        "            allocationLimit = scratchLimit;\n"
+        "        }\n"
+        "        records[used].id = id;\n"
+        "        records[used].level = level;\n"
+        "        used++;\n"
+        "    }\n\n"
+        "    int size() const\n"
+        "    {\n"
+        "        return used;\n"
+        "    }\n\n"
+        "    Slot* get(int index)\n"
+        "    {\n"
+        "        return &records[index];\n"
+        "    }\n\n"
+        "private:\n"
+        "    Slot* records;\n"
+        "    int used;\n"
+        "    int allocationLimit;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<Slot> records;"),
+            "raw array member should become std::vector\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "Slot appendedItem{};"), "field append should create a local value object");
+    require(contains(result.modernCode, "records.push_back(appendedItem);"), "field append should use vector push_back");
+    require(contains(result.modernCode, "return records.size();"), "count getter should return vector.size()");
+    require(contains(result.modernCode, "return &records[index];")
+                || contains(result.modernCode, "return &records[static_cast<std::size_t>(index)];"),
+            "index accessor should return address of vector element\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "scratchStore"), "temporary growth buffer should be removed");
+    require(!contains(result.modernCode, "scratchLimit"), "temporary capacity variable should be removed");
+    require(!contains(result.modernCode, "new Slot["), "raw new[] should be removed");
+    require(!contains(result.modernCode, "delete[] records"), "delete[] for vector storage should be removed");
+    require(!contains(result.modernCode, "records = scratchStore"), "raw buffer assignment to vector should be removed");
+    require(!contains(result.modernCode, "scratchStore[cursor] = records[cursor]"), "manual growth copy loop should be removed");
+    require(!contains(result.modernCode, "records[used]"), "append-style vector indexing should not remain");
+    require(!contains(result.modernCode, "~SlotLog()"), "cleanup-only destructor should be removed");
+    require(!contains(result.modernCode, "records[cursor] = other.records[cursor]"), "manual copy constructor loop should be removed/defaulted");
+    require(hasAppliedRule(result, "Container modernization cleanup"),
+            "container cleanup consistency pass should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "container modernization cleanup consistency sample should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testContainerModernizationCleanupRemovesSameLineGrowthFragments()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstddef>\n"
+        "struct SensorRecord\n"
+        "{\n"
+        "    int channel;\n"
+        "    int reading;\n"
+        "};\n\n"
+        "class MeasurementStore\n"
+        "{\n"
+        "public:\n"
+        "    MeasurementStore() : entries(nullptr), count(0), capacity(2)\n"
+        "    {\n"
+        "        entries = new SensorRecord[capacity];\n"
+        "    }\n\n"
+        "    ~MeasurementStore()\n"
+        "    {\n"
+        "        delete[] entries;\n"
+        "    }\n\n"
+        "    bool add(int channel, int reading)\n"
+        "    {\n"
+        "        if (count >= capacity) {\n"
+        "            int newCapacity = capacity * 2;\n"
+        "            SensorRecord* temp = new SensorRecord[newCapacity];\n"
+        "            for (int i = 0; i < count; ++i) {\n"
+        "                temp[i] = entries[i];\n"
+        "            }\n"
+        "            delete[] entries;\n"
+        "            entries = temp;\n"
+        "            capacity = newCapacity;\n"
+        "        }\n"
+        "        entries[count].channel = channel;\n"
+        "        entries[count].reading = reading;\n"
+        "        count++;\n"
+        "        return true;\n"
+        "    }\n\n"
+        "    int getCount() const\n"
+        "    {\n"
+        "        return count;\n"
+        "    }\n\n"
+        "private:\n"
+        "    SensorRecord* entries;\n"
+        "    int count;\n"
+        "    int capacity;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<SensorRecord> entries;"),
+            "raw SensorRecord array member should become vector\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "entries.push_back("),
+            "same-line growth fixture should append with vector push_back\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "return entries.size();"),
+            "count getter should return vector.size() after cleanup\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "newCapacity"), "temporary capacity variable should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "newCap"), "newCap-style capacity fragments should be absent\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "SensorRecord* temp"), "temporary raw growth buffer should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "temp = new"), "raw temp allocation should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "new SensorRecord["), "raw new[] should be removed after vector conversion\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "delete[] entries"), "delete[] for converted vector should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "temp[i] = entries[i]"), "manual copy loop into temp buffer should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "capacity = newCapacity"), "stale capacity update should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "for (int i = 0; i < count; ++i) {\n        }"),
+            "empty manual copy loop should not remain\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "entries[count]"), "append-style vector indexing should not remain\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "~MeasurementStore()"), "cleanup-only destructor should be removed");
+    require(hasAppliedRule(result, "Container modernization cleanup"),
+            "container modernization cleanup should report stale growth fragment cleanup");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "same-line growth fragment cleanup sample should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testContainerModernizationCleanupPolishesVectorBackedClass()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstddef>\n"
+        "struct TelemetryRecord\n"
+        "{\n"
+        "    int id;\n"
+        "    int value;\n"
+        "};\n\n"
+        "class TelemetryStore\n"
+        "{\n"
+        "public:\n"
+        "    TelemetryStore()\n"
+        "        : readings(nullptr), itemCount(0), reserveSlots(4)\n"
+        "    {\n"
+        "        readings = new TelemetryRecord[reserveSlots];\n"
+        "    }\n\n"
+        "    TelemetryStore(const TelemetryStore& other)\n"
+        "        : readings(new TelemetryRecord[other.reserveSlots]), itemCount(other.itemCount), reserveSlots(other.reserveSlots)\n"
+        "    {\n"
+        "        for (int i = 0; i < itemCount; ++i)\n"
+        "        {\n"
+        "            readings[i] = other.readings[i];\n"
+        "        }\n"
+        "    }\n\n"
+        "    ~TelemetryStore()\n"
+        "    {\n"
+        "        delete[] readings;\n"
+        "    }\n\n"
+        "    void append(int id, int value)\n"
+        "    {\n"
+        "        readings[itemCount].id = id;\n"
+        "        readings[itemCount].value = value;\n"
+        "        itemCount++;\n"
+        "    }\n\n"
+        "    int getCount() const\n"
+        "    {\n"
+        "        return itemCount;\n"
+        "    }\n\n"
+        "    TelemetryRecord* getRecord(int index)\n"
+        "    {\n"
+        "        return &readings[index];\n"
+        "    }\n\n"
+        "private:\n"
+        "    TelemetryRecord* readings;\n"
+        "    int itemCount;\n"
+        "    int reserveSlots;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<TelemetryRecord> readings;"),
+            "raw telemetry storage should become vector\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "readings.reserve(4);"),
+            "pure preallocation capacity member should collapse to reserve literal\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "readings.push_back("),
+            "append should use vector push_back\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::size_t getCount() const { return readings.size(); }"),
+            "count getter should be std::size_t and return vector.size()\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "const TelemetryRecord* getRecord(std::size_t index) const"),
+            "record getter should be const and std::size_t-based\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "if (index < readings.size())"),
+            "record getter should check vector bounds\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "return nullptr;"),
+            "bounds-safe getter should return nullptr for out-of-range access\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "int itemCount;"), "stale count mirror member should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "int reserveSlots;"), "stale allocation capacity member should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "itemCount(0)"), "stale count initializer should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "reserveSlots(4)"), "stale capacity initializer should be removed\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "TelemetryStore(const TelemetryStore&) = default;"),
+            "explicit default copy constructor should be removed when vector copy is enough\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "\n\n\n"), "cleanup should not leave excessive blank lines\nConverted code:\n" + result.modernCode);
+    require(hasAppliedRule(result, "Post-vector cleanup polish"),
+            "post-vector cleanup polish should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "post-vector cleanup polish sample should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testConstReturnPropagationUpdatesDirectReceivers()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <cstddef>\n"
+        "struct Entry\n"
+        "{\n"
+        "    int id;\n"
+        "};\n\n"
+        "class EntryStore\n"
+        "{\n"
+        "public:\n"
+        "    EntryStore()\n"
+        "        : entries(nullptr), entryCount(1)\n"
+        "    {\n"
+        "        entries = new Entry[entryCount];\n"
+        "    }\n\n"
+        "    ~EntryStore()\n"
+        "    {\n"
+        "        delete[] entries;\n"
+        "    }\n\n"
+        "    Entry* getEntry(int index)\n"
+        "    {\n"
+        "        return &entries[index];\n"
+        "    }\n"
+        "private:\n"
+        "    Entry* entries;\n"
+        "    int entryCount;\n"
+        "};\n\n"
+        "int readFirst(EntryStore& store)\n"
+        "{\n"
+        "    Entry* entry = store.getEntry(0);\n"
+        "    if (entry != nullptr)\n"
+        "    {\n"
+        "        return entry->id;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "const Entry* getEntry(std::size_t index) const"),
+            "vector-backed getter should become a const pointer observer\nConverted code:\n" + result.modernCode);
+    require(contains(result.modernCode, "const Entry* entry = store.getEntry(0);"),
+            "direct receiver should follow the getter's const pointer return type\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "\n    Entry* entry = store.getEntry(0);"),
+            "old mutable pointer receiver should not remain after const return propagation\nConverted code:\n" + result.modernCode);
+    require(hasAppliedRule(result, "Const return receiver propagation"),
+            "const receiver propagation should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "const return receiver propagation sample should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testConstReturnPropagationHandlesReferencesAndSmartPointerRefs()
+{
+    const std::string code =
+        "#include <memory>\n"
+        "struct Item\n"
+        "{\n"
+        "    int value;\n"
+        "};\n\n"
+        "class Holder\n"
+        "{\n"
+        "public:\n"
+        "    const Item& current() const\n"
+        "    {\n"
+        "        static Item item{};\n"
+        "        return item;\n"
+        "    }\n\n"
+        "    const std::unique_ptr<Item>& owned() const\n"
+        "    {\n"
+        "        static std::unique_ptr<Item> item;\n"
+        "        return item;\n"
+        "    }\n"
+        "};\n\n"
+        "void inspect(Holder& holder)\n"
+        "{\n"
+        "    Item& item = holder.current();\n"
+        "    std::unique_ptr<Item>& pointer = holder.owned();\n"
+        "    (void)item.value;\n"
+        "    (void)pointer;\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const ReturnTypePropagationPass pass;
+    const std::string fixed = pass.rewrite(code, changes);
+
+    require(contains(fixed, "const Item& item = holder.current();"),
+            "reference receiver should follow const reference return type\nConverted code:\n" + fixed);
+    require(contains(fixed, "const std::unique_ptr<Item>& pointer = holder.owned();"),
+            "smart pointer reference receiver should follow const reference return type\nConverted code:\n" + fixed);
+    require(!contains(fixed, "\n    Item& item = holder.current();"),
+            "old mutable reference receiver should not remain\nConverted code:\n" + fixed);
+    require(!contains(fixed, "\n    std::unique_ptr<Item>& pointer = holder.owned();"),
+            "old mutable smart pointer reference receiver should not remain\nConverted code:\n" + fixed);
+    require(hasAppliedRule(changes, "Const return receiver propagation"),
+            "reference receiver propagation should be tracked");
+
+    const CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(fixed);
+    require(verification.compilerUsed.empty() || verification.passed,
+            "reference receiver propagation sample should pass syntax verification\nCompiler output:\n"
+                + verification.output + "\nConverted code:\n" + fixed);
 }
 
 void testVectorModernizationRemovesCleanupOnlyCopySpecialMembers()
@@ -3876,6 +5134,102 @@ void testRepositoryModeUsesStructuralModernizationPipeline()
     require(std::filesystem::exists(root / "src" / "legacy.cpp.legacy_backup"), "repository structural pipeline should create backup");
 }
 
+void testRepositoryModeUsesFunctionPointerModernizationPass()
+{
+    const std::filesystem::path root = makeTempDirectory("moderncpp_repo_function_pointer");
+    writeTextFile(root / "src" / "callbacks.cpp",
+        "typedef int (*Transform)(int);\n"
+        "int increment(int value) { return value + 1; }\n"
+        "class CallbackStore\n"
+        "{\n"
+        "public:\n"
+        "    CallbackStore() : callback(nullptr) {}\n"
+        "    void setCallback(void (*next)(int))\n"
+        "    {\n"
+        "        callback = next;\n"
+        "    }\n"
+        "    int notify(int value)\n"
+        "    {\n"
+        "        if (callback != nullptr)\n"
+        "        {\n"
+        "            return callback(value);\n"
+        "        }\n"
+        "        return value;\n"
+        "    }\n"
+        "private:\n"
+        "    int (*callback)(int);\n"
+        "};\n"
+        "void run()\n"
+        "{\n"
+        "    int (*local)(int) = &increment;\n"
+        "    CallbackStore store;\n"
+        "    store.setCallback(local);\n"
+        "}\n");
+
+    RepositoryModernizationOptions options;
+    options.repositoryUrl = "https://github.com/example/function-pointer-modernization";
+    options.outputWorkspaceFolder = root.parent_path();
+    options.modernizationLevel = OfflineModernizationLevel::Balanced;
+    options.compileVerificationEnabled = true;
+
+    RepositoryModernizationService service(std::make_unique<RuleBasedConverterEngine>());
+    const RepositoryModernizationResult result = service.modernizeRepository(options, root);
+    const std::string modernized = readTextFile(root / "src" / "callbacks.cpp");
+    const std::string report = readTextFile(root / "modernization_report.txt");
+
+    require(result.filesScanned == 1, "repository function pointer test should scan one source file");
+    require(result.filesModified == 1, "repository function pointer test should modify the source file");
+    require(contains(modernized, "using Transform = int (*)(int);"),
+            "repository mode should modernize function pointer typedefs");
+    require(contains(modernized, "auto local = &increment;"),
+            "repository mode should modernize local callback variables to auto");
+    require(contains(modernized, "std::function<int(int)> callback;"),
+            "repository mode should modernize private stored callback fields to std::function");
+    require(contains(modernized, "int notify(int value)"),
+            "repository mode should preserve unrelated callback wrapper behavior");
+    require(contains(report, "Function pointer typedef to using"),
+            "repository report should include function pointer typedef modernization");
+    require(contains(report, "Stored callback pointer to std::function"),
+            "repository report should include stored callback modernization");
+    require(std::filesystem::exists(root / "src" / "callbacks.cpp.legacy_backup"),
+            "repository function pointer modernization should create backup");
+}
+
+void testRepositoryModeUsesPrintfModernizationPass()
+{
+    const std::filesystem::path root = makeTempDirectory("moderncpp_repo_printf");
+    writeTextFile(root / "src" / "output.cpp",
+        "#include <cstdio>\n"
+        "void report(const char* label, int value)\n"
+        "{\n"
+        "    printf(\"%s=%d\\n\", label, value);\n"
+        "    fprintf(stderr, \"error=%d\\n\", value);\n"
+        "}\n");
+
+    RepositoryModernizationOptions options;
+    options.repositoryUrl = "https://github.com/example/printf-modernization";
+    options.outputWorkspaceFolder = root.parent_path();
+    options.modernizationLevel = OfflineModernizationLevel::Balanced;
+    options.compileVerificationEnabled = true;
+
+    RepositoryModernizationService service(std::make_unique<RuleBasedConverterEngine>());
+    const RepositoryModernizationResult result = service.modernizeRepository(options, root);
+    const std::string modernized = readTextFile(root / "src" / "output.cpp");
+    const std::string report = readTextFile(root / "modernization_report.txt");
+
+    require(result.filesScanned == 1, "repository printf test should scan one source file");
+    require(result.filesModified == 1, "repository printf test should modify the source file");
+    require(contains(modernized, "std::cout << label << \"=\" << value << \"\\n\";"),
+            "repository mode should modernize printf output to std::cout");
+    require(contains(modernized, "std::cerr << \"error=\" << value << \"\\n\";"),
+            "repository mode should modernize stderr fprintf output to std::cerr");
+    require(!contains(modernized, "printf("), "repository mode should remove converted printf");
+    require(contains(report, "printf-family output to iostream"),
+            "repository report should include printf modernization");
+    require(std::filesystem::exists(root / "src" / "output.cpp.legacy_backup"),
+            "repository printf modernization should create backup");
+}
+
 void testRepositoryModeUsesOwnershipGraphPipeline()
 {
     const std::filesystem::path root = makeTempDirectory("moderncpp_repo_ownership_graph");
@@ -4340,6 +5694,14 @@ int main(int argc, char** argv)
 
     testNullConversion();
     testTypedefConversion();
+    testFunctionPointerTypedefAndLocalCallbackModernization();
+    testStoredCallbackUsesStdFunctionConservatively();
+    testRawFunctionPointerParameterPreservedWhenNotStored();
+    testPrintfSimpleTextModernizesToCout();
+    testPrintfValuesModernizeToIostreamChain();
+    testPrintfValuesCanUseStdFormatWhenEnabled();
+    testFprintfStdoutAndStderrModernizeToStreams();
+    testUnsafePrintfFormatsRemainSuggestions();
     testSuggestionGeneration();
     testExplanationGeneration();
     testStandaloneExplanationGenerator();
@@ -4358,6 +5720,13 @@ int main(int argc, char** argv)
     testConvertedLegacySampleCompiles();
     testConvertsSimpleNewDeleteToMakeUnique();
     testConvertsNewWithConstructorArgsToMakeUnique();
+    testUniquePtrOwnerPassedToRawObserverUsesGet();
+    testClassRawPointerMemberDeletesCopyAndDefaultsMove();
+    testMallocSingleObjectModernizesToUniquePtr();
+    testMallocArrayModernizesToVector();
+    testCallocAndByteBufferModernizeToVector();
+    testMallocMemberCleanupDestructorModernizesToRuleOfZero();
+    testMallocReallocAndEscapingOwnershipRemainUnchanged();
     testOwnershipConversionDoesNotDuplicateSuggestions();
     testDoesNotConvertEscapingPointer();
     testDoesNotConvertReturnedPointer();
@@ -4391,6 +5760,9 @@ int main(int argc, char** argv)
     testFunctionLikeMacroModernization();
     testStructuralTypedefStructModernization();
     testStructuralCharBufferMemberModernizesToString();
+    testClassMultipleOwnedCharTextMembersModernizeTogether();
+    testRuleOfZeroPreservesCleanupWhenRawCharOwnershipRemains();
+    testStringModernizationRemovesTemporaryConcatBuffer();
     testStructuralRawDynamicArrayModernizesToVector();
     testStructuralLocalDynamicArrayModernizesToVector();
     testStructuralIteratorAndIndexLoopsModernize();
@@ -4400,6 +5772,8 @@ int main(int argc, char** argv)
     testStructuralPreprocessorBalanceValidationRemovesDanglingEndif();
     testDependentVectorCleanupUpdatesAllUsages();
     testDependentStringCleanupUpdatesAllUsages();
+    testDependentStringCleanupRewritesConcatAndSymmetricCompare();
+    testStringCleanupHandlesConcatOnlyTextUsage();
     testNestedStringMemberCascadeCleanup();
     testCompilerDiagnosticCleanupFixesKnownLeftovers();
     testValueTypePointerOperationScannerRemovesPointerLeftovers();
@@ -4418,8 +5792,15 @@ int main(int argc, char** argv)
     testExplicitMutableIteratorLoopModernizes();
     testIteratorLoopWithEraseIsPreservedWithWarning();
     testVectorGrowthEmulationCleanupModernizesAppend();
+    testVectorPostIncrementAppendBecomesPushBack();
+    testLocalRawArrayAppendUsesReserveAndPushBack();
     testVectorGrowthPassFlagsAmbiguousRawAssignment();
     testVectorEmulationEliminatesFieldAppendGrowth();
+    testContainerModernizationCleanupRemovesGenericGrowthSystem();
+    testContainerModernizationCleanupRemovesSameLineGrowthFragments();
+    testContainerModernizationCleanupPolishesVectorBackedClass();
+    testConstReturnPropagationUpdatesDirectReceivers();
+    testConstReturnPropagationHandlesReferencesAndSmartPointerRefs();
     testVectorModernizationRemovesCleanupOnlyCopySpecialMembers();
     testVectorAppendPreservesLogicalMaxCapacity();
     testVectorAppendPassConvertsReserveToResizeForFixedIndexWrites();
@@ -4452,6 +5833,8 @@ int main(int argc, char** argv)
     testAiStyleStringViewParameterExplicitlyOwnsStringMember();
     testRepositoryModeUsesImprovedOfflinePipeline();
     testRepositoryModeUsesStructuralModernizationPipeline();
+    testRepositoryModeUsesFunctionPointerModernizationPass();
+    testRepositoryModeUsesPrintfModernizationPass();
     testRepositoryModeUsesOwnershipGraphPipeline();
     testRepositoryModeAppliesScopeLeakValidation();
     testRepositoryModeUsesSmartPointerPropagationPass();

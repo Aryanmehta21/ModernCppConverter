@@ -249,6 +249,41 @@ bool findDestructorRegion(const std::string& classText, const std::string& class
     return true;
 }
 
+bool findFunctionRegion(const std::string& classText,
+                        const std::regex& headerPattern,
+                        MethodRegion& region)
+{
+    std::smatch match;
+    if (!std::regex_search(classText, match, headerPattern)) {
+        return false;
+    }
+
+    const std::size_t start = static_cast<std::size_t>(match.position());
+    const std::size_t openBrace = classText.find('{', start);
+    if (openBrace == std::string::npos) {
+        return false;
+    }
+
+    int depth = 1;
+    std::size_t position = openBrace + 1;
+    for (; position < classText.size(); ++position) {
+        if (classText[position] == '{') {
+            ++depth;
+        } else if (classText[position] == '}') {
+            --depth;
+            if (depth == 0) {
+                break;
+            }
+        }
+    }
+    if (position >= classText.size()) {
+        return false;
+    }
+
+    region = MethodRegion{start, openBrace, position, position + 1};
+    return true;
+}
+
 std::vector<std::string> splitLines(const std::string& text)
 {
     std::vector<std::string> lines;
@@ -337,6 +372,191 @@ bool rawMemberReturnsAreObserverGetters(const std::string& classText,
     }
 
     return foundGetterReturn && !std::regex_search(withoutKnownGetters, returnPattern);
+}
+
+bool hasSpecialMemberBusinessLogic(const std::string& functionText)
+{
+    static const std::regex sideEffectPattern(R"(\b(?:std::cout|std::cerr|printf|fprintf|throw|log|callback|telemetry|lock|unlock|open|close)\b)");
+    return std::regex_search(functionText, sideEffectPattern);
+}
+
+bool copySpecialMemberLooksResourceOnly(const std::string& classText,
+                                        const std::regex& headerPattern,
+                                        const std::string& memberType,
+                                        const std::string& memberName)
+{
+    MethodRegion region;
+    if (!findFunctionRegion(classText, headerPattern, region)) {
+        return false;
+    }
+
+    const std::string functionText = classText.substr(region.start, region.end - region.start);
+    if (hasSpecialMemberBusinessLogic(functionText)) {
+        return false;
+    }
+
+    const std::string escapedMember = escapeRegex(memberName);
+    const std::string escapedType = escapeRegex(memberType);
+    const bool mentionsMember = std::regex_search(functionText, std::regex(R"(\b)" + escapedMember + R"(\b)"));
+    const bool allocatesMember = std::regex_search(functionText,
+                                                   std::regex(escapedMember + R"(\s*(?:=|\()\s*new\s+)" + escapedType));
+    const bool deletesMember = std::regex_search(functionText, std::regex(R"(delete\s+)" + escapedMember + R"(\s*;)"));
+    return mentionsMember && (allocatesMember || deletesMember);
+}
+
+bool hasDeletedCopyConstructor(const std::string& classText, const std::string& className)
+{
+    const std::regex deletedPattern(escapeRegex(className) + R"(\s*\(\s*const\s+)" + escapeRegex(className)
+                                    + R"(\s*&\s*(?:[A-Za-z_]\w*)?\s*\)\s*=\s*delete\s*;)");
+    return std::regex_search(classText, deletedPattern);
+}
+
+bool hasDeletedCopyAssignment(const std::string& classText, const std::string& className)
+{
+    const std::regex deletedPattern(escapeRegex(className) + R"(\s*&\s*operator=\s*\(\s*const\s+)"
+                                    + escapeRegex(className) + R"(\s*&\s*(?:[A-Za-z_]\w*)?\s*\)\s*=\s*delete\s*;)");
+    return std::regex_search(classText, deletedPattern);
+}
+
+bool hasMoveConstructor(const std::string& classText, const std::string& className)
+{
+    const std::regex movePattern(escapeRegex(className) + R"(\s*\(\s*)" + escapeRegex(className) + R"(\s*&&)");
+    return std::regex_search(classText, movePattern);
+}
+
+bool hasMoveAssignment(const std::string& classText, const std::string& className)
+{
+    const std::regex movePattern(R"(operator=\s*\(\s*)" + escapeRegex(className) + R"(\s*&&)");
+    return std::regex_search(classText, movePattern);
+}
+
+std::string deleteCopyOperation(std::string classText,
+                                const std::regex& headerPattern,
+                                const std::string& replacement,
+                                const std::string& ruleName,
+                                std::vector<ConversionChange>& changes,
+                                bool& changed)
+{
+    MethodRegion region;
+    if (!findFunctionRegion(classText, headerPattern, region)) {
+        return classText;
+    }
+
+    const std::string before = classText.substr(region.start, region.end - region.start);
+    addAppliedChange(changes,
+                     ruleName,
+                     trim(before),
+                     trim(replacement),
+                     "Deleted obsolete raw-resource copy semantics because std::unique_ptr expresses exclusive ownership.");
+    classText.replace(region.start, region.end - region.start, replacement);
+    changed = true;
+    return classText;
+}
+
+std::size_t publicInsertionPoint(const std::string& classText)
+{
+    const std::size_t publicPosition = classText.find("public:");
+    if (publicPosition == std::string::npos) {
+        return classText.find('{') == std::string::npos ? 0 : classText.find('{') + 1;
+    }
+    const std::size_t lineEnd = classText.find('\n', publicPosition);
+    return lineEnd == std::string::npos ? publicPosition + std::string("public:").size() : lineEnd + 1;
+}
+
+std::string defaultMoveOperationsAfterUniqueOwnership(std::string classText,
+                                                      const std::string& className,
+                                                      const std::string& indent,
+                                                      std::vector<ConversionChange>& changes)
+{
+    if (hasMoveConstructor(classText, className) && hasMoveAssignment(classText, className)) {
+        return classText;
+    }
+
+    std::ostringstream declarations;
+    if (!hasMoveConstructor(classText, className)) {
+        declarations << indent << className << "(" << className << "&&) noexcept = default;\n";
+    }
+    if (!hasMoveAssignment(classText, className)) {
+        declarations << indent << className << "& operator=(" << className << "&&) noexcept = default;\n";
+    }
+
+    const std::string moveDeclarations = declarations.str();
+    if (moveDeclarations.empty()) {
+        return classText;
+    }
+
+    std::size_t insertionPoint = std::string::npos;
+    const std::regex copyAssignmentDeletePattern("(^[ \\t]*)" + escapeRegex(className)
+                                                 + R"(\s*&\s*operator=\s*\(\s*const\s+)"
+                                                 + escapeRegex(className)
+                                                 + R"(\s*&\s*(?:[A-Za-z_]\w*)?\s*\)\s*=\s*delete\s*;)",
+                                                 std::regex::ECMAScript | std::regex::multiline);
+    std::smatch match;
+    if (std::regex_search(classText, match, copyAssignmentDeletePattern)) {
+        insertionPoint = static_cast<std::size_t>(match.position() + match.length());
+    } else {
+        const std::regex copyConstructorDeletePattern("(^[ \\t]*)" + escapeRegex(className)
+                                                      + R"(\s*\(\s*const\s+)"
+                                                      + escapeRegex(className)
+                                                      + R"(\s*&\s*(?:[A-Za-z_]\w*)?\s*\)\s*=\s*delete\s*;)",
+                                                      std::regex::ECMAScript | std::regex::multiline);
+        if (std::regex_search(classText, match, copyConstructorDeletePattern)) {
+            insertionPoint = static_cast<std::size_t>(match.position() + match.length());
+        }
+    }
+    if (insertionPoint == std::string::npos) {
+        insertionPoint = publicInsertionPoint(classText);
+    }
+
+    classText.insert(insertionPoint, "\n" + moveDeclarations);
+    addAppliedChange(changes,
+                     "Default move operations after unique ownership modernization",
+                     className,
+                     trim(moveDeclarations),
+                     "Defaulted move operations after deleting raw-resource copy operations for exclusive std::unique_ptr ownership.");
+    return classText;
+}
+
+std::string updateCopyAndMoveForUniqueMember(std::string classText,
+                                             const std::string& className,
+                                             std::vector<ConversionChange>& changes)
+{
+    const std::regex copyConstructorHeader(
+        "(^[ \\t]*)" + escapeRegex(className) + R"(\s*\(\s*const\s+)" + escapeRegex(className)
+            + R"(\s*&\s*(?:[A-Za-z_]\w*)?\s*\)\s*(?:[^{]*)?\{)",
+        std::regex::ECMAScript | std::regex::multiline);
+    const std::regex copyAssignmentHeader(
+        "(^[ \\t]*)" + escapeRegex(className) + R"(\s*&\s*operator=\s*\(\s*const\s+)"
+            + escapeRegex(className) + R"(\s*&\s*(?:[A-Za-z_]\w*)?\s*\)\s*\{)",
+        std::regex::ECMAScript | std::regex::multiline);
+
+    std::smatch match;
+    std::string indent = "    ";
+    bool deletedCopy = false;
+    if (std::regex_search(classText, match, copyConstructorHeader)) {
+        indent = match[1].str();
+        classText = deleteCopyOperation(std::move(classText),
+                                        copyConstructorHeader,
+                                        indent + className + "(const " + className + "&) = delete;",
+                                        "Delete copy constructor after unique ownership modernization",
+                                        changes,
+                                        deletedCopy);
+    }
+    if (std::regex_search(classText, match, copyAssignmentHeader)) {
+        indent = match[1].str();
+        classText = deleteCopyOperation(std::move(classText),
+                                        copyAssignmentHeader,
+                                        indent + className + "& operator=(const " + className + "&) = delete;",
+                                        "Delete copy assignment after unique ownership modernization",
+                                        changes,
+                                        deletedCopy);
+    }
+
+    if (deletedCopy || hasDeletedCopyConstructor(classText, className) || hasDeletedCopyAssignment(classText, className)) {
+        classText = defaultMoveOperationsAfterUniqueOwnership(std::move(classText), className, indent, changes);
+    }
+
+    return classText;
 }
 
 std::string removeUniquePtrMemberCleanup(std::string destructorBody,
@@ -491,6 +711,14 @@ std::string AggressiveRewriteEngine::rewriteClassMemberOwnership(const std::stri
             const std::regex returnPattern("\\breturn\\s+" + escapedName + R"(\s*;)");
             const std::regex copyConstructorPattern("\\b" + escapeRegex(region.name) + R"(\s*\(\s*(?:const\s+)?)" + escapeRegex(region.name) + R"(\s*&)");
             const std::regex copyAssignmentPattern(R"(operator\s*=\s*\(\s*(?:const\s+)?)" + escapeRegex(region.name) + R"(\s*&)");
+            const std::regex copyConstructorHeader(
+                "(^[ \\t]*)" + escapeRegex(region.name) + R"(\s*\(\s*const\s+)" + escapeRegex(region.name)
+                    + R"(\s*&\s*(?:[A-Za-z_]\w*)?\s*\)\s*(?:[^{]*)?\{)",
+                std::regex::ECMAScript | std::regex::multiline);
+            const std::regex copyAssignmentHeader(
+                "(^[ \\t]*)" + escapeRegex(region.name) + R"(\s*&\s*operator=\s*\(\s*const\s+)"
+                    + escapeRegex(region.name) + R"(\s*&\s*(?:[A-Za-z_]\w*)?\s*\)\s*\{)",
+                std::regex::ECMAScript | std::regex::multiline);
 
             const bool hasAssignmentAllocation = std::regex_search(classText, assignmentPattern);
             const bool hasInitializerAllocation = std::regex_search(classText, initializerPattern);
@@ -499,8 +727,16 @@ std::string AggressiveRewriteEngine::rewriteClassMemberOwnership(const std::stri
                 && !rawMemberReturnsAreObserverGetters(classText, member.type, member.name);
             const bool hasCopyOperation = std::regex_search(classText, copyConstructorPattern)
                 || std::regex_search(classText, copyAssignmentPattern);
-            const bool copyOperationDeleted = hasCopyOperation
-                && classText.find("= delete") != std::string::npos;
+            const bool copyConstructorDeleted = hasDeletedCopyConstructor(classText, region.name);
+            const bool copyAssignmentDeleted = hasDeletedCopyAssignment(classText, region.name);
+            const bool hasCopyConstructorBody = std::regex_search(classText, copyConstructorHeader);
+            const bool hasCopyAssignmentBody = std::regex_search(classText, copyAssignmentHeader);
+            const bool copyConstructorSafe = !hasCopyConstructorBody
+                || copyConstructorDeleted
+                || copySpecialMemberLooksResourceOnly(classText, copyConstructorHeader, member.type, member.name);
+            const bool copyAssignmentSafe = !hasCopyAssignmentBody
+                || copyAssignmentDeleted
+                || copySpecialMemberLooksResourceOnly(classText, copyAssignmentHeader, member.type, member.name);
 
             if (!hasAssignmentAllocation && !hasInitializerAllocation) {
                 addSuggestion(changes,
@@ -510,7 +746,7 @@ std::string AggressiveRewriteEngine::rewriteClassMemberOwnership(const std::stri
                 continue;
             }
 
-            if (!hasDestructorDelete || hasUnsafeRawReturn || (hasCopyOperation && !copyOperationDeleted)) {
+            if (!hasDestructorDelete || hasUnsafeRawReturn || (hasCopyOperation && (!copyConstructorSafe || !copyAssignmentSafe))) {
                 addSuggestion(changes,
                               "Class member raw pointer to std::unique_ptr",
                               trim(member.declaration),
@@ -569,6 +805,7 @@ std::string AggressiveRewriteEngine::rewriteClassMemberOwnership(const std::stri
                                   replacement);
             }
 
+            classText = updateCopyAndMoveForUniqueMember(std::move(classText), region.name, changes);
             convertedMembers.push_back(member.name);
         }
 

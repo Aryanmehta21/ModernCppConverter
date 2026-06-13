@@ -31,6 +31,12 @@ struct RawVectorSink
     std::string functionName;
 };
 
+struct RawPointerSink
+{
+    std::string elementType;
+    std::string functionName;
+};
+
 std::string trim(std::string value)
 {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -103,6 +109,23 @@ std::vector<RawVectorSink> collectRawVectorSinks(const std::string& code)
         R"(\b[A-Za-z_][A-Za-z0-9_:<>,\s*&]*\s+([A-Za-z_]\w*)\s*\([^)]*std::vector\s*<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*\*\s*>\s*(const\s*)?([&*]\s*)?[A-Za-z_]\w*[^)]*\))");
     for (std::sregex_iterator it(code.begin(), code.end(), functionPattern), end; it != end; ++it) {
         sinks.push_back(RawVectorSink{(*it)[2].str(), (*it)[1].str()});
+    }
+    return sinks;
+}
+
+std::vector<RawPointerSink> collectRawPointerSinks(const std::string& code)
+{
+    std::vector<RawPointerSink> sinks;
+    const std::regex functionPattern(
+        R"((?:^|\n)[ \t]*(?:template\s*<[^;\n{}]+>\s*)?(?:[A-Za-z_:][A-Za-z0-9_:<>,\s*&]*\s+)+([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*(?:const\s*)?(?:\{|;))",
+        std::regex::ECMAScript);
+    const std::regex rawPointerParameter(R"((?:^|,)\s*(?:const\s+)?([A-Za-z_:][A-Za-z0-9_:]*)\s*\*\s*[A-Za-z_]\w*)");
+    for (std::sregex_iterator iterator(code.begin(), code.end(), functionPattern), end; iterator != end; ++iterator) {
+        const std::string functionName = (*iterator)[1].str();
+        const std::string parameters = (*iterator)[2].str();
+        for (std::sregex_iterator parameter(parameters.begin(), parameters.end(), rawPointerParameter), parameterEnd; parameter != parameterEnd; ++parameter) {
+            sinks.push_back(RawPointerSink{(*parameter)[1].str(), functionName});
+        }
     }
     return sinks;
 }
@@ -191,53 +214,67 @@ std::string updateRawVectorSignatures(std::string code,
     return code;
 }
 
-std::string updateRawPointerSignatures(std::string code,
-                                      const std::vector<SmartPointerSymbol>& smartPointers,
-                                      std::vector<ConversionChange>& changes)
+std::string adaptRawPointerObserverCalls(std::string code,
+                                         const std::vector<SmartPointerSymbol>& smartPointers,
+                                         const std::vector<RawPointerSink>& rawPointerSinks,
+                                         std::vector<ConversionChange>& changes)
 {
-    for (const SmartPointerSymbol& pointer : smartPointers) {
-        const std::regex signaturePattern(R"((const\s+)?)" + escapeRegex(pointer.elementType)
-                                          + R"(\s*\*\s*([A-Za-z_]\w+))");
-        std::smatch match;
-        std::string search = code;
-        std::size_t consumed = 0;
-        while (std::regex_search(search, match, signaturePattern)) {
-            const std::size_t position = consumed + static_cast<std::size_t>(match.position());
-            const std::size_t lineStart = code.rfind('\n', position) == std::string::npos ? 0 : code.rfind('\n', position) + 1;
-            const std::size_t lineEnd = code.find('\n', position);
-            const std::string line = code.substr(lineStart, (lineEnd == std::string::npos ? code.size() : lineEnd) - lineStart);
-            if (line.find('(') == std::string::npos || line.find(')') == std::string::npos) {
-                consumed = position + static_cast<std::size_t>(match.length());
-                search = code.substr(consumed);
-                continue;
-            }
-            const std::size_t paren = code.rfind('(', position);
-            const std::size_t nameEnd = paren == std::string::npos ? std::string::npos : code.find_last_not_of(" \t\n", paren - 1);
-            const std::size_t nameStart = nameEnd == std::string::npos ? std::string::npos : code.find_last_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_", nameEnd);
-            const std::string functionName = (nameStart == std::string::npos || nameEnd == std::string::npos)
-                ? std::string{}
-                : code.substr(nameStart + 1, nameEnd - nameStart);
-            if (functionName.empty()
-                || !hasDefinitionBodyAfterParameter(code, position)
-                || !hasDirectCallWithSymbol(code, functionName, pointer.name)) {
-                consumed = position + static_cast<std::size_t>(match.length());
-                search = code.substr(consumed);
-                continue;
-            }
-
-            const std::string smartType = "const std::" + pointer.pointerKind + "<" + pointer.elementType + ">& " + match[2].str();
-            const std::string before = match[0].str();
-            code.replace(position, static_cast<std::size_t>(match.length()), smartType);
-            addAppliedChange(changes,
-                             "CrossScopeTypePropagationPass",
-                             trim(before),
-                             trim(smartType),
-                             "Updated a visible raw-pointer consumer signature after the reachable argument became a smart pointer.");
-            consumed = position + smartType.size();
-            search = code.substr(consumed);
-        }
+    if (smartPointers.empty() || rawPointerSinks.empty()) {
+        return code;
     }
-    return code;
+
+    bool changed = false;
+    const SafeReplacementEngine safeReplacement;
+    std::string updated = safeReplacement.rewriteCodeLines(std::move(code), [&](const std::string& line) {
+        std::string trailingComment;
+        std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+        const std::string before = codePart;
+
+        for (const RawPointerSink& sink : rawPointerSinks) {
+            for (const SmartPointerSymbol& pointer : smartPointers) {
+                if (sink.elementType != pointer.elementType) {
+                    continue;
+                }
+
+                const std::regex signaturePattern("\\b" + escapeRegex(sink.functionName) + R"(\s*\([^;\n{}]*\*\s*[A-Za-z_]\w*[^;\n{}]*\)\s*(?:const\s*)?(?:;|\{)?\s*$)");
+                if (std::regex_search(codePart, signaturePattern)) {
+                    continue;
+                }
+
+                const std::regex callPattern("(\\b(?:(?:[A-Za-z_]\\w*)\\s*(?:\\.|->)\\s*)?"
+                                             + escapeRegex(sink.functionName)
+                                             + "\\s*\\(\\s*)"
+                                             + escapeRegex(pointer.name)
+                                             + "(\\s*\\))");
+                std::smatch match;
+                if (!std::regex_search(codePart, match, callPattern)) {
+                    continue;
+                }
+
+                const std::string replacement = match[1].str() + pointer.name + ".get()" + match[2].str();
+                codePart.replace(static_cast<std::size_t>(match.position()),
+                                 static_cast<std::size_t>(match.length()),
+                                 replacement);
+                changed = true;
+            }
+        }
+
+        if (codePart != before) {
+            addAppliedChange(changes,
+                             "Cross-scope raw pointer observer adaptation",
+                             trim(before),
+                             trim(codePart),
+                             "Kept the visible raw-pointer observer API unchanged and passed the converted smart pointer owner through .get().");
+            addAppliedChange(changes,
+                             "Smart pointer sink propagation",
+                             trim(before),
+                             trim(codePart),
+                             "Passed a non-owning raw pointer view with .get() when a raw-pointer observer API is used.");
+        }
+        return codePart + trailingComment;
+    });
+
+    return changed ? updated : code;
 }
 
 std::string adaptExternalRawVectorSinks(std::string code,
@@ -337,9 +374,10 @@ std::string CrossScopeTypePropagationPass::rewrite(const std::string& code,
     std::string updated = code;
     const std::vector<SmartVectorSymbol> smartVectors = collectSmartVectors(updated);
     const std::vector<SmartPointerSymbol> smartPointers = collectSmartPointers(updated);
+    const std::vector<RawPointerSink> rawPointerSinks = collectRawPointerSinks(updated);
 
     updated = updateRawVectorSignatures(std::move(updated), smartVectors, changes);
-    updated = updateRawPointerSignatures(std::move(updated), smartPointers, changes);
+    updated = adaptRawPointerObserverCalls(std::move(updated), smartPointers, rawPointerSinks, changes);
     updated = repairClassVectorGetter(std::move(updated), changes);
 
     if (!externalContext.empty()) {
