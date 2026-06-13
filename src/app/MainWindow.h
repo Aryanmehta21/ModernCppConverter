@@ -8,8 +8,11 @@
 
 #include <memory>
 #include <filesystem>
+#include <cstdint>
 #include <vector>
 
+#include <QElapsedTimer>
+#include <QFutureWatcher>
 #include <QMainWindow>
 
 class QCheckBox;
@@ -18,6 +21,8 @@ class CppCodeEditor;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
+class QPushButton;
+class QTimer;
 class QWidget;
 
 class MainWindow final : public QMainWindow
@@ -29,6 +34,7 @@ public:
 
 private slots:
     void convertCode();
+    void handleConversionTimeout();
     void clearEditors();
     void copyOutputToClipboard();
     void selectAllOptions();
@@ -54,12 +60,22 @@ private:
     void updateModeStatus(ConversionMode mode, bool backendUnavailable);
     void updateStatusBarMetadata(const ConversionResult& result);
     void appendDiagnostic(const QString& message);
+    void appendConversionDiagnostic(const QString& message);
+    void handleConversionFinished(QFutureWatcher<CoordinatedConversionResult>* watcher,
+                                  std::uint64_t conversionId);
     void setAllOptions(bool checked);
     void displayResult(const ConversionResult& result);
     [[nodiscard]] QString formatChanges(const ConversionResult& result) const;
     [[nodiscard]] QString formatCompileVerification(const ConversionResult& result) const;
 
     std::unique_ptr<ConversionCoordinator> conversionCoordinator_;
+    QFutureWatcher<CoordinatedConversionResult>* activeConversionWatcher_ = nullptr;
+    QTimer* activeConversionTimer_ = nullptr;
+    QElapsedTimer activeConversionClock_;
+    bool activeConversionTimedOut_ = false;
+    std::uint64_t currentConversionId_ = 0;
+    std::uint64_t activeConversionId_ = 0;
+    QPushButton* convertButton_ = nullptr;
     QComboBox* conversionModeComboBox_ = nullptr;
     QComboBox* offlineModernizationLevelComboBox_ = nullptr;
     QComboBox* offlineRewriteStyleComboBox_ = nullptr;

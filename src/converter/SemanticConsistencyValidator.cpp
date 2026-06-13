@@ -2,11 +2,13 @@
 
 #include "converter/DependentUsageRewritePass.h"
 #include "converter/CrossFunctionTypePropagationPass.h"
+#include "converter/CrossScopeTypePropagationPass.h"
 #include "converter/FunctorToLambdaPass.h"
 #include "converter/OwnershipSanityScanner.h"
 #include "converter/PolymorphicContractPass.h"
 #include "converter/RuleOfZeroPass.h"
 #include "converter/ScopeLeakValidationPass.h"
+#include "converter/SemanticTypeValidationPass.h"
 #include "converter/SmartPointerTypePropagationPass.h"
 #include "converter/ValueTypePointerOperationScanner.h"
 
@@ -60,6 +62,8 @@ std::string SemanticConsistencyValidator::validateAndRepair(const std::string& c
     std::string updated = code;
     const SmartPointerTypePropagationPass smartPointerTypePropagationPass;
     updated = smartPointerTypePropagationPass.rewrite(updated, options, context, changes);
+    const CrossScopeTypePropagationPass crossScopeTypePropagationPass;
+    updated = crossScopeTypePropagationPass.rewrite(updated, options, context, changes);
     const CrossFunctionTypePropagationPass crossFunctionTypePropagationPass;
     updated = crossFunctionTypePropagationPass.rewrite(updated, changes);
     const PolymorphicContractPass polymorphicContractPass;
@@ -76,6 +80,8 @@ std::string SemanticConsistencyValidator::validateAndRepair(const std::string& c
     updated = scopeLeakValidationPass.validate(updated, context, compilerOutput, changes);
     const RuleOfZeroPass ruleOfZeroPass;
     updated = ruleOfZeroPass.rewrite(updated, context, changes);
+    const SemanticTypeValidationPass semanticTypeValidationPass;
+    updated = semanticTypeValidationPass.validateAndRepair(updated, options, changes);
 
     for (const TypeChangeRecord& record : context.typeChanges()) {
         if (isSmartPointerCollection(record)) {

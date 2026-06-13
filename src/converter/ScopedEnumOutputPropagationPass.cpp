@@ -231,6 +231,29 @@ bool isInsideQuotedText(const std::string& line, std::size_t position)
     return inString || inCharacter;
 }
 
+bool isInsideSwitchCaseLabel(const std::string& line, const std::size_t position)
+{
+    const std::size_t casePosition = line.rfind("case", position);
+    if (casePosition == std::string::npos) {
+        return false;
+    }
+
+    const bool leftBoundaryOk = casePosition == 0 || !isIdentifierCharacter(line[casePosition - 1]);
+    const std::size_t afterCase = casePosition + std::string_view("case").size();
+    const bool rightBoundaryOk = afterCase >= line.size() || !isIdentifierCharacter(line[afterCase]);
+    if (!leftBoundaryOk || !rightBoundaryOk) {
+        return false;
+    }
+
+    const std::size_t previousStatement = line.rfind(';', position);
+    if (previousStatement != std::string::npos && previousStatement > casePosition) {
+        return false;
+    }
+
+    const std::size_t labelColon = line.find(':', afterCase);
+    return labelColon != std::string::npos && position < labelColon;
+}
+
 bool lineMayOutputOrFormat(const std::string& codePart)
 {
     if (codePart.find("<<") != std::string::npos) {
@@ -405,6 +428,7 @@ std::string replaceCandidate(const std::string& codePart,
 
         if (position < searchStart
             || isInsideQuotedText(codePart, position)
+            || isInsideSwitchCaseLabel(codePart, position)
             || followsMemberAccessOperator(codePart, position)
             || isInsideOutputSafeWrapper(codePart, position, length)
             || rewriteState.wasProcessed(candidate.enumName, expression)) {

@@ -61,6 +61,15 @@ bool contains(const std::string& text, const std::string& needle)
     return text.find(needle) != std::string::npos;
 }
 
+bool diagnosticsContain(const ConversionResult& result, const std::string& needle)
+{
+    return std::any_of(result.diagnosticMessages.begin(),
+                       result.diagnosticMessages.end(),
+                       [&needle](const std::string& diagnostic) {
+                           return contains(diagnostic, needle);
+                       });
+}
+
 std::string readTextFile(const std::filesystem::path& path)
 {
     std::filesystem::path resolved = path;
@@ -1386,10 +1395,59 @@ void testStructuralPreprocessorCleanupAndConstantMacros()
     require(!contains(result.modernCode, "#endif\n#endif"), "preprocessor cleanup should not leave dangling endif pairs");
     require(contains(result.modernCode, "inline constexpr auto MAX_ITEMS = 64;"), "numeric macro constant should become constexpr");
     require(contains(result.modernCode, "inline constexpr auto APP_NAME = \"tool\";"), "string macro constant should become constexpr");
-    require(contains(result.modernCode, "#define SCALE_VALUE(x)"), "function-like macro should be preserved");
+    require(contains(result.modernCode, "constexpr auto SCALE_VALUE"), "simple function-like macro should become a constexpr function");
     require(hasAppliedRule(result, "Remove obsolete preprocessor workaround block"), "obsolete preprocessor removal should be tracked");
     require(hasAppliedRule(result, "Constant macro to constexpr"), "constant macro conversion should be tracked");
-    require(hasSuggestionRule(result, "Constant macro to constexpr"), "function-like macro should produce suggestion");
+    require(hasAppliedRule(result, "Function-like macro to constexpr function"), "function-like macro conversion should be tracked");
+}
+
+void testFunctionLikeMacroModernization()
+{
+    RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult safeResult = converter.convert(
+        "#define SQUARE(x) ((x) * (x))\n"
+        "#define ADD(left, right) ((left) + (right))\n"
+        "int compute(int value)\n"
+        "{\n"
+        "    return SQUARE(value) + ADD(value, 1);\n"
+        "}\n",
+        options);
+
+    require(!contains(safeResult.modernCode, "#define SQUARE"), "safe expression macro should be removed after constexpr conversion");
+    require(!contains(safeResult.modernCode, "#define ADD"), "safe multi-parameter expression macro should be removed after constexpr conversion");
+    require(contains(safeResult.modernCode, "template <typename T0>"), "single-parameter macro should become a function template");
+    require(contains(safeResult.modernCode, "constexpr auto SQUARE(") && contains(safeResult.modernCode, "x)"),
+            "macro name and parameter should be preserved in constexpr function");
+    require(contains(safeResult.modernCode, "constexpr auto ADD(")
+                && contains(safeResult.modernCode, "left")
+                && contains(safeResult.modernCode, "right"),
+            "multi-parameter macro should become constexpr template");
+    require(contains(safeResult.modernCode, "return SQUARE(value) + ADD(value, 1);"), "call sites should remain ordinary function calls");
+    require(hasAppliedRule(safeResult, "Function-like macro to constexpr function"), "function-like macro conversion should be recorded");
+    if (safeResult.compileVerificationEnabled) {
+        require(safeResult.compileVerificationPassed, "safe function-like macro conversion should pass syntax verification");
+    }
+
+    const ConversionResult unsafeResult = converter.convert(
+        "#define JOIN(left, right) left ## right\n"
+        "#define TO_TEXT(value) #value\n"
+        "#define SET_FLAG(value) do { (value) = 1; } while (0)\n"
+        "#define TWICE(value) ((value) + (value))\n"
+        "int mutate(int value)\n"
+        "{\n"
+        "    return TWICE(++value);\n"
+        "}\n",
+        options);
+
+    require(contains(unsafeResult.modernCode, "#define JOIN(left, right)"), "token-pasting macro should remain unchanged");
+    require(contains(unsafeResult.modernCode, "#define TO_TEXT(value)"), "stringification macro should remain unchanged");
+    require(contains(unsafeResult.modernCode, "#define SET_FLAG(value)"), "multi-statement macro should remain unchanged");
+    require(contains(unsafeResult.modernCode, "#define TWICE(value)"), "macro with side-effect-sensitive visible call should remain unchanged");
+    require(!contains(unsafeResult.modernCode, "constexpr auto JOIN"), "unsafe macro should not get constexpr replacement");
+    require(hasSuggestionRule(unsafeResult, "Function-like macro to constexpr function"), "unsafe function-like macros should produce suggestions");
 }
 
 void testStructuralTypedefStructModernization()
@@ -1530,6 +1588,276 @@ void testStructuralIteratorAndIndexLoopsModernize()
     require(contains(result.modernCode, "value = 0;"), "index access should be replaced consistently in loop body");
     require(hasAppliedRule(result, "Explicit iterator loop to range-based for"), "iterator loop conversion should be tracked");
     require(hasAppliedRule(result, "Index loop to range-based for"), "index loop conversion should be tracked");
+}
+
+void testLoopModernizationSafetyBoundaries()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult memberAccessResult = converter.convert(
+        "#include <cstddef>\n"
+        "#include <vector>\n"
+        "struct Item\n"
+        "{\n"
+        "    int count = 0;\n"
+        "    int read() const { return count; }\n"
+        "    void bump() { ++count; }\n"
+        "};\n"
+        "template <typename Container>\n"
+        "int readAll(const Container& values)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (typename Container::const_iterator it = values.begin(); it != values.end(); ++it) {\n"
+        "        total += it->read();\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n"
+        "void bumpAll(std::vector<Item>& items)\n"
+        "{\n"
+        "    for (std::vector<Item>::iterator it = items.begin(); it != items.end(); ++it) {\n"
+        "        it->bump();\n"
+        "        it->count += 1;\n"
+        "    }\n"
+        "}\n"
+        "int sumIndex(const std::vector<int>& values)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (std::size_t index = 0; index < values.size(); ++index) {\n"
+        "        total += values[index];\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n",
+        options);
+
+    require(contains(memberAccessResult.modernCode, "for (const auto& value : values)"),
+            "typename const_iterator loop should become const range-for");
+    require(contains(memberAccessResult.modernCode, "total += value.read();"),
+            "iterator member access should be rewritten to element member access");
+    require(contains(memberAccessResult.modernCode, "for (auto& item : items)"),
+            "mutable iterator member-call loop should become auto& range-for");
+    require(contains(memberAccessResult.modernCode, "item.bump();"), "iterator method call should use range variable");
+    require(contains(memberAccessResult.modernCode, "item.count += 1;"), "iterator member assignment should use range variable");
+    require(contains(memberAccessResult.modernCode, "for (const auto& value : values)"),
+            "same-line opening brace index loop should become range-for");
+    require(!contains(memberAccessResult.modernCode, "it->"), "converted iterator loops should not leave iterator arrow access");
+    if (memberAccessResult.compileVerificationEnabled) {
+        require(memberAccessResult.compileVerificationPassed, "member-access loop modernization should pass syntax verification");
+    }
+
+    const ConversionResult unsafeResult = converter.convert(
+        "#include <vector>\n"
+        "void unsafeLoops(std::vector<int>& values, const std::vector<int>& other)\n"
+        "{\n"
+        "    for (auto it = values.begin(); it != values.end(); ++it)\n"
+        "    {\n"
+        "        if (*it == 0)\n"
+        "        {\n"
+        "            values.erase(it);\n"
+        "        }\n"
+        "    }\n"
+        "    for (auto it = values.rbegin(); it != values.rend(); ++it)\n"
+        "    {\n"
+        "        *it += 1;\n"
+        "    }\n"
+        "    for (std::size_t index = 0; index < values.size(); ++index)\n"
+        "    {\n"
+        "        values[index] += other[index];\n"
+        "    }\n"
+        "}\n",
+        options);
+
+    require(contains(unsafeResult.modernCode, "values.erase(it);"),
+            "erase iterator loop should remain explicit");
+    require(contains(unsafeResult.modernCode, "values.rbegin()"),
+            "reverse iterator loop should remain explicit");
+    require(contains(unsafeResult.modernCode, "other[index]"),
+            "multi-container index loop should remain explicit");
+    require(hasSuggestionRule(unsafeResult, "Explicit iterator loop to range-based for"),
+            "unsafe erase loop should emit loop modernization suggestion");
+    if (unsafeResult.compileVerificationEnabled) {
+        require(unsafeResult.compileVerificationPassed, "unsafe loop preservation sample should still compile");
+    }
+}
+
+void testManualGrowthPipelineConverges()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <cstddef>\n"
+        "class BufferStore\n"
+        "{\n"
+        "public:\n"
+        "    BufferStore()\n"
+        "        : values(nullptr), count(0), capacity(2)\n"
+        "    {\n"
+        "        values = new int[capacity];\n"
+        "    }\n\n"
+        "    BufferStore(const BufferStore& other)\n"
+        "        : values(new int[other.capacity]), count(other.count), capacity(other.capacity)\n"
+        "    {\n"
+        "        for (int index = 0; index < count; ++index)\n"
+        "        {\n"
+        "            values[index] = other.values[index];\n"
+        "        }\n"
+        "    }\n\n"
+        "    ~BufferStore()\n"
+        "    {\n"
+        "        if (values != nullptr)\n"
+        "        {\n"
+        "            delete[] values;\n"
+        "            values = nullptr;\n"
+        "        }\n"
+        "    }\n\n"
+        "    void append(int value)\n"
+        "    {\n"
+        "        if (count == capacity)\n"
+        "        {\n"
+        "            int nextCapacity = capacity * 2;\n"
+        "            int* grown = new int[nextCapacity];\n"
+        "            for (int index = 0; index < count; ++index)\n"
+        "            {\n"
+        "                grown[index] = values[index];\n"
+        "            }\n"
+        "            delete[] values;\n"
+        "            values = grown;\n"
+        "            capacity = nextCapacity;\n"
+        "        }\n"
+        "        values[count] = value;\n"
+        "        ++count;\n"
+        "    }\n\n"
+        "    int size() const\n"
+        "    {\n"
+        "        return count;\n"
+        "    }\n\n"
+        "private:\n"
+        "    int* values;\n"
+        "    int count;\n"
+        "    int capacity;\n"
+        "};\n\n"
+        "int main()\n"
+        "{\n"
+        "    BufferStore store;\n"
+        "    store.append(1);\n"
+        "    store.append(2);\n"
+        "    store.append(3);\n"
+        "    return store.size();\n"
+        "}\n",
+        options);
+
+    require(diagnosticsContain(result, "VectorParadigmRewritePass"),
+            "pass tracing should include vector paradigm cleanup for manual growth fixture");
+    require(diagnosticsContain(result, "hash_before=") && diagnosticsContain(result, "hash_after="),
+            "pass tracing should include before/after hashes");
+    require(!diagnosticsContain(result, "iteration-limit-exceeded"),
+            "manual growth modernization should converge without hitting iteration guard");
+    require(contains(result.modernCode, "std::vector<int> values;"),
+            "manual dynamic array should modernize to vector storage");
+    require(!contains(result.modernCode, "grown[index]"),
+            "manual growth copy loop should not leave orphaned temp buffer references");
+    require(!contains(result.modernCode, "delete[] values"),
+            "vector modernization should remove manual delete[] cleanup");
+    require(contains(result.modernCode, "values.push_back(value);"),
+            "append logic should converge to vector push_back");
+    if (result.compileVerificationEnabled) {
+        require(result.compileVerificationPassed,
+                "manual growth convergence fixture should pass syntax verification\nCompiler output:\n" + result.compilerOutput
+                    + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testCanBufferManualGrowthReproTerminates()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const auto started = std::chrono::steady_clock::now();
+    const ConversionResult result = converter.convert(
+        "#include <iostream>\n"
+        "#include <cstring>\n\n"
+        "#define INITIAL_MAX 2\n\n"
+        "typedef struct _CanFrame {\n"
+        "    unsigned long arbitrationId;\n"
+        "    char dataPayload[8];\n"
+        "} CanFrame;\n\n"
+        "class CanBufferManager {\n"
+        "private:\n"
+        "    CanFrame* backingStore;\n"
+        "    int count;\n"
+        "    int capacity;\n\n"
+        "public:\n"
+        "    CanBufferManager() {\n"
+        "        count = 0;\n"
+        "        capacity = INITIAL_MAX;\n"
+        "        backingStore = new CanFrame[capacity];\n"
+        "    }\n\n"
+        "    CanBufferManager(const CanBufferManager& other) {\n"
+        "        count = other.count;\n"
+        "        capacity = other.capacity;\n"
+        "        backingStore = new CanFrame[capacity];\n"
+        "        for (int i = 0; i < count; ++i) {\n"
+        "            backingStore[i] = other.backingStore[i];\n"
+        "        }\n"
+        "    }\n\n"
+        "    ~CanBufferManager() {\n"
+        "        if (backingStore != NULL) {\n"
+        "            delete[] backingStore;\n"
+        "            backingStore = NULL;\n"
+        "        }\n"
+        "    }\n\n"
+        "    bool appendFrame(unsigned long id, const char* bytes) {\n"
+        "        if (count >= capacity) {\n"
+        "            int newCap = capacity * 2;\n"
+        "            CanFrame* newStore = new CanFrame[newCap];\n"
+        "            for (int i = 0; i < count; ++i) {\n"
+        "                newStore[i] = backingStore[i];\n"
+        "            }\n"
+        "            delete[] backingStore;\n"
+        "            backingStore = newStore;\n"
+        "            capacity = newCap;\n"
+        "        }\n\n"
+        "        backingStore[count].arbitrationId = id;\n"
+        "        std::strncpy(backingStore[count].dataPayload, bytes, 7);\n"
+        "        backingStore[count].dataPayload[7] = '\\0';\n\n"
+        "        count++;\n"
+        "        return true;\n"
+        "    }\n\n"
+        "    int getFrameCount() const { return count; }\n"
+        "    CanFrame* getFrame(int index) { return &backingStore[index]; }\n"
+        "};\n\n"
+        "int main() {\n"
+        "    CanBufferManager buffer;\n"
+        "    buffer.appendFrame(0x7DF, \"\\x02\\x01\\x0D\\x00\\x00\\x00\\x00\");\n"
+        "    buffer.appendFrame(0x7E8, \"\\x03\\x41\\x0D\\x32\\x00\\x00\\x00\");\n\n"
+        "    std::cout << \"Buffered Frames: \" << buffer.getFrameCount() << std::endl;\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+
+    require(elapsed.count() < 15000,
+            "CanBuffer manual-growth repro should terminate quickly; elapsed_ms=" + std::to_string(elapsed.count()));
+    require(diagnosticsContain(result, "START PASS VectorParadigmRewritePass"),
+            "pass tracing should print START PASS for vector paradigm cleanup");
+    require(diagnosticsContain(result, "END PASS VectorParadigmRewritePass"),
+            "pass tracing should print END PASS for vector paradigm cleanup");
+    require(diagnosticsContain(result, "hash_before=") && diagnosticsContain(result, "hash_after="),
+            "pass tracing should include AST/code hashes around passes");
+    require(!diagnosticsContain(result, "iteration-limit-exceeded"),
+            "CanBuffer repro should converge without hitting the iteration guard");
+    require(!contains(result.modernCode, "newStore[i]"),
+            "manual growth temp buffer loop should not remain after conversion");
+    require(!contains(result.modernCode, "backingStore = newStore"),
+            "raw temp buffer assignment to converted storage should not remain");
+    require(result.compileVerificationEnabled, "compile verification should run for CanBuffer repro");
+    require(result.compileVerificationPassed,
+            "CanBuffer repro should pass syntax verification\nCompiler output:\n" + result.compilerOutput
+                + "\nConverted code:\n" + result.modernCode);
 }
 
 void testStructuralPreprocessorBalanceValidationRemovesDanglingEndif()
@@ -3449,10 +3777,15 @@ void testRepositoryModeUsesStructuralModernizationPipeline()
         "#define nullptr NULL\n"
         "#endif\n"
         "#define BUFFER_LIMIT 32\n"
+        "#define DOUBLE_VALUE(x) ((x) * 2)\n"
         "typedef struct\n"
         "{\n"
         "    int id;\n"
         "} Record;\n\n"
+        "int scale(int value)\n"
+        "{\n"
+        "    return DOUBLE_VALUE(value);\n"
+        "}\n\n"
         "class TextStore\n"
         "{\n"
         "public:\n"
@@ -3520,6 +3853,8 @@ void testRepositoryModeUsesStructuralModernizationPipeline()
     require(result.filesScanned == 1, "repository structural pipeline should scan fixture file");
     require(result.filesModified == 1, "repository structural pipeline should modify fixture file");
     require(contains(modernized, "inline constexpr auto BUFFER_LIMIT = 32;"), "repository mode should convert constant macros");
+    require(contains(modernized, "constexpr auto DOUBLE_VALUE"), "repository mode should convert safe function-like macros");
+    require(!contains(modernized, "#define DOUBLE_VALUE"), "repository mode should remove converted function-like macro definitions");
     require(contains(modernized, "struct Record"), "repository mode should modernize typedef struct");
     require(contains(modernized, "std::string name;"), "repository mode should modernize char buffer members");
     require(contains(modernized, "std::vector<int> values;"), "repository mode should modernize dynamic array members");
@@ -3532,6 +3867,7 @@ void testRepositoryModeUsesStructuralModernizationPipeline()
     require(!contains(modernized, "values != nullptr"), "repository dependency cleanup should remove vector null checks");
     require(!contains(modernized, "#ifndef nullptr"), "repository mode should remove obsolete preprocessor blocks");
     require(contains(report, "Constant macro to constexpr"), "repository report should include macro conversion");
+    require(contains(report, "Function-like macro to constexpr function"), "repository report should include function-like macro conversion");
     require(contains(report, "C-style typedef struct to C++ struct"), "repository report should include typedef struct conversion");
     require(contains(report, "Char buffer member to std::string"), "repository report should include char buffer conversion");
     require(contains(report, "Value-type pointer operation scanner"), "repository report should include value-type pointer cleanup scanner");
@@ -3644,6 +3980,114 @@ void testOfflineModeStillWorks()
     require(result.effectiveMode == ConversionMode::OfflineRuleBased, "offline mode should remain effective mode");
     require(result.result.conversionSource == "Offline Rule-Based", "offline mode should stamp conversion source");
     require(result.result.backendStatus == "Not used", "offline mode should stamp backend status");
+}
+
+void testCoordinatorCanBufferManualGrowthReproTerminates()
+{
+    auto backend = std::make_unique<FakeBackendClient>();
+    auto* backendRaw = backend.get();
+    ConversionCoordinator coordinator(std::make_unique<RuleBasedConverterEngine>(), std::move(backend));
+
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const auto started = std::chrono::steady_clock::now();
+    const CoordinatedConversionResult result = coordinator.convert(
+        "#include <iostream>\n"
+        "#include <cstring>\n\n"
+        "#define INITIAL_MAX 2\n\n"
+        "typedef struct _CanFrame {\n"
+        "    unsigned long arbitrationId;\n"
+        "    char dataPayload[8];\n"
+        "} CanFrame;\n\n"
+        "class CanBufferManager {\n"
+        "private:\n"
+        "    CanFrame* backingStore;\n"
+        "    int count;\n"
+        "    int capacity;\n\n"
+        "public:\n"
+        "    CanBufferManager() {\n"
+        "        count = 0;\n"
+        "        capacity = INITIAL_MAX;\n"
+        "        backingStore = new CanFrame[capacity];\n"
+        "    }\n\n"
+        "    CanBufferManager(const CanBufferManager& other) {\n"
+        "        count = other.count;\n"
+        "        capacity = other.capacity;\n"
+        "        backingStore = new CanFrame[capacity];\n"
+        "        for (int i = 0; i < count; ++i) {\n"
+        "            backingStore[i] = other.backingStore[i];\n"
+        "        }\n"
+        "    }\n\n"
+        "    ~CanBufferManager() {\n"
+        "        if (backingStore != NULL) {\n"
+        "            delete[] backingStore;\n"
+        "            backingStore = NULL;\n"
+        "        }\n"
+        "    }\n\n"
+        "    bool appendFrame(unsigned long id, const char* bytes) {\n"
+        "        if (count >= capacity) {\n"
+        "            int newCap = capacity * 2;\n"
+        "            CanFrame* newStore = new CanFrame[newCap];\n"
+        "            for (int i = 0; i < count; ++i) {\n"
+        "                newStore[i] = backingStore[i];\n"
+        "            }\n"
+        "            delete[] backingStore;\n"
+        "            backingStore = newStore;\n"
+        "            capacity = newCap;\n"
+        "        }\n\n"
+        "        backingStore[count].arbitrationId = id;\n"
+        "        std::strncpy(backingStore[count].dataPayload, bytes, 7);\n"
+        "        backingStore[count].dataPayload[7] = '\\0';\n\n"
+        "        count++;\n"
+        "        return true;\n"
+        "    }\n\n"
+        "    int getFrameCount() const { return count; }\n"
+        "    CanFrame* getFrame(int index) { return &backingStore[index]; }\n"
+        "};\n\n"
+        "int main() {\n"
+        "    CanBufferManager buffer;\n"
+        "    buffer.appendFrame(0x7DF, \"\\x02\\x01\\x0D\\x00\\x00\\x00\\x00\");\n"
+        "    buffer.appendFrame(0x7E8, \"\\x03\\x41\\x0D\\x32\\x00\\x00\\x00\");\n\n"
+        "    std::cout << \"Buffered Frames: \" << buffer.getFrameCount() << std::endl;\n"
+        "    return 0;\n"
+        "}\n",
+        options,
+        ConversionMode::OfflineRuleBased);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+
+    require(elapsed.count() < 15000,
+            "coordinator CanBuffer repro should terminate quickly; elapsed_ms=" + std::to_string(elapsed.count()));
+    require(!backendRaw->convertCalled, "offline coordinator path should not call backend");
+    require(result.effectiveMode == ConversionMode::OfflineRuleBased, "coordinator repro should stay offline");
+    require(diagnosticsContain(result.result, "START PASS VectorParadigmRewritePass"),
+            "coordinator path should preserve START PASS pipeline diagnostics for GUI details");
+    require(diagnosticsContain(result.result, "END PASS VectorParadigmRewritePass"),
+            "coordinator path should preserve END PASS pipeline diagnostics for GUI details");
+    require(!diagnosticsContain(result.result, "iteration-limit-exceeded"),
+            "coordinator CanBuffer repro should not hit convergence guard");
+    require(contains(result.result.modernCode, "inline constexpr auto INITIAL_MAX"),
+            "coordinator CanBuffer repro should convert constant macros");
+    require(contains(result.result.modernCode, "struct CanFrame"),
+            "coordinator CanBuffer repro should modernize typedef struct");
+    require(contains(result.result.modernCode, "std::vector<CanFrame> backingStore"),
+            "coordinator CanBuffer repro should convert raw array storage to vector");
+    require(!contains(result.result.modernCode, "new CanFrame["),
+            "coordinator CanBuffer repro should remove raw dynamic array allocation");
+    require(!contains(result.result.modernCode, "delete[] backingStore"),
+            "coordinator CanBuffer repro should remove manual delete[] cleanup");
+    require(!contains(result.result.modernCode, "newStore"),
+            "coordinator CanBuffer repro should remove manual growth temporaries");
+    require(contains(result.result.modernCode, "backingStore.push_back"),
+            "coordinator CanBuffer repro should rewrite append logic to vector push_back\nConverted code:\n" + result.result.modernCode);
+    require(contains(result.result.modernCode, "return backingStore.size();"),
+            "coordinator CanBuffer repro should cascade count getter to vector.size()");
+    require(contains(result.result.modernCode, "'\\n'"),
+            "coordinator CanBuffer repro should replace simple std::endl with newline output");
+    require(result.result.compileVerificationEnabled, "coordinator CanBuffer repro should run compile verification");
+    require(result.result.compileVerificationPassed,
+            "coordinator CanBuffer repro should pass compile verification\nCompiler output:\n" + result.result.compilerOutput
+                + "\nConverted code:\n" + result.result.modernCode);
 }
 
 void testBackendHealthCheckParsing()
@@ -3944,11 +4388,15 @@ int main(int argc, char** argv)
     testOfflineSampleFilesModernize();
     testTokenBasedStructureAnalyzerFindsReusableBlocks();
     testStructuralPreprocessorCleanupAndConstantMacros();
+    testFunctionLikeMacroModernization();
     testStructuralTypedefStructModernization();
     testStructuralCharBufferMemberModernizesToString();
     testStructuralRawDynamicArrayModernizesToVector();
     testStructuralLocalDynamicArrayModernizesToVector();
     testStructuralIteratorAndIndexLoopsModernize();
+    testLoopModernizationSafetyBoundaries();
+    testManualGrowthPipelineConverges();
+    testCanBufferManualGrowthReproTerminates();
     testStructuralPreprocessorBalanceValidationRemovesDanglingEndif();
     testDependentVectorCleanupUpdatesAllUsages();
     testDependentStringCleanupUpdatesAllUsages();
@@ -4008,6 +4456,7 @@ int main(int argc, char** argv)
     testRepositoryModeAppliesScopeLeakValidation();
     testRepositoryModeUsesSmartPointerPropagationPass();
     testOfflineModeStillWorks();
+    testCoordinatorCanBufferManualGrowthReproTerminates();
     testBackendHealthCheckParsing();
     testBackendUnavailableFallback();
     testHybridModeExecutionPath();

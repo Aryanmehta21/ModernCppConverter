@@ -1324,6 +1324,7 @@ ConversionResult RuleBasedConverterEngine::convert(const std::string& legacyCode
     result.compilerUsed = pipelineResult.compilerUsed;
     result.compilerOutput = pipelineResult.compilerOutput;
     result.rewriteLevel = pipelineResult.rewriteLevel;
+    result.diagnosticMessages = pipelineResult.diagnosticMessages;
     result.explanation = explanationGenerator_->generate(result.modernCode, result.changes, options);
     return result;
 }

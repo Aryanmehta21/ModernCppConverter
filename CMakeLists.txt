@@ -14,7 +14,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network Concurrent)
 
 add_library(ModernCppConverterWarnings INTERFACE)
 target_compile_options(ModernCppConverterWarnings
@@ -40,13 +40,19 @@ add_library(ModernCppConverterCore
     src/converter/ConcurrencyRaiiModernizationPass.cpp
     src/converter/ContainerPolishPass.cpp
     src/converter/CrossFunctionTypePropagationPass.cpp
+    src/converter/CrossScopeTypePropagationPass.cpp
     src/converter/DependentUsageRewritePass.cpp
     src/converter/DestructorDeclarationValidationPass.cpp
     src/converter/EnumToStringCandidatePass.cpp
     src/converter/FilePointerModernizationPass.cpp
     src/converter/FileIoModernizationPass.cpp
+    src/converter/AutoDeductionPass.cpp
+    src/converter/FunctionalModernizationPass.cpp
+    src/converter/FunctionalModernizationValidator.cpp
     src/converter/FunctorToLambdaPass.cpp
+    src/converter/FunctorToLambdaValidationPass.cpp
     src/converter/ImpactCascadingCleanupPass.cpp
+    src/converter/IndexLoopModernizationPass.cpp
     src/converter/IteratorModernizationPass.cpp
     src/converter/IncludeManager.cpp
     src/converter/MemberApiCascadePass.cpp
@@ -57,9 +63,13 @@ add_library(ModernCppConverterCore
     src/converter/OwnershipGraphModernizationPass.cpp
     src/converter/OwnershipSanityScanner.cpp
     src/converter/OverrideEnforcementPass.cpp
+    src/converter/NsdmiScopeSafetyPass.cpp
+    src/converter/PassByValueToConstRefPass.cpp
     src/converter/PolymorphicContractPass.cpp
     src/converter/PolymorphicContractPolishPass.cpp
     src/converter/PolymorphicSafetyPass.cpp
+    src/converter/QualityModernizationPass.cpp
+    src/converter/RangeForModernizationPass.cpp
     src/converter/OrphanedGrowthSymbolCleanupPass.cpp
     src/converter/OrphanedTempBufferLoopCleanupPass.cpp
     src/converter/SafeReplacementEngine.cpp
@@ -70,6 +80,7 @@ add_library(ModernCppConverterCore
     src/converter/ScopedEnumOutputValidator.cpp
     src/converter/SemanticConsistencyValidator.cpp
     src/converter/SemanticModernizationValidator.cpp
+    src/converter/SemanticTypeValidationPass.cpp
     src/converter/SmartPointerCollectionPropagationPass.cpp
     src/converter/SmartPointerSinkPropagationPass.cpp
     src/converter/SmartPointerTypePropagationPass.cpp
@@ -129,6 +140,7 @@ add_executable(ModernCppConverter
 target_link_libraries(ModernCppConverter
     PRIVATE
         ModernCppConverterCore
+        Qt6::Concurrent
         Qt6::Widgets
 )
 

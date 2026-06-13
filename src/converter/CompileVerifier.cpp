@@ -1,6 +1,8 @@
 #include "converter/CompileVerifier.h"
 
+#include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
@@ -57,6 +59,9 @@ CompileVerificationResult CompileVerifier::verifySyntaxOnly(const std::string& c
 
 CompileVerificationResult CompileVerifier::verifySyntaxOnly(const std::string& code, CppStandard standard)
 {
+    QElapsedTimer verificationTimer;
+    verificationTimer.start();
+    qInfo() << "Compile verification started";
     CompileVerificationResult result;
     result.verificationEnabled = true;
 
@@ -95,10 +100,12 @@ CompileVerificationResult CompileVerifier::verifySyntaxOnly(const std::string& c
         return result;
     }
 
-    if (!process.waitForFinished(30000)) {
+    constexpr int compilerTimeoutMs = 10000;
+    if (!process.waitForFinished(compilerTimeoutMs)) {
         process.kill();
         process.waitForFinished();
-        result.output = "Compile verification timed out.";
+        result.output = "Compile verification timed out after 10000 ms.";
+        qWarning() << "Compile verification timed out; elapsed_ms =" << verificationTimer.elapsed();
         return result;
     }
 
@@ -108,5 +115,6 @@ CompileVerificationResult CompileVerifier::verifySyntaxOnly(const std::string& c
     result.output = output.trimmed().isEmpty()
         ? (result.passed ? "Compile verification passed." : "Compile verification failed with no compiler output.")
         : output.trimmed().toStdString();
+    qInfo() << "Compile verification finished; passed =" << result.passed << "elapsed_ms =" << verificationTimer.elapsed();
     return result;
 }

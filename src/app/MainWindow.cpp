@@ -9,6 +9,7 @@
 #include "repository/RepositoryModernizationService.h"
 
 #include <algorithm>
+#include <exception>
 #include <stdexcept>
 
 #include <QApplication>
@@ -34,10 +35,12 @@
 #include <QSplitter>
 #include <QStatusBar>
 #include <QTabWidget>
+#include <QTimer>
 #include <QToolBar>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <QtConcurrent/QtConcurrentRun>
 
 #include <utility>
 
@@ -111,6 +114,16 @@ QString defaultRepositoryWorkspace()
 {
     return QDir::home().filePath("ModernCppConverterWorkspaces");
 }
+
+int guiConversionTimeoutMs()
+{
+    bool ok = false;
+    const int configured = qEnvironmentVariableIntValue("MODERNCPP_CONVERSION_TIMEOUT_MS", &ok);
+    if (ok && configured > 0) {
+        return configured;
+    }
+    return 30000;
+}
 } // namespace
 
 MainWindow::MainWindow(std::unique_ptr<IConverterEngine> converterEngine, QWidget* parent)
@@ -135,7 +148,7 @@ void MainWindow::buildUi()
     toolbar->setMovable(false);
     toolbar->setFloatable(false);
 
-    auto* convertButton = new QPushButton("Convert");
+    convertButton_ = new QPushButton("Convert");
     auto* verifyButton = new QPushButton("Verify");
     auto* clearButton = new QPushButton("Clear");
     auto* copyButton = new QPushButton("Copy Output");
@@ -160,7 +173,7 @@ void MainWindow::buildUi()
     toolbar->addWidget(new QLabel("Level"));
     toolbar->addWidget(offlineModernizationLevelComboBox_);
     toolbar->addSeparator();
-    toolbar->addWidget(convertButton);
+    toolbar->addWidget(convertButton_);
     toolbar->addWidget(verifyButton);
     toolbar->addWidget(clearButton);
     toolbar->addWidget(copyButton);
@@ -185,7 +198,7 @@ void MainWindow::buildUi()
     statusBar()->addPermanentWidget(statusCompileLabel_);
     statusBar()->addPermanentWidget(statusSourceLabel_);
 
-    connect(convertButton, &QPushButton::clicked, this, &MainWindow::convertCode);
+    connect(convertButton_, &QPushButton::clicked, this, &MainWindow::convertCode);
     connect(clearButton, &QPushButton::clicked, this, &MainWindow::clearEditors);
     connect(copyButton, &QPushButton::clicked, this, &MainWindow::copyOutputToClipboard);
     connect(checkBackendButton, &QPushButton::clicked, this, &MainWindow::checkBackendConnection);
@@ -460,12 +473,108 @@ QWidget* MainWindow::createDiagnosticsPanel()
 
 void MainWindow::convertCode()
 {
-    appendDiagnostic("Conversion request started. Mode: " + conversionModeComboBox_->currentText());
+    if (activeConversionWatcher_ != nullptr && activeConversionWatcher_->isRunning()) {
+        appendConversionDiagnostic("Convert clicked while conversion is already running. Use Clear to cancel the active conversion.");
+        statusBar()->showMessage("Conversion is already running");
+        return;
+    }
+
+    activeConversionClock_.restart();
+    activeConversionTimedOut_ = false;
+    const std::uint64_t conversionId = ++currentConversionId_;
+    activeConversionId_ = conversionId;
+    appendConversionDiagnostic("Convert button clicked.");
     const std::string input = inputEditor_->toPlainText().toStdString();
-    const CoordinatedConversionResult conversion = conversionCoordinator_->convert(input, readModernizationOptions(), readConversionMode());
+    const ModernizationOptions options = readModernizationOptions();
+    const ConversionMode mode = readConversionMode();
+    appendConversionDiagnostic("Selected conversion mode: " + conversionModeComboBox_->currentText());
+    appendConversionDiagnostic("Selected modernization level: " + offlineModernizationLevelComboBox_->currentText());
+    appendConversionDiagnostic(QString("Compile verification requested: %1").arg(options.compileVerificationEnabled ? "true" : "false"));
+
+    if (convertButton_ != nullptr) {
+        convertButton_->setEnabled(false);
+    }
+    statusBar()->showMessage("Conversion running...");
+
+    activeConversionWatcher_ = new QFutureWatcher<CoordinatedConversionResult>(this);
+    activeConversionTimer_ = new QTimer(this);
+    activeConversionTimer_->setSingleShot(true);
+
+    connect(activeConversionWatcher_, &QFutureWatcher<CoordinatedConversionResult>::finished,
+            this, [this, watcher = activeConversionWatcher_, conversionId]() {
+                handleConversionFinished(watcher, conversionId);
+            });
+    connect(activeConversionTimer_, &QTimer::timeout, this, &MainWindow::handleConversionTimeout);
+
+    appendConversionDiagnostic(QString("Worker thread started. conversion_id=%1").arg(static_cast<qulonglong>(conversionId)));
+    activeConversionWatcher_->setFuture(QtConcurrent::run([this, input, options, mode]() {
+        try {
+            return conversionCoordinator_->convert(input, options, mode);
+        } catch (const std::exception& exception) {
+            CoordinatedConversionResult failure;
+            failure.result.modernCode = input;
+            failure.result.conversionSource = "Conversion Error";
+            failure.result.backendStatus = "Failed";
+            failure.result.explanation = std::string("Conversion failed before producing output: ") + exception.what();
+            failure.result.diagnosticMessages.push_back(std::string("conversion exception: ") + exception.what());
+            return failure;
+        } catch (...) {
+            CoordinatedConversionResult failure;
+            failure.result.modernCode = input;
+            failure.result.conversionSource = "Conversion Error";
+            failure.result.backendStatus = "Failed";
+            failure.result.explanation = "Conversion failed before producing output because an unknown exception was thrown.";
+            failure.result.diagnosticMessages.push_back("conversion exception: unknown");
+            return failure;
+        }
+    }));
+    activeConversionTimer_->start(guiConversionTimeoutMs());
+}
+
+void MainWindow::handleConversionFinished(QFutureWatcher<CoordinatedConversionResult>* watcher,
+                                          std::uint64_t conversionId)
+{
+    if (watcher == nullptr) {
+        return;
+    }
+
+    const bool isActiveConversion = watcher == activeConversionWatcher_ && conversionId == activeConversionId_;
+    if (!isActiveConversion) {
+        watcher->deleteLater();
+        qInfo() << "Stale conversion worker finished and was ignored"
+                << "conversion_id=" << static_cast<qulonglong>(conversionId);
+        appendDiagnostic(QString("Stale conversion worker finished and was ignored. conversion_id=%1")
+                             .arg(static_cast<qulonglong>(conversionId)));
+        return;
+    }
+
+    if (activeConversionTimer_ != nullptr) {
+        activeConversionTimer_->stop();
+        activeConversionTimer_->deleteLater();
+        activeConversionTimer_ = nullptr;
+    }
+
+    appendConversionDiagnostic(QString("Worker thread finished. conversion_id=%1").arg(static_cast<qulonglong>(conversionId)));
+    const CoordinatedConversionResult conversion = watcher->result();
+    watcher->deleteLater();
+    activeConversionWatcher_ = nullptr;
+    activeConversionTimedOut_ = false;
+    activeConversionId_ = 0;
+
+    if (convertButton_ != nullptr) {
+        convertButton_->setEnabled(true);
+    }
+
+    appendConversionDiagnostic("Result rendering started.");
     displayResult(conversion.result);
     updateModeStatus(conversion.effectiveMode, conversion.backendUnavailable);
     updateStatusBarMetadata(conversion.result);
+    appendConversionDiagnostic("Result rendering finished.");
+    if (conversion.result.compileVerificationEnabled) {
+        appendConversionDiagnostic(conversion.result.compileVerificationPassed
+                ? "Compile verification finished: passed."
+                : "Compile verification finished: failed or skipped.");
+    }
 
     const bool hasSuggestions = std::any_of(conversion.result.changes.begin(), conversion.result.changes.end(), [](const ConversionChange& change) {
         return !change.applied;
@@ -479,6 +588,47 @@ void MainWindow::convertCode()
         appendDiagnostic(status + ". Source: " + QString::fromStdString(conversion.result.conversionSource));
         statusBar()->showMessage(status + " - " + QString::fromStdString(conversion.result.conversionSource));
     }
+}
+
+void MainWindow::handleConversionTimeout()
+{
+    if (activeConversionWatcher_ == nullptr || !activeConversionWatcher_->isRunning()) {
+        return;
+    }
+
+    const int timeoutMs = guiConversionTimeoutMs();
+    const std::uint64_t timedOutConversionId = activeConversionId_;
+    ++currentConversionId_;
+    activeConversionTimedOut_ = true;
+    activeConversionWatcher_->cancel();
+
+    if (activeConversionTimer_ != nullptr) {
+        activeConversionTimer_->stop();
+        activeConversionTimer_->deleteLater();
+        activeConversionTimer_ = nullptr;
+    }
+
+    activeConversionWatcher_ = nullptr;
+    activeConversionId_ = 0;
+    activeConversionTimedOut_ = false;
+    appendConversionDiagnostic(QString("Conversion timed out after %1 ms; cancellation requested and UI lock released. conversion_id=%2")
+                                   .arg(timeoutMs)
+                                   .arg(static_cast<qulonglong>(timedOutConversionId)));
+
+    ConversionResult timeoutResult;
+    timeoutResult.conversionSource = "Conversion Timeout";
+    timeoutResult.backendStatus = "Timeout";
+    timeoutResult.explanation = "Conversion exceeded the GUI watchdog. The app stopped waiting and remains responsive.";
+    timeoutResult.diagnosticMessages.push_back("conversion timeout elapsed_ms=" + std::to_string(activeConversionClock_.elapsed()));
+    timeoutResult.diagnosticMessages.push_back("last completed GUI stage: worker thread started");
+    timeoutResult.diagnosticMessages.push_back("stale worker result will be ignored if it finishes later");
+    displayResult(timeoutResult);
+    updateStatusBarMetadata(timeoutResult);
+
+    if (convertButton_ != nullptr) {
+        convertButton_->setEnabled(true);
+    }
+    statusBar()->showMessage("Conversion timed out. The app is responsive; late worker result will be ignored.");
 }
 
 ConversionMode MainWindow::readConversionMode() const
@@ -553,6 +703,14 @@ void MainWindow::appendDiagnostic(const QString& message)
 
     const QString timestamp = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
     diagnosticsEditor_->appendPlainText("[" + timestamp + "] " + message);
+}
+
+void MainWindow::appendConversionDiagnostic(const QString& message)
+{
+    const qint64 elapsed = activeConversionClock_.isValid() ? activeConversionClock_.elapsed() : 0;
+    const QString fullMessage = QString("%1 elapsed_ms=%2").arg(message).arg(elapsed);
+    qInfo() << fullMessage;
+    appendDiagnostic(fullMessage);
 }
 
 void MainWindow::checkBackendConnection()
@@ -661,6 +819,28 @@ ModernizationOptions MainWindow::readModernizationOptions() const
 
 void MainWindow::clearEditors()
 {
+    const bool hadActiveConversion = activeConversionWatcher_ != nullptr;
+    if (hadActiveConversion) {
+        const std::uint64_t cancelledConversionId = activeConversionId_;
+        ++currentConversionId_;
+        if (activeConversionWatcher_->isRunning()) {
+            activeConversionWatcher_->cancel();
+        }
+        if (activeConversionTimer_ != nullptr) {
+            activeConversionTimer_->stop();
+            activeConversionTimer_->deleteLater();
+            activeConversionTimer_ = nullptr;
+        }
+        activeConversionWatcher_ = nullptr;
+        activeConversionId_ = 0;
+        activeConversionTimedOut_ = false;
+        if (convertButton_ != nullptr) {
+            convertButton_->setEnabled(true);
+        }
+        qInfo() << "Clear requested active conversion cancellation"
+                << "conversion_id=" << static_cast<qulonglong>(cancelledConversionId);
+    }
+
     inputEditor_->clear();
     outputEditor_->clear();
     detailsEditor_->clear();
@@ -668,7 +848,9 @@ void MainWindow::clearEditors()
     compileVerificationEditor_->clear();
     if (diagnosticsEditor_ != nullptr) {
         diagnosticsEditor_->clear();
-        appendDiagnostic("Editors cleared.");
+        appendDiagnostic(hadActiveConversion
+                ? "Editors cleared. Active conversion cancellation requested; stale worker result will be ignored."
+                : "Editors cleared.");
     }
     if (statusCompileLabel_ != nullptr) {
         statusCompileLabel_->setText("Compile: Not run");
@@ -676,7 +858,7 @@ void MainWindow::clearEditors()
     if (statusSourceLabel_ != nullptr) {
         statusSourceLabel_->setText("Source: None");
     }
-    statusBar()->showMessage("Ready");
+    statusBar()->showMessage(hadActiveConversion ? "Conversion cancelled. Ready" : "Ready");
 }
 
 void MainWindow::copyOutputToClipboard()

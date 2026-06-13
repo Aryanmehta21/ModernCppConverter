@@ -275,6 +275,127 @@ std::string joinLines(const std::vector<std::string>& lines)
     return output.str();
 }
 
+std::string lowercaseCopy(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
+}
+
+bool isObserverGetterName(const std::string& functionName)
+{
+    const std::string lowered = lowercaseCopy(functionName);
+    return lowered.find("get") != std::string::npos
+        || lowered.find("view") != std::string::npos
+        || lowered.find("observe") != std::string::npos
+        || lowered.find("peek") != std::string::npos
+        || lowered.find("data") != std::string::npos
+        || lowered.find("ptr") != std::string::npos
+        || lowered.find("pointer") != std::string::npos;
+}
+
+bool isOwnershipTransferName(const std::string& functionName)
+{
+    const std::string lowered = lowercaseCopy(functionName);
+    return lowered.find("release") != std::string::npos
+        || lowered.find("take") != std::string::npos
+        || lowered.find("steal") != std::string::npos
+        || lowered.find("detach") != std::string::npos
+        || lowered.find("create") != std::string::npos;
+}
+
+bool rawMemberReturnsAreObserverGetters(const std::string& classText,
+                                        const std::string& memberType,
+                                        const std::string& memberName)
+{
+    const std::string escapedType = escapeRegex(memberType);
+    const std::string escapedMember = escapeRegex(memberName);
+    const std::regex returnPattern(R"(\breturn\s+)" + escapedMember + R"(\s*;)");
+    if (!std::regex_search(classText, returnPattern)) {
+        return true;
+    }
+
+    const std::regex getterPattern(
+        std::string("((?:const\\s+)?)") + escapedType
+            + R"(\s*\*\s*([A-Za-z_]\w*)\s*\([^)]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{[^{}]*\breturn\s+)"
+            + escapedMember
+            + R"(\s*;\s*[^{}]*\})",
+        std::regex::ECMAScript);
+    std::string withoutKnownGetters = classText;
+    bool foundGetterReturn = false;
+    std::smatch match;
+    while (std::regex_search(withoutKnownGetters, match, getterPattern)) {
+        const std::string functionName = match[2].str();
+        if (!isObserverGetterName(functionName) || isOwnershipTransferName(functionName)) {
+            return false;
+        }
+        foundGetterReturn = true;
+        withoutKnownGetters.replace(static_cast<std::size_t>(match.position()),
+                                    static_cast<std::size_t>(match.length()),
+                                    "");
+    }
+
+    return foundGetterReturn && !std::regex_search(withoutKnownGetters, returnPattern);
+}
+
+std::string removeUniquePtrMemberCleanup(std::string destructorBody,
+                                         const std::string& memberName,
+                                         std::vector<ConversionChange>& changes)
+{
+    const std::string escapedMember = escapeRegex(memberName);
+
+    const std::regex oneLineConditionalDeletePattern(
+        R"(^[ \t]*if\s*\(\s*)" + escapedMember + R"(\s*(?:(?:!=|==)\s*(?:nullptr|NULL|0))?\s*\)\s*delete\s+)"
+            + escapedMember + R"(\s*;\s*\n?)",
+        std::regex::ECMAScript | std::regex::multiline);
+    if (std::regex_search(destructorBody, oneLineConditionalDeletePattern)) {
+        destructorBody = std::regex_replace(destructorBody, oneLineConditionalDeletePattern, "");
+        addAppliedChange(changes,
+                         "Remove redundant manual delete",
+                         "if (...) delete " + memberName + ";",
+                         "removed",
+                         "Manual conditional delete is no longer needed because std::unique_ptr destroys the member automatically.");
+    }
+
+    const std::regex deleteLinePattern(R"(^[ \t]*delete\s+)" + escapedMember + R"(\s*;\s*\n?)",
+                                       std::regex::ECMAScript | std::regex::multiline);
+    if (std::regex_search(destructorBody, deleteLinePattern)) {
+        destructorBody = std::regex_replace(destructorBody, deleteLinePattern, "");
+        addAppliedChange(changes,
+                         "Remove redundant manual delete",
+                         "delete " + memberName + ";",
+                         "removed",
+                         "Manual delete is no longer needed because std::unique_ptr destroys the member automatically.");
+    }
+
+    const std::regex nullAssignmentPattern(
+        R"(^[ \t]*)" + escapedMember + R"(\s*=\s*(?:nullptr|NULL|0)\s*;\s*\n?)",
+        std::regex::ECMAScript | std::regex::multiline);
+    if (std::regex_search(destructorBody, nullAssignmentPattern)) {
+        destructorBody = std::regex_replace(destructorBody, nullAssignmentPattern, "");
+        addAppliedChange(changes,
+                         "Remove redundant manual delete",
+                         memberName + " = nullptr;",
+                         "removed",
+                         "Resetting a member after destructor cleanup is redundant once std::unique_ptr owns it.");
+    }
+
+    const std::regex emptyIfBlockPattern(
+        R"(^[ \t]*if\s*\(\s*)" + escapedMember + R"(\s*(?:!=|==)\s*(?:nullptr|NULL|0)\s*\)\s*\{\s*\}\s*\n?)",
+        std::regex::ECMAScript | std::regex::multiline);
+    if (std::regex_search(destructorBody, emptyIfBlockPattern)) {
+        destructorBody = std::regex_replace(destructorBody, emptyIfBlockPattern, "");
+        addAppliedChange(changes,
+                         "Rule of Zero destructor cleanup",
+                         "empty cleanup block for " + memberName,
+                         "removed",
+                         "Removed an empty pointer cleanup block left after std::unique_ptr modernization.");
+    }
+
+    return destructorBody;
+}
+
 } // namespace
 
 std::string AggressiveRewriteEngine::rewrite(const std::string& code,
@@ -374,7 +495,8 @@ std::string AggressiveRewriteEngine::rewriteClassMemberOwnership(const std::stri
             const bool hasAssignmentAllocation = std::regex_search(classText, assignmentPattern);
             const bool hasInitializerAllocation = std::regex_search(classText, initializerPattern);
             const bool hasDestructorDelete = hasDestructor && std::regex_search(destructorBody, deletePattern);
-            const bool escapesRawMember = std::regex_search(classText, returnPattern);
+            const bool hasUnsafeRawReturn = std::regex_search(classText, returnPattern)
+                && !rawMemberReturnsAreObserverGetters(classText, member.type, member.name);
             const bool hasCopyOperation = std::regex_search(classText, copyConstructorPattern)
                 || std::regex_search(classText, copyAssignmentPattern);
             const bool copyOperationDeleted = hasCopyOperation
@@ -388,11 +510,11 @@ std::string AggressiveRewriteEngine::rewriteClassMemberOwnership(const std::stri
                 continue;
             }
 
-            if (!hasDestructorDelete || escapesRawMember || (hasCopyOperation && !copyOperationDeleted)) {
+            if (!hasDestructorDelete || hasUnsafeRawReturn || (hasCopyOperation && !copyOperationDeleted)) {
                 addSuggestion(changes,
                               "Class member raw pointer to std::unique_ptr",
                               trim(member.declaration),
-                              "Raw pointer member was not converted because ownership escapes, deletion is unclear, or custom copy semantics need manual review.");
+                              "Raw pointer member was not converted because ownership transfer may escape, deletion is unclear, or custom copy semantics need manual review.");
                 continue;
             }
 
@@ -434,6 +556,19 @@ std::string AggressiveRewriteEngine::rewriteClassMemberOwnership(const std::stri
                                   replacement);
             }
 
+            std::smatch returnMatch;
+            while (std::regex_search(classText, returnMatch, returnPattern)) {
+                const std::string replacement = "return " + member.name + ".get();";
+                addAppliedChange(changes,
+                                 "Unique_ptr getter return to raw observer",
+                                 trim(returnMatch[0].str()),
+                                 replacement,
+                                 "The member is now owned by std::unique_ptr, so raw pointer getter APIs return a non-owning view with get().");
+                classText.replace(static_cast<std::size_t>(returnMatch.position()),
+                                  static_cast<std::size_t>(returnMatch.length()),
+                                  replacement);
+            }
+
             convertedMembers.push_back(member.name);
         }
 
@@ -447,16 +582,7 @@ std::string AggressiveRewriteEngine::rewriteClassMemberOwnership(const std::stri
                 std::string cleanedDestructorBody = updatedDestructorBody;
 
                 for (const std::string& memberName : convertedMembers) {
-                    const std::regex deleteLinePattern(R"(^[ \t]*delete\s+)" + escapeRegex(memberName) + R"(\s*;\s*\n?)",
-                                                       std::regex::ECMAScript | std::regex::multiline);
-                    if (std::regex_search(cleanedDestructorBody, deleteLinePattern)) {
-                        cleanedDestructorBody = std::regex_replace(cleanedDestructorBody, deleteLinePattern, "");
-                        addAppliedChange(changes,
-                                         "Remove redundant manual delete",
-                                         "delete " + memberName + ";",
-                                         "removed",
-                                         "Manual delete is no longer needed because std::unique_ptr destroys the member automatically.");
-                    }
+                    cleanedDestructorBody = removeUniquePtrMemberCleanup(std::move(cleanedDestructorBody), memberName, changes);
                 }
 
                 if (cleanedDestructorBody != updatedDestructorBody) {

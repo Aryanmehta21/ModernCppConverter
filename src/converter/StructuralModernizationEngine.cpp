@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -182,6 +183,371 @@ bool isSimpleConstantMacroValue(const std::string& value)
         || stripped == "false";
 }
 
+struct FunctionLikeMacroDefinition
+{
+    std::string name;
+    std::vector<std::string> parameters;
+    std::string body;
+};
+
+bool isIdentifierCharacter(char character)
+{
+    return std::isalnum(static_cast<unsigned char>(character)) != 0 || character == '_';
+}
+
+std::vector<std::string> splitCommaSeparated(const std::string& text)
+{
+    std::vector<std::string> values;
+    std::string current;
+    int depth = 0;
+    bool inString = false;
+    bool inCharacter = false;
+    bool escaped = false;
+
+    for (const char character : text) {
+        if (escaped) {
+            current.push_back(character);
+            escaped = false;
+            continue;
+        }
+        if (character == '\\' && (inString || inCharacter)) {
+            current.push_back(character);
+            escaped = true;
+            continue;
+        }
+        if (character == '"' && !inCharacter) {
+            inString = !inString;
+        } else if (character == '\'' && !inString) {
+            inCharacter = !inCharacter;
+        } else if (!inString && !inCharacter) {
+            if (character == '(' || character == '[' || character == '{') {
+                ++depth;
+            } else if (character == ')' || character == ']' || character == '}') {
+                --depth;
+            } else if (character == ',' && depth == 0) {
+                values.push_back(trim(current));
+                current.clear();
+                continue;
+            }
+        }
+        current.push_back(character);
+    }
+    values.push_back(trim(current));
+    return values;
+}
+
+bool parseFunctionLikeMacro(const std::string& stripped,
+                            FunctionLikeMacroDefinition& macro,
+                            std::string& reason)
+{
+    std::smatch match;
+    if (!std::regex_match(stripped, match, std::regex(R"(^#\s*define\s+([A-Za-z_]\w*)\(([^)]*)\)\s+(.+)$)"))) {
+        return false;
+    }
+
+    macro.name = match[1].str();
+    macro.body = trim(match[3].str());
+    macro.parameters.clear();
+
+    const std::string parameterText = trim(match[2].str());
+    if (!parameterText.empty()) {
+        std::set<std::string> seenParameters;
+        for (const std::string& parameter : splitCommaSeparated(parameterText)) {
+            if (parameter == "..." || parameter.find("...") != std::string::npos) {
+                reason = "Variadic function-like macros are not converted automatically.";
+                return true;
+            }
+            if (!std::regex_match(parameter, std::regex(R"([A-Za-z_]\w*)"))) {
+                reason = "Macro parameters must be simple identifiers before a constexpr function can be generated safely.";
+                return true;
+            }
+            if (!seenParameters.insert(parameter).second) {
+                reason = "Macro parameters must be unique before a constexpr function can be generated safely.";
+                return true;
+            }
+            macro.parameters.push_back(parameter);
+        }
+    }
+
+    if (macro.body.empty()) {
+        reason = "Empty function-like macros are preserved for manual review.";
+    }
+    return true;
+}
+
+bool isAllowedMacroBodyIdentifier(const std::string& identifier,
+                                  const std::vector<std::string>& parameters)
+{
+    return identifier == "true"
+        || identifier == "false"
+        || identifier == "nullptr"
+        || std::find(parameters.begin(), parameters.end(), identifier) != parameters.end();
+}
+
+int countIdentifierOccurrences(const std::string& text, const std::string& identifier)
+{
+    int count = 0;
+    const std::regex pattern("\\b" + escapeRegex(identifier) + "\\b");
+    for (std::sregex_iterator iterator(text.begin(), text.end(), pattern), end; iterator != end; ++iterator) {
+        ++count;
+    }
+    return count;
+}
+
+bool macroBodyIsSimpleExpression(const FunctionLikeMacroDefinition& macro, std::string& reason)
+{
+    const std::string& body = macro.body;
+    if (body.find('\\') != std::string::npos) {
+        reason = "Line-continuation macros are preserved because they often hide multi-statement or platform-specific behavior.";
+        return false;
+    }
+    if (body.find("##") != std::string::npos || body.find('#') != std::string::npos) {
+        reason = "Token-pasting and stringification macros are preserved because constexpr functions cannot reproduce those preprocessor semantics.";
+        return false;
+    }
+    if (body.find(';') != std::string::npos || body.find('{') != std::string::npos || body.find('}') != std::string::npos) {
+        reason = "Multi-statement function-like macros are preserved for manual review.";
+        return false;
+    }
+    if (body.find("++") != std::string::npos || body.find("--") != std::string::npos) {
+        reason = "Macros with increment or decrement expressions may rely on evaluation side effects.";
+        return false;
+    }
+    if (body.find("__") != std::string::npos || body.find("_Pragma") != std::string::npos) {
+        reason = "Compiler/platform extension macros are preserved for manual review.";
+        return false;
+    }
+
+    static const std::regex controlKeyword(R"(\b(do|while|for|if|switch|case|return|goto|break|continue|asm|defined)\b)");
+    if (std::regex_search(body, controlKeyword)) {
+        reason = "Control-flow or compiler-specific function-like macros are preserved for manual review.";
+        return false;
+    }
+
+    static const std::regex assignmentOperator(R"((^|[^=!<>])=([^=]|$)|\+=|-=|\*=|/=|%=|<<=|>>=|&=|\|=|\^=)");
+    if (std::regex_search(body, assignmentOperator)) {
+        reason = "Function-like macros that assign values are preserved because rewriting them could change side effects.";
+        return false;
+    }
+
+    const std::regex identifierPattern(R"(\b[A-Za-z_]\w*\b)");
+    for (std::sregex_iterator iterator(body.begin(), body.end(), identifierPattern), end; iterator != end; ++iterator) {
+        if (!isAllowedMacroBodyIdentifier(iterator->str(), macro.parameters)) {
+            reason = "The macro body references identifiers outside its parameter list, so the converter preserved it for manual review.";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+std::string stripBalancedOuterParentheses(std::string value)
+{
+    value = trim(std::move(value));
+    bool stripped = true;
+    while (stripped && value.size() >= 2 && value.front() == '(' && value.back() == ')') {
+        stripped = false;
+        int depth = 0;
+        bool balancedOuterPair = true;
+        for (std::size_t index = 0; index < value.size(); ++index) {
+            if (value[index] == '(') {
+                ++depth;
+            } else if (value[index] == ')') {
+                --depth;
+                if (depth == 0 && index + 1 < value.size()) {
+                    balancedOuterPair = false;
+                    break;
+                }
+            }
+        }
+        if (balancedOuterPair && depth == 0) {
+            value = trim(value.substr(1, value.size() - 2));
+            stripped = true;
+        }
+    }
+    return value;
+}
+
+bool isSideEffectFreeMacroArgument(const std::string& argument)
+{
+    const std::string stripped = stripBalancedOuterParentheses(argument);
+    if (stripped.empty()
+        || stripped.find("++") != std::string::npos
+        || stripped.find("--") != std::string::npos
+        || stripped.find('=') != std::string::npos
+        || stripped.find(',') != std::string::npos) {
+        return false;
+    }
+
+    static const std::regex integerLiteral(R"([-+]?(?:0x[0-9A-Fa-f]+|\d+)(?:[uUlL]*)?)");
+    static const std::regex floatingLiteral(R"([-+]?\d+\.\d+(?:[fFlL])?)");
+    static const std::regex quotedLiteral(R"("([^"\\]|\\.)*"|'([^'\\]|\\.)')");
+    static const std::regex simpleAccess(
+        R"([A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*|\[[A-Za-z_]\w*\]|\[-?\d+\])*)");
+
+    return std::regex_match(stripped, integerLiteral)
+        || std::regex_match(stripped, floatingLiteral)
+        || std::regex_match(stripped, quotedLiteral)
+        || std::regex_match(stripped, simpleAccess);
+}
+
+bool parseInvocationArguments(const std::string& code,
+                              std::size_t openParen,
+                              std::vector<std::string>& arguments,
+                              std::size_t& closeParen)
+{
+    arguments.clear();
+    std::string current;
+    int depth = 0;
+    bool inString = false;
+    bool inCharacter = false;
+    bool escaped = false;
+
+    for (std::size_t index = openParen; index < code.size(); ++index) {
+        const char character = code[index];
+        if (escaped) {
+            current.push_back(character);
+            escaped = false;
+            continue;
+        }
+        if (character == '\\' && (inString || inCharacter)) {
+            current.push_back(character);
+            escaped = true;
+            continue;
+        }
+        if (character == '"' && !inCharacter) {
+            inString = !inString;
+        } else if (character == '\'' && !inString) {
+            inCharacter = !inCharacter;
+        }
+
+        if (!inString && !inCharacter) {
+            if (character == '(') {
+                if (depth > 0) {
+                    current.push_back(character);
+                }
+                ++depth;
+                continue;
+            }
+            if (character == ')') {
+                --depth;
+                if (depth == 0) {
+                    if (!trim(current).empty()) {
+                        arguments.push_back(trim(current));
+                    }
+                    closeParen = index;
+                    return true;
+                }
+                current.push_back(character);
+                continue;
+            }
+            if (character == ',' && depth == 1) {
+                arguments.push_back(trim(current));
+                current.clear();
+                continue;
+            }
+        }
+        current.push_back(character);
+    }
+
+    return false;
+}
+
+bool lineContainingPositionIsPreprocessor(const std::string& code, std::size_t position)
+{
+    const std::size_t lineStart = code.rfind('\n', position);
+    const std::size_t start = lineStart == std::string::npos ? 0 : lineStart + 1;
+    const std::size_t lineEnd = code.find('\n', position);
+    const std::string line = code.substr(start, lineEnd == std::string::npos ? std::string::npos : lineEnd - start);
+    return trim(line).starts_with("#");
+}
+
+bool visibleMacroInvocationsAreSafe(const std::string& code,
+                                    const FunctionLikeMacroDefinition& macro,
+                                    std::string& reason)
+{
+    std::vector<int> parameterOccurrences;
+    parameterOccurrences.reserve(macro.parameters.size());
+    bool hasDuplicateParameterEvaluation = false;
+    for (const std::string& parameter : macro.parameters) {
+        const int occurrences = countIdentifierOccurrences(macro.body, parameter);
+        parameterOccurrences.push_back(occurrences);
+        hasDuplicateParameterEvaluation = hasDuplicateParameterEvaluation || occurrences > 1;
+    }
+
+    if (!hasDuplicateParameterEvaluation) {
+        return true;
+    }
+
+    bool sawInvocation = false;
+    for (std::size_t position = code.find(macro.name);
+         position != std::string::npos;
+         position = code.find(macro.name, position + macro.name.size())) {
+        const bool validLeftBoundary = position == 0 || !isIdentifierCharacter(code[position - 1]);
+        const std::size_t afterName = position + macro.name.size();
+        const bool validRightBoundary = afterName >= code.size() || !isIdentifierCharacter(code[afterName]);
+        if (!validLeftBoundary || !validRightBoundary || lineContainingPositionIsPreprocessor(code, position)) {
+            continue;
+        }
+
+        std::size_t openParen = afterName;
+        while (openParen < code.size() && std::isspace(static_cast<unsigned char>(code[openParen])) != 0) {
+            ++openParen;
+        }
+        if (openParen >= code.size() || code[openParen] != '(') {
+            continue;
+        }
+
+        std::vector<std::string> arguments;
+        std::size_t closeParen = openParen;
+        if (!parseInvocationArguments(code, openParen, arguments, closeParen) || arguments.size() != macro.parameters.size()) {
+            reason = "The converter could not verify all visible macro call sites, so it preserved the function-like macro.";
+            return false;
+        }
+        sawInvocation = true;
+        for (std::size_t parameterIndex = 0; parameterIndex < arguments.size(); ++parameterIndex) {
+            if (parameterOccurrences[parameterIndex] > 1 && !isSideEffectFreeMacroArgument(arguments[parameterIndex])) {
+                reason = "A parameter is evaluated multiple times and a visible call site may have side effects, so the macro was preserved.";
+                return false;
+            }
+        }
+        position = closeParen;
+    }
+
+    if (!sawInvocation) {
+        reason = "A parameter is evaluated multiple times and no visible side-effect-free call site was found, so the macro was preserved.";
+        return false;
+    }
+
+    return true;
+}
+
+std::string constexprFunctionForMacro(const FunctionLikeMacroDefinition& macro)
+{
+    std::ostringstream replacement;
+    if (!macro.parameters.empty()) {
+        replacement << "template <";
+        for (std::size_t index = 0; index < macro.parameters.size(); ++index) {
+            if (index > 0) {
+                replacement << ", ";
+            }
+            replacement << "typename T" << index;
+        }
+        replacement << ">\n";
+    }
+    replacement << "constexpr auto " << macro.name << "(";
+    for (std::size_t index = 0; index < macro.parameters.size(); ++index) {
+        if (index > 0) {
+            replacement << ", ";
+        }
+        replacement << "T" << index << ' ' << macro.parameters[index];
+    }
+    replacement << ")\n{\n"
+                << "    return " << macro.body << ";\n"
+                << "}";
+    return replacement.str();
+}
+
 std::string removeCstringIfUnused(std::string code)
 {
     const IncludeManager includeManager;
@@ -252,6 +618,34 @@ std::string StructuralModernizationEngine::modernizePreprocessor(const std::stri
             continue;
         }
 
+        FunctionLikeMacroDefinition functionLikeMacro;
+        std::string functionLikeMacroReason;
+        if (parseFunctionLikeMacro(stripped, functionLikeMacro, functionLikeMacroReason)) {
+            if (functionLikeMacroReason.empty()
+                && options.useConstexpr
+                && macroBodyIsSimpleExpression(functionLikeMacro, functionLikeMacroReason)
+                && visibleMacroInvocationsAreSafe(code, functionLikeMacro, functionLikeMacroReason)) {
+                const std::string replacement = constexprFunctionForMacro(functionLikeMacro);
+                addAppliedChange(changes,
+                                 "Function-like macro to constexpr function",
+                                 stripped,
+                                 replacement,
+                                 "Converted a simple expression macro to a constexpr function template so calls use normal C++ type checking without unsafe preprocessor substitution.");
+                output.push_back(replacement);
+                changed = true;
+                continue;
+            }
+
+            addSuggestion(changes,
+                          "Function-like macro to constexpr function",
+                          stripped,
+                          functionLikeMacroReason.empty()
+                              ? "Function-like macros can change evaluation and ABI behavior. They were preserved for manual review."
+                              : functionLikeMacroReason);
+            output.push_back(lines[index]);
+            continue;
+        }
+
         std::smatch macroMatch;
         if (std::regex_match(stripped, macroMatch, std::regex(R"(^#\s*define\s+([A-Za-z_]\w*)\s+(.+)$)"))) {
             const std::string macroName = macroMatch[1].str();
@@ -267,13 +661,6 @@ std::string StructuralModernizationEngine::modernizePreprocessor(const std::stri
                 changed = true;
                 continue;
             }
-        }
-
-        if (std::regex_match(stripped, std::regex(R"(^#\s*define\s+[A-Za-z_]\w*\s*\(.*$)"))) {
-            addSuggestion(changes,
-                          "Constant macro to constexpr",
-                          stripped,
-                          "Function-like macros can change evaluation and ABI behavior. They were preserved for manual review.");
         }
 
         output.push_back(lines[index]);

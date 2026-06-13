@@ -2,6 +2,7 @@
 
 #include <QEventLoop>
 #include <QDebug>
+#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkAccessManager>
@@ -48,6 +49,8 @@ BackendClient::BackendClient(BackendConfig config)
 
 bool BackendClient::isAvailable() const
 {
+    QElapsedTimer elapsed;
+    elapsed.start();
     qInfo() << "Backend health check starts for" << config_.backendUrl;
     QNetworkAccessManager manager;
     QNetworkRequest request(QUrl(config_.backendUrl + "/health"));
@@ -67,14 +70,14 @@ bool BackendClient::isAvailable() const
         const bool ok = reply->error() == QNetworkReply::NoError
             && reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200
             && deserializeHealthResponse(reply->readAll());
-        qInfo() << "Backend health check" << (ok ? "succeeded" : "failed");
+        qInfo() << "Backend health check" << (ok ? "succeeded" : "failed") << "elapsed_ms =" << elapsed.elapsed();
         reply->deleteLater();
         return ok;
     }
 
     reply->abort();
     reply->deleteLater();
-    qWarning() << "Backend health check timed out";
+    qWarning() << "Backend health check timed out; elapsed_ms =" << elapsed.elapsed();
     return false;
 }
 
@@ -83,6 +86,8 @@ BackendConversionResponse BackendClient::convert(const std::string& code,
                                                  ConversionMode mode,
                                                  const ConversionResult* localResult) const
 {
+    QElapsedTimer elapsed;
+    elapsed.start();
     qInfo() << "Backend conversion request starts; mode =" << modeToString(mode);
     QNetworkAccessManager manager;
     QNetworkRequest request(QUrl(config_.backendUrl + "/api/convert"));
@@ -102,7 +107,7 @@ BackendConversionResponse BackendClient::convert(const std::string& code,
     if (!timer.isActive()) {
         reply->abort();
         reply->deleteLater();
-        qWarning() << "Backend conversion request timed out";
+        qWarning() << "Backend conversion request timed out; elapsed_ms =" << elapsed.elapsed();
         return {false, {}, "Backend request timed out."};
     }
 
@@ -110,14 +115,14 @@ BackendConversionResponse BackendClient::convert(const std::string& code,
     if (reply->error() != QNetworkReply::NoError) {
         const std::string error = reply->errorString().toStdString();
         reply->deleteLater();
-        qWarning() << "Backend conversion request failed:" << QString::fromStdString(error);
+        qWarning() << "Backend conversion request failed:" << QString::fromStdString(error) << "elapsed_ms =" << elapsed.elapsed();
         return {false, {}, error};
     }
 
     const QByteArray payload = reply->readAll();
     reply->deleteLater();
     BackendConversionResponse response = deserializeConversionResponse(payload);
-    qInfo() << "Backend conversion request" << (response.ok ? "succeeded" : "failed");
+    qInfo() << "Backend conversion request" << (response.ok ? "succeeded" : "failed") << "elapsed_ms =" << elapsed.elapsed();
     return response;
 }
 

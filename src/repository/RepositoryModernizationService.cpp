@@ -1,5 +1,8 @@
 #include "repository/RepositoryModernizationService.h"
 
+#include "converter/CrossScopeTypePropagationPass.h"
+#include "converter/TransformationContext.h"
+
 #include <QDateTime>
 
 #include <fstream>
@@ -51,6 +54,11 @@ RepositoryModernizationResult RepositoryModernizationService::modernizeRepositor
     const std::vector<std::filesystem::path> files = scanner_.scanCppFiles(clonePath);
     result.filesScanned = files.size();
     const ModernizationOptions conversionOptions = fileOptions(options);
+    std::ostringstream repositoryContext;
+    for (const std::filesystem::path& filePath : files) {
+        repositoryContext << readFile(filePath) << '\n';
+    }
+    const std::string repositoryContextText = repositoryContext.str();
 
     for (const std::filesystem::path& filePath : files) {
         FileModernizationResult fileResult;
@@ -67,6 +75,14 @@ RepositoryModernizationResult RepositoryModernizationService::modernizeRepositor
         }
 
         ConversionResult conversion = converterEngine_->convert(original, conversionOptions);
+        const CrossScopeTypePropagationPass crossScopeTypePropagationPass;
+        TransformationContext repositoryTransformationContext;
+        const std::string fileAwareRepositoryContext = repositoryContextText + '\n' + original + '\n' + conversion.modernCode;
+        conversion.modernCode = crossScopeTypePropagationPass.rewrite(conversion.modernCode,
+                                                                      conversionOptions,
+                                                                      repositoryTransformationContext,
+                                                                      fileAwareRepositoryContext,
+                                                                      conversion.changes);
         fileResult.changes = conversion.changes;
 
         for (const ConversionChange& change : fileResult.changes) {

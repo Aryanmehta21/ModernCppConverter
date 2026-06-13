@@ -15,6 +15,7 @@ struct OfflineModernizationPipelineResult
     std::string compilerUsed;
     std::string compilerOutput;
     std::string rewriteLevel;
+    std::vector<std::string> diagnosticMessages;
 };
 
 class OfflineModernizationPipeline

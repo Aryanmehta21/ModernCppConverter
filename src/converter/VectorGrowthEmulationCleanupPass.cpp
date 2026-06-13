@@ -340,15 +340,15 @@ std::string rewriteFieldAppendSequences(const std::string& code,
                                             + " = " + trim(assignmentMatch[4].str()) + ";" + trailingComment);
         }
 
-        if (scan >= lines.size()) {
-            rewrittenLines.push_back(lines[index]);
-            continue;
-        }
-
+        const bool hasFollowingLine = scan < lines.size();
         std::string incrementTrailingComment;
-        const std::string incrementCodePart = SafeReplacementEngine::splitTrailingLineComment(lines[scan], incrementTrailingComment);
+        std::string incrementCodePart;
+        if (hasFollowingLine) {
+            incrementCodePart = SafeReplacementEngine::splitTrailingLineComment(lines[scan], incrementTrailingComment);
+        }
         const std::regex incrementPattern("^[ \\t]*(?:\\+\\+" + escapeRegex(countName) + "|" + escapeRegex(countName) + "\\+\\+)\\s*;\\s*$");
-        if (!std::regex_match(incrementCodePart, incrementPattern)) {
+        const bool hasCountIncrement = hasFollowingLine && std::regex_match(incrementCodePart, incrementPattern);
+        if (!hasCountIncrement && originalAssignmentLines.size() < 2) {
             rewrittenLines.push_back(lines[index]);
             continue;
         }
@@ -360,7 +360,9 @@ std::string rewriteFieldAppendSequences(const std::string& code,
             }
             before << originalLine;
         }
-        before << '\n' << lines[scan];
+        if (hasCountIncrement) {
+            before << '\n' << lines[scan];
+        }
 
         rewrittenLines.push_back(baseIndent + elementType + " " + objectName + "{};");
         for (const std::string& assignmentLine : modernAssignmentLines) {
@@ -379,9 +381,11 @@ std::string rewriteFieldAppendSequences(const std::string& code,
                          "Indexed append to vector push_back",
                          trim(before.str()),
                          trim(after.str()),
-                         "Replaced field-by-field indexed append plus count increment with construction of a local value and std::vector::push_back().");
+                         hasCountIncrement
+                             ? "Replaced field-by-field indexed append plus count increment with construction of a local value and std::vector::push_back()."
+                             : "Replaced field-by-field indexed append whose old count increment had already been removed with construction of a local value and std::vector::push_back().");
         changed = true;
-        index = scan;
+        index = hasCountIncrement ? scan : scan - 1;
     }
 
     return joinLines(rewrittenLines);
@@ -633,9 +637,17 @@ std::string VectorGrowthEmulationCleanupPass::rewrite(const std::string& code,
                                                         + ")\\s*\\[\\s*([A-Za-z_]\\w*)\\s*\\]\\s*=\\s*([^;]+)\\s*;\\s*\\n\\1(?:\\+\\+\\3|\\3\\+\\+)\\s*;",
                                                     std::regex::ECMAScript | std::regex::multiline);
         std::smatch appendMatch;
-        while (std::regex_search(updated, appendMatch, appendThenIncrementPattern)) {
+        std::string appendSearch = updated;
+        std::size_t appendConsumed = 0;
+        while (std::regex_search(appendSearch, appendMatch, appendThenIncrementPattern)) {
             const std::string replacement = appendMatch[1].str() + record.symbolName + ".push_back(" + trim(appendMatch[4].str()) + ");";
-            updated.replace(static_cast<std::size_t>(appendMatch.position()),
+            const std::size_t appendPosition = appendConsumed + static_cast<std::size_t>(appendMatch.position());
+            if (replacement == appendMatch[0].str()) {
+                appendConsumed += static_cast<std::size_t>(appendMatch.position() + appendMatch.length());
+                appendSearch = updated.substr(appendConsumed);
+                continue;
+            }
+            updated.replace(appendPosition,
                             static_cast<std::size_t>(appendMatch.length()),
                             replacement);
             changed = true;
@@ -644,6 +656,8 @@ std::string VectorGrowthEmulationCleanupPass::rewrite(const std::string& code,
                              trim(appendMatch[0].str()),
                              trim(replacement),
                              "Replaced indexed append plus count increment with std::vector::push_back().");
+            appendConsumed = appendPosition + replacement.size();
+            appendSearch = updated.substr(appendConsumed);
         }
 
         const std::regex capacityCountPattern(R"(\b([A-Za-z_]\w*)\s*(==|>=|>)\s*([A-Za-z_]\w*)\b)");

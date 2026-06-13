@@ -32,4 +32,32 @@ add_test(NAME SemanticConsistencyTests COMMAND Phase4EnterpriseTests semantic)
 add_test(NAME ScopedEnumOutputTests COMMAND Phase4EnterpriseTests scoped-enum)
 add_test(NAME FinalPolishTests COMMAND Phase4EnterpriseTests polish)
 add_test(NAME RegressionModernizationTests COMMAND Phase4EnterpriseTests regression)
+add_test(NAME QualitySprintTests COMMAND Phase4EnterpriseTests quality)
+add_test(NAME CrossScopeTypePropagationTests COMMAND Phase4EnterpriseTests cross-scope)
+add_test(NAME NsdmiScopeSafetyTests COMMAND Phase4EnterpriseTests nsdmi-scope)
+add_test(NAME FunctionalModernizationTests COMMAND Phase4EnterpriseTests functional)
+add_test(NAME FunctorToLambdaSpecificTests COMMAND Phase4EnterpriseTests functor-specific)
 add_test(NAME RepositoryModeTests COMMAND Phase4EnterpriseTests repository)
+
+add_executable(GuiConversionSmokeTests
+    GuiConversionSmokeTests.cpp
+    ../src/app/MainWindow.cpp
+    ../src/app/MainWindow.h
+    ../src/editor/CppCodeEditor.cpp
+    ../src/editor/CppCodeEditor.h
+    ../src/editor/CppSyntaxHighlighter.cpp
+    ../src/editor/CppSyntaxHighlighter.h
+    ../src/editor/LineNumberArea.cpp
+    ../src/editor/LineNumberArea.h
+)
+
+target_link_libraries(GuiConversionSmokeTests
+    PRIVATE
+        ModernCppConverterCore
+        ModernCppConverterWarnings
+        Qt6::Concurrent
+        Qt6::Widgets
+)
+
+add_test(NAME GuiConversionSmokeTests COMMAND GuiConversionSmokeTests)
+set_tests_properties(GuiConversionSmokeTests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

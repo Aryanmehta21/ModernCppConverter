@@ -149,8 +149,11 @@ bool cleanupOnlyCopyConstructorBody(const std::string& functionText,
     const std::regex manualCopyLoop(symbol + R"(\s*\[[^\]]+\]\s*=\s*)" + parameter + R"(\.)" + symbol + R"(\s*\[[^\]]+\])");
     const std::regex vectorResize(symbol + R"(\.resize\s*\()");
     const std::regex oldAllocation(symbol + R"(\s*=\s*new\s+)");
+    const std::regex oldInitializerAllocation(symbol + R"(\s*\(\s*new\s+)");
     return std::regex_search(functionText, manualCopyLoop)
-        && (std::regex_search(functionText, vectorResize) || std::regex_search(functionText, oldAllocation));
+        && (std::regex_search(functionText, vectorResize)
+            || std::regex_search(functionText, oldAllocation)
+            || std::regex_search(functionText, oldInitializerAllocation));
 }
 
 bool cleanupOnlyCopyAssignmentBody(const std::string& functionText,
@@ -396,6 +399,17 @@ std::string DependentUsageRewritePass::rewriteVectorUsages(const std::string& co
                              record.symbolName + "(nullptr)",
                              "removed",
                              "Removed pointer-style nullptr member initialization after std::vector modernization.");
+            changed = true;
+        }
+
+        const std::regex firstInitializerPattern(R"(:\s*)" + symbol + R"(\s*\(\s*nullptr\s*\)\s*,\s*)");
+        if (std::regex_search(updated, firstInitializerPattern)) {
+            updated = std::regex_replace(updated, firstInitializerPattern, ": ");
+            addAppliedChange(changes,
+                             "Remove nullptr check after vector modernization",
+                             record.symbolName + "(nullptr)",
+                             "removed",
+                             "Removed pointer-style nullptr member initialization from the front of a constructor initializer list after std::vector modernization.");
             changed = true;
         }
 

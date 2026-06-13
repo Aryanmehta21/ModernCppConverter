@@ -2,7 +2,9 @@
 
 #include <QDateTime>
 #include <QDebug>
+#include <QElapsedTimer>
 
+#include <iterator>
 #include <stdexcept>
 #include <utility>
 
@@ -40,7 +42,9 @@ void stampResult(ConversionResult& result,
     result.aiModel = std::move(aiModel);
     result.fallbackUsed = fallbackUsed;
     result.convertedAt = currentTimestamp();
-    result.diagnosticMessages = std::move(diagnostics);
+    result.diagnosticMessages.insert(result.diagnosticMessages.end(),
+                                     std::make_move_iterator(diagnostics.begin()),
+                                     std::make_move_iterator(diagnostics.end()));
 }
 
 void applyOfflineSourceLabel(ConversionResult& result)
@@ -87,7 +91,13 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
 {
     if (requestedMode == ConversionMode::OfflineRuleBased) {
         qInfo() << "Offline mode selected";
+        QElapsedTimer timer;
+        timer.start();
+        qInfo() << "Offline pipeline started";
         ConversionResult result = localEngine_->convert(code, options);
+        const qint64 elapsed = timer.elapsed();
+        qInfo() << "Offline pipeline finished; elapsed_ms =" << elapsed;
+        result.diagnosticMessages.push_back("offline pipeline finished elapsed_ms=" + std::to_string(elapsed));
         stampResult(result, ConversionMode::OfflineRuleBased, "Not used");
         applyOfflineSourceLabel(result);
         return {std::move(result), ConversionMode::OfflineRuleBased, false, {}};
@@ -97,7 +107,13 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
     qInfo() << "Backend health check starts";
     if (!backendClient_->isAvailable()) {
         qWarning() << "Backend health check failed; offline fallback will be used";
+        QElapsedTimer timer;
+        timer.start();
+        qInfo() << "Offline fallback pipeline started";
         ConversionResult result = localEngine_->convert(code, options);
+        const qint64 elapsed = timer.elapsed();
+        qInfo() << "Offline fallback pipeline finished; elapsed_ms =" << elapsed;
+        result.diagnosticMessages.push_back("offline fallback pipeline finished elapsed_ms=" + std::to_string(elapsed));
         stampResult(result,
                     ConversionMode::OfflineRuleBased,
                     "Unavailable",
@@ -147,7 +163,13 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
         };
     }
 
+    QElapsedTimer localTimer;
+    localTimer.start();
+    qInfo() << "Hybrid local offline pipeline started";
     ConversionResult localResult = localEngine_->convert(code, options);
+    const qint64 localElapsed = localTimer.elapsed();
+    qInfo() << "Hybrid local offline pipeline finished; elapsed_ms =" << localElapsed;
+    localResult.diagnosticMessages.push_back("hybrid local offline pipeline finished elapsed_ms=" + std::to_string(localElapsed));
     qInfo() << "Hybrid conversion request starts after local conversion";
     BackendConversionResponse response = backendClient_->convert(localResult.modernCode, options, requestedMode, &localResult);
     if (response.ok) {
