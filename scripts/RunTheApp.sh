@@ -60,7 +60,7 @@ case "$OS" in
                 15) GENERATOR="Visual Studio 15 2017" ;;
                 16) GENERATOR="Visual Studio 16 2019" ;;
                 17) GENERATOR="Visual Studio 17 2022" ;;
-                18) GENERATOR="Visual Studio 18 2022" ;;
+                18) GENERATOR="Visual Studio 18 2026" ;;
                 *) GENERATOR="Visual Studio 17 2022" ;; # default to latest known version
             esac
             echo "[INFO] Detected Visual Studio version $VS_MAJOR, using generator: $GENERATOR" >&2
