@@ -1,6 +1,7 @@
 add_executable(ConverterTests
     ConverterTests.cpp
 )
+modern_cpp_converter_use_root_output(ConverterTests)
 
 target_link_libraries(ConverterTests
     PRIVATE
@@ -14,6 +15,7 @@ add_test(NAME ConverterTests COMMAND ConverterTests)
 add_executable(Phase4EnterpriseTests
     Phase4EnterpriseTests.cpp
 )
+modern_cpp_converter_use_root_output(Phase4EnterpriseTests)
 
 target_link_libraries(Phase4EnterpriseTests
     PRIVATE
@@ -41,19 +43,12 @@ add_test(NAME RepositoryModeTests COMMAND Phase4EnterpriseTests repository)
 
 add_executable(GuiConversionSmokeTests
     GuiConversionSmokeTests.cpp
-    ../src/app/MainWindow.cpp
-    ../src/app/MainWindow.h
-    ../src/editor/CppCodeEditor.cpp
-    ../src/editor/CppCodeEditor.h
-    ../src/editor/CppSyntaxHighlighter.cpp
-    ../src/editor/CppSyntaxHighlighter.h
-    ../src/editor/LineNumberArea.cpp
-    ../src/editor/LineNumberArea.h
 )
+modern_cpp_converter_use_root_output(GuiConversionSmokeTests)
 
 target_link_libraries(GuiConversionSmokeTests
     PRIVATE
-        ModernCppConverterCore
+        ModernCppConverterUi
         ModernCppConverterWarnings
         Qt6::Concurrent
         Qt6::Widgets

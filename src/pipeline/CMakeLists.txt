@@ -1,0 +1,20 @@
+target_sources(ModernCppConverterCore
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/converter/AggressiveRewriteEngine.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/AstRepresentation.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/ClangAstStructureAnalyzer.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/CompileVerifier.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/ConversionRule.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/IncludeManager.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/ModernCppConverter.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/ModernCppExplanationGenerator.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/OfflineModernizationPipeline.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/RawTextRepresentation.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/RuleBasedConverterEngine.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/SafeReplacementEngine.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/StructuralAnalyzers.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/StructuralModernizationEngine.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/TokenBasedStructureAnalyzer.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/TokenRepresentation.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/TransformationContext.cpp
+)

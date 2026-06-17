@@ -1,0 +1,12 @@
+target_sources(ModernCppConverterCore
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/app/ConversionCoordinator.cpp
+        ${PROJECT_SOURCE_DIR}/src/backend/BackendClient.cpp
+        ${PROJECT_SOURCE_DIR}/src/backend/BackendConfig.cpp
+        ${PROJECT_SOURCE_DIR}/src/repository/RepositoryBackupService.cpp
+        ${PROJECT_SOURCE_DIR}/src/repository/RepositoryCloneService.cpp
+        ${PROJECT_SOURCE_DIR}/src/repository/RepositoryModernizationService.cpp
+        ${PROJECT_SOURCE_DIR}/src/repository/RepositoryReportWriter.cpp
+        ${PROJECT_SOURCE_DIR}/src/repository/RepositoryScanner.cpp
+        ${PROJECT_SOURCE_DIR}/src/repository/RepositoryVerificationService.cpp
+)
