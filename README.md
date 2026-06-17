@@ -36,13 +36,14 @@ Supported modernization categories include:
 
 ## Screenshots
 
-Screenshots are not committed yet.
-
-Suggested future screenshots:
-
+<img width="1207" height="818" alt="Screenshot 2026-06-17 at 8 32 12 PM" src="https://github.com/user-attachments/assets/432864b8-ad29-4048-8691-bfeecb96bcc3" />
 - Code Converter tab
+
+  <img width="1470" height="956" alt="image" src="https://github.com/user-attachments/assets/ba91d561-d555-413c-9f9b-9ec395097588" />
 - Options tab
+  <img width="1470" height="956" alt="image" src="https://github.com/user-attachments/assets/d590104b-efa5-40d6-a4a3-d06852fec9e5" />
 - Repository Modernization tab
+  <img width="1328" height="222" alt="image" src="https://github.com/user-attachments/assets/3a506096-92ab-407c-9312-d0934dc84a34" />
 - Compile Verification and Diagnostics tab
 
 ## Tech Stack
