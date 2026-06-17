@@ -102,6 +102,19 @@ For single-config generators, the executable may be at:
 ./build/ModernCppConverter
 ```
 
+We also have a script in /scripts folder named RunTheApp.sh, we can use that to directly run the app without the need of cmake commands:
+
+```sh
+chmod 777 RunTheApp.sh
+./scripts/RunTheApp.sh            #without arguments it will run the release mode
+./scripts/RunTheApp.sh debug      # Debug
+./scripts/RunTheApp.sh release    # Release
+./scripts/RunTheApp.sh clean      # clean Release
+./scripts/RunTheApp.sh debug clean
+./scripts/RunTheApp.sh release clean
+./scripts/RunTheApp.sh --help
+```
+
 ## Offline Mode
 
 Offline Rule-Based mode is the primary feature.
