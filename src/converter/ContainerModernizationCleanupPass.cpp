@@ -444,6 +444,108 @@ std::string removeEmptyBlocks(std::string code,
     return code;
 }
 
+std::string removeObsoleteCapacityGuardFragments(std::string code,
+                                                 const std::string& vectorName,
+                                                 std::vector<ConversionChange>& changes,
+                                                 bool& changed)
+{
+    const std::string escapedVector = escapeRegex(vectorName);
+    const std::regex guardLinePattern("^[ \\t]*if\\s*\\(\\s*" + escapedVector
+                                      + "\\.size\\s*\\(\\s*\\)\\s*(==|>=|>)\\s*"
+                                      + "(static_cast\\s*<\\s*std::size_t\\s*>\\s*\\(\\s*)?"
+                                      + "[A-Za-z_]\\w*\\s*\\)?\\s*\\)\\s*\\{\\s*$");
+    const std::regex simpleAssignmentPattern(R"(^[ \t]*[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\s*;\s*$)");
+    const std::regex closeBracePattern(R"(^[ \t]*\}\s*$)");
+    const std::regex appendPattern("^[ \\t]*" + escapedVector + R"(\.push_back\s*\()");
+
+    std::stringstream input(code);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(input, line)) {
+        lines.push_back(line);
+    }
+
+    std::set<std::size_t> linesToRemove;
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        if (!std::regex_match(lines[index], guardLinePattern)) {
+            continue;
+        }
+
+        std::size_t next = index + 1;
+        while (next < lines.size() && trim(lines[next]).empty()) {
+            ++next;
+        }
+
+        if (next < lines.size() && std::regex_match(lines[next], closeBracePattern)) {
+            linesToRemove.insert(index);
+            linesToRemove.insert(next);
+        } else if (next < lines.size() && std::regex_match(lines[next], simpleAssignmentPattern)) {
+            std::size_t close = next + 1;
+            while (close < lines.size() && trim(lines[close]).empty()) {
+                ++close;
+            }
+            if (close < lines.size() && std::regex_match(lines[close], closeBracePattern)) {
+                linesToRemove.insert(index);
+                linesToRemove.insert(next);
+                linesToRemove.insert(close);
+            }
+        } else if (next < lines.size() && std::regex_search(lines[next], appendPattern)) {
+            linesToRemove.insert(index);
+        } else {
+            bool sawAppend = false;
+            bool sawReturn = false;
+            for (std::size_t scan = next; scan < lines.size() && scan < index + 10; ++scan) {
+                if (std::regex_search(lines[scan], std::regex(R"(\breturn\b)"))) {
+                    sawReturn = true;
+                    break;
+                }
+                if (std::regex_search(lines[scan], appendPattern)) {
+                    sawAppend = true;
+                    break;
+                }
+                if (scan != next && std::regex_match(lines[scan], closeBracePattern)) {
+                    break;
+                }
+            }
+            if (sawAppend && !sawReturn) {
+                linesToRemove.insert(index);
+            }
+        }
+
+        if (linesToRemove.contains(index)) {
+            addAppliedChange(changes,
+                             "Container modernization cleanup",
+                             trim(lines[index]),
+                             "removed",
+                             "Removed an obsolete allocation-capacity guard left after vector growth cleanup.");
+            changed = true;
+        }
+    }
+
+    if (linesToRemove.empty()) {
+        return code;
+    }
+
+    std::ostringstream output;
+    bool firstLine = true;
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        if (linesToRemove.contains(index)) {
+            continue;
+        }
+        if (!firstLine) {
+            output << '\n';
+        }
+        firstLine = false;
+        output << lines[index];
+    }
+
+    std::string updated = output.str();
+    if (!code.empty() && code.back() == '\n') {
+        updated.push_back('\n');
+    }
+    return updated;
+}
+
 bool hasResidualGrowthFragments(const std::string& code,
                                 const std::string& targetExpression,
                                 const std::string& elementType)
@@ -790,7 +892,36 @@ bool hasLogicalCapacityUse(const std::string& classText, const std::string& capa
     stripped = removeMemberInitializer(std::move(stripped), capacityName);
     stripped = removeNumericMemberDeclaration(std::move(stripped), capacityName);
     stripped = removeSimpleMemberAssignment(std::move(stripped), capacityName);
+    stripped = std::regex_replace(stripped,
+                                  std::regex(R"(^[ \t]*)" + escapeRegex(capacityName)
+                                                 + R"(\s*(?:\*=|\+=|-=|/=)\s*[^;]+;\s*\n?)",
+                                             std::regex::ECMAScript | std::regex::multiline),
+                                  "");
     return containsWord(stripped, capacityName);
+}
+
+bool isAllocationCapacityLikeMember(const std::string& memberName)
+{
+    const std::string lowered = lowercase(memberName);
+    return lowered == "capacity"
+        || lowered == "cap"
+        || lowered == "reserve"
+        || lowered.find("capacity") != std::string::npos
+        || lowered.find("reserve") != std::string::npos
+        || lowered.find("allocated") != std::string::npos
+        || lowered.find("allocation") != std::string::npos;
+}
+
+std::string removeCapacityOnlyUpdates(std::string classText, const std::string& memberName)
+{
+    const std::string escapedMember = escapeRegex(memberName);
+    classText = removeSimpleMemberAssignment(std::move(classText), memberName);
+    classText = std::regex_replace(classText,
+                                   std::regex(R"(^[ \t]*)" + escapedMember
+                                                  + R"(\s*(?:\*=|\+=|-=|/=)\s*[^;]+;\s*\n?)",
+                                              std::regex::ECMAScript | std::regex::multiline),
+                                   "");
+    return classText;
 }
 
 std::string removeStaleCapacityMembers(std::string classText,
@@ -799,12 +930,14 @@ std::string removeStaleCapacityMembers(std::string classText,
                                        bool& changed)
 {
     for (const std::string& memberName : numericMemberNames(classText)) {
+        if (!isAllocationCapacityLikeMember(memberName) || memberName == record.symbolName) {
+            continue;
+        }
+
         const std::string escapedMember = escapeRegex(memberName);
         const std::regex reservePattern(escapeRegex(record.symbolName) + R"(\.reserve\s*\(\s*)"
                                             + escapedMember + R"(\s*\))");
-        if (!std::regex_search(classText, reservePattern)) {
-            continue;
-        }
+        const bool feedsReserve = std::regex_search(classText, reservePattern);
 
         if (hasLogicalCapacityUse(classText, memberName, record.symbolName)) {
             continue;
@@ -814,23 +947,26 @@ std::string removeStaleCapacityMembers(std::string classText,
         if (!expression || expression->empty()) {
             expression = findMemberAssignmentExpression(classText, memberName);
         }
-        if (!expression || expression->empty()) {
+        if (feedsReserve && (!expression || expression->empty())) {
             continue;
         }
 
         const std::string before = classText;
-        classText = std::regex_replace(classText,
-                                       reservePattern,
-                                       record.symbolName + ".reserve(" + *expression + ")");
-        classText = removeSimpleMemberAssignment(std::move(classText), memberName);
+        if (feedsReserve) {
+            classText = std::regex_replace(classText,
+                                           reservePattern,
+                                           record.symbolName + ".reserve(" + *expression + ")");
+        }
+        classText = removeCapacityOnlyUpdates(std::move(classText), memberName);
         classText = removeMemberInitializer(std::move(classText), memberName);
         classText = removeNumericMemberDeclaration(std::move(classText), memberName);
         if (classText != before) {
+            const std::string afterText = feedsReserve && expression ? "reserve(" + *expression + ")" : "removed";
             addAppliedChange(changes,
                              "Post-vector stale capacity member removal",
                              memberName,
-                             "reserve(" + *expression + ")",
-                             "Removed an allocation-capacity member that only fed std::vector::reserve().");
+                             afterText,
+                             "Removed an allocation-capacity member that no longer enforces a logical limit after std::vector modernization.");
             changed = true;
         }
     }
@@ -931,6 +1067,7 @@ std::string finalVectorLeftoverSweep(std::string code,
         growthSymbols = collectGrowthSymbols(code, targetExpression, elementType);
         code = removeGrowthSymbolLines(std::move(code), targetExpression, elementType, growthSymbols, changes, changed);
         code = removeEmptyBlocks(std::move(code), changes, changed);
+        code = removeObsoleteCapacityGuardFragments(std::move(code), record.symbolName, changes, changed);
 
         code = safeReplacement.rewriteCodeLines(code, [&](const std::string& line) {
             std::string trailingComment;

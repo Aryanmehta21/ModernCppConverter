@@ -4,6 +4,7 @@
 #include "converter/OfflineModernizationPipeline.h"
 #include "converter/RawTextRepresentation.h"
 
+#include <algorithm>
 #include <cctype>
 #include <regex>
 #include <set>
@@ -485,7 +486,7 @@ public:
                std::vector<ConversionChange>& changes) const override
     {
         static const std::regex allocationPattern(
-            R"(^([ \t]*)([A-Za-z_]\w*(?:::\w+)*)\s*\*\s*([A-Za-z_]\w*)\s*=\s*new\s+\2(?:\s*\(([^;]*)\))?\s*;\s*$)");
+            R"(^([ \t]*)([A-Za-z_]\w*(?:::\w+)*(?:\s*<[^;\n{}]+>)?)\s*\*\s*([A-Za-z_]\w*)\s*=\s*new\s+([A-Za-z_]\w*(?:::\w+)*(?:\s*<[^;\n{}]+>)?)\s*(?:\(([^;{}]*)\)|\{([^;{}]*)\})?\s*;\s*$)");
         static const std::regex deletePattern(R"(^[ \t]*delete\s+([A-Za-z_]\w*)\s*;\s*$)");
 
         const std::string originalCode = representation.sourceText();
@@ -506,9 +507,21 @@ public:
             }
 
             const std::string indent = allocationMatch[1].str();
-            const std::string typeName = allocationMatch[2].str();
+            const std::string typeName = trim(allocationMatch[2].str());
             const std::string variable = allocationMatch[3].str();
-            const std::string arguments = allocationMatch[4].matched ? trim(allocationMatch[4].str()) : "";
+            const std::string allocatedType = trim(allocationMatch[4].str());
+            const std::string arguments = allocationMatch[5].matched
+                ? trim(allocationMatch[5].str())
+                : (allocationMatch[6].matched ? trim(allocationMatch[6].str()) : "");
+
+            auto compactType = [](std::string value) {
+                value.erase(std::remove_if(value.begin(), value.end(), [](const unsigned char character) {
+                                return std::isspace(character) != 0;
+                            }),
+                            value.end());
+                return value;
+            };
+            const bool allocatedAsDeclaredType = compactType(typeName) == compactType(allocatedType);
 
             std::size_t deleteLine = lines.size();
             bool sawConditionalDelete = false;
@@ -529,7 +542,9 @@ public:
                 && !containsEscapingUse(originalCode, variable);
 
             if (safe && options.useSmartPointers && options.useMakeUnique && options.applySafeOwnershipModernization) {
-                const std::string replacement = indent + "auto " + variable + " = std::make_unique<" + typeName + ">(" + arguments + ");";
+                const std::string replacement = allocatedAsDeclaredType
+                    ? indent + "auto " + variable + " = std::make_unique<" + typeName + ">(" + arguments + ");"
+                    : indent + "std::unique_ptr<" + typeName + "> " + variable + " = std::make_unique<" + allocatedType + ">(" + arguments + ");";
                 addAppliedChange(changes,
                                  name(),
                                  trim(lines[index]),

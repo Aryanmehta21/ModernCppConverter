@@ -3,6 +3,7 @@
 #include "backend/IBackendClient.h"
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
+#include "converter/ContainerModernizationCleanupPass.h"
 #include "converter/ImpactCascadingCleanupPass.h"
 #include "converter/IConverterEngine.h"
 #include "converter/ModernCppExplanationGenerator.h"
@@ -13,6 +14,7 @@
 #include "converter/ReturnTypePropagationPass.h"
 #include "converter/ScopeAwareSymbolTable.h"
 #include "converter/ScopeLeakValidationPass.h"
+#include "converter/SemanticTypeValidationPass.h"
 #include "converter/SmartPointerCollectionPropagationPass.h"
 #include "converter/AstRepresentation.h"
 #include "converter/RawTextRepresentation.h"
@@ -803,6 +805,66 @@ void testConvertsNewWithConstructorArgsToMakeUnique()
     require(contains(result.modernCode, "auto controller = std::make_unique<VehicleController>(config, mode);"),
             "constructor arguments should be preserved in make_unique");
     require(!contains(result.modernCode, "delete controller"), "matching delete with constructor args should be removed");
+}
+
+void testConvertsTemplatedLocalNewDeleteToMakeUnique()
+{
+    const RuleBasedConverterEngine converter;
+    const ConversionResult result = converter.convert(
+        "#include <string>\n"
+        "void run()\n"
+        "{\n"
+        "    std::string* label = new std::string(\"ready\");\n"
+        "    delete label;\n"
+        "}\n");
+
+    require(contains(result.modernCode, "auto label = std::make_unique<std::string>(\"ready\");"),
+            "local templated/qualified new/delete ownership should convert to make_unique\nConverted code:\n"
+                + result.modernCode);
+    require(!contains(result.modernCode, "delete label"),
+            "delete for converted qualified local owner should be removed\nConverted code:\n" + result.modernCode);
+}
+
+void testConvertsBasePointerNewDerivedToUniquePtrAndGet()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "class Base\n"
+        "{\n"
+        "public:\n"
+        "    virtual ~Base() = default;\n"
+        "    virtual void touch() {}\n"
+        "};\n"
+        "class Derived : public Base {};\n"
+        "void observe(Base* value)\n"
+        "{\n"
+        "    if (value != nullptr)\n"
+        "    {\n"
+        "        value->touch();\n"
+        "    }\n"
+        "}\n"
+        "void run()\n"
+        "{\n"
+        "    Base* value = new Derived();\n"
+        "    observe(value);\n"
+        "    delete value;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::unique_ptr<Base> value = std::make_unique<Derived>();"),
+            "base pointer owning a derived allocation should become unique_ptr<Base>/make_unique<Derived>\nConverted code:\n"
+                + result.modernCode);
+    require(contains(result.modernCode, "observe(value.get());"),
+            "base unique_ptr owner passed to raw observer should use .get()\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "delete value"),
+            "delete for base/derived unique ownership should be removed\nConverted code:\n" + result.modernCode);
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "base/derived unique_ptr ownership propagation sample should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
 }
 
 void testUniquePtrOwnerPassedToRawObserverUsesGet()
@@ -1828,6 +1890,19 @@ void testCompileVerifierHandlesUnavailableCompilerGracefully()
     const CompileVerificationResult result = CompileVerifier::verifySyntaxOnly("int main() { return 0; }\n");
     require(result.verificationEnabled, "manual compile verifier should report enabled verification");
     require(result.compilerFound || contains(result.output, "Compiler not found"), "compiler absence should be a graceful result");
+}
+
+void testCompileVerifierDoesNotMergeMultipleMainSnippets()
+{
+    const CompileVerificationResult result = CompileVerifier::verifySyntaxOnly(
+        "int main() { return 0; }\n\n"
+        "int main() { return 1; }\n");
+    require(result.verificationEnabled, "multiple-main verification should still report verification metadata");
+    if (result.compilerFound) {
+        require(!result.passed, "combined snippets with multiple main functions should not be accepted as one translation unit");
+        require(contains(result.output, "Multiple main functions detected"),
+                "multiple-main diagnostic should tell callers to verify snippets separately");
+    }
 }
 
 void testOfflineSampleFilesModernize()
@@ -3873,6 +3948,128 @@ void testContainerModernizationCleanupPolishesVectorBackedClass()
     }
 }
 
+void testPostVectorCleanupRemovesUnusedCapacityWithoutReserve()
+{
+    TransformationContext context;
+    context.registerTypeChange(TypeChangeRecord{
+        "records",
+        "Record*",
+        "std::vector<Record>",
+        "RecordStore",
+        true,
+        "Raw dynamic array to std::vector",
+        {},
+        {},
+        true,
+    });
+
+    std::vector<ConversionChange> changes;
+    const ContainerModernizationCleanupPass cleanupPass;
+    const std::string updated = cleanupPass.rewrite(
+        "#include <vector>\n"
+        "#include <cstddef>\n"
+        "struct Record\n"
+        "{\n"
+        "    int value;\n"
+        "};\n\n"
+        "class RecordStore\n"
+        "{\n"
+        "public:\n"
+        "    RecordStore()\n"
+        "        : allocationCapacity(8)\n"
+        "    {\n"
+        "    }\n\n"
+        "    std::size_t getCount() const { return records.size(); }\n\n"
+        "private:\n"
+        "    std::vector<Record> records;\n"
+        "    int allocationCapacity;\n"
+        "};\n",
+        context,
+        changes);
+
+    require(!contains(updated, "allocationCapacity"),
+            "unused allocation-capacity member should be removed even when reserve already disappeared\nConverted code:\n"
+                + updated);
+    require(hasAppliedRule(changes, "Post-vector stale capacity member removal"),
+            "stale capacity removal should be tracked");
+}
+
+void testSizeReturningGetterUpdatesSignedLoopIndex()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    const ConversionResult result = converter.convert(
+        "#include <vector>\n"
+        "#include <cstddef>\n"
+        "struct Item\n"
+        "{\n"
+        "    int value;\n"
+        "};\n\n"
+        "class ItemStore\n"
+        "{\n"
+        "public:\n"
+        "    std::size_t getCount() const { return items.size(); }\n"
+        "private:\n"
+        "    std::vector<Item> items;\n"
+        "};\n\n"
+        "int countItems(const ItemStore& store)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (int index = 0; index < store.getCount(); ++index)\n"
+        "    {\n"
+        "        total += 1;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "for (std::size_t index = 0; index < store.getCount(); ++index)"),
+            "loop index should follow std::size_t count getter after type propagation\nConverted code:\n"
+                + result.modernCode);
+    require(hasAppliedRule(result, "Signed loop index to std::size_t"),
+            "signed loop cleanup should be tracked");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "signed loop cleanup sample should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testFinalFormatterCleansTransformedBlocks()
+{
+    const SemanticTypeValidationPass validationPass;
+    ModernizationOptions options = structuralOptions();
+    std::vector<ConversionChange> changes{
+        ConversionChange{
+            "Synthetic applied transformation",
+            "before",
+            "after",
+            "test marker",
+            true,
+            false,
+        },
+    };
+
+    const std::string formatted = validationPass.validateAndRepair(
+        "struct Fixture{\n"
+        "void run() override{\n"
+        "if (true){\n"
+        "return;\n"
+        "}\n"
+        "}\n"
+        "};\n",
+        options,
+        changes);
+
+    require(contains(formatted, "struct Fixture {"), "formatter should add space before class/struct brace\nOutput:\n" + formatted);
+    require(contains(formatted, "    void run() override {"), "formatter should indent class members and fix override brace spacing\nOutput:\n" + formatted);
+    require(contains(formatted, "        if (true) {"), "formatter should indent if blocks and add space before brace\nOutput:\n" + formatted);
+    require(contains(formatted, "            return;"), "formatter should indent statements inside nested blocks\nOutput:\n" + formatted);
+    require(!contains(formatted, "override{"), "formatter should not leave override glued to brace\nOutput:\n" + formatted);
+    require(hasAppliedRule(changes, "Final transformation formatting cleanup"), "formatting cleanup should be tracked");
+}
+
 void testConstReturnPropagationUpdatesDirectReceivers()
 {
     const RuleBasedConverterEngine converter;
@@ -5720,6 +5917,8 @@ int main(int argc, char** argv)
     testConvertedLegacySampleCompiles();
     testConvertsSimpleNewDeleteToMakeUnique();
     testConvertsNewWithConstructorArgsToMakeUnique();
+    testConvertsTemplatedLocalNewDeleteToMakeUnique();
+    testConvertsBasePointerNewDerivedToUniquePtrAndGet();
     testUniquePtrOwnerPassedToRawObserverUsesGet();
     testClassRawPointerMemberDeletesCopyAndDefaultsMove();
     testMallocSingleObjectModernizesToUniquePtr();
@@ -5754,6 +5953,7 @@ int main(int argc, char** argv)
     testOfflineRequiredIncludesAreNotDuplicated();
     testOfflineCompileVerificationPassesForSimpleSample();
     testCompileVerifierHandlesUnavailableCompilerGracefully();
+    testCompileVerifierDoesNotMergeMultipleMainSnippets();
     testOfflineSampleFilesModernize();
     testTokenBasedStructureAnalyzerFindsReusableBlocks();
     testStructuralPreprocessorCleanupAndConstantMacros();
@@ -5799,6 +5999,9 @@ int main(int argc, char** argv)
     testContainerModernizationCleanupRemovesGenericGrowthSystem();
     testContainerModernizationCleanupRemovesSameLineGrowthFragments();
     testContainerModernizationCleanupPolishesVectorBackedClass();
+    testPostVectorCleanupRemovesUnusedCapacityWithoutReserve();
+    testSizeReturningGetterUpdatesSignedLoopIndex();
+    testFinalFormatterCleansTransformedBlocks();
     testConstReturnPropagationUpdatesDirectReceivers();
     testConstReturnPropagationHandlesReferencesAndSmartPointerRefs();
     testVectorModernizationRemovesCleanupOnlyCopySpecialMembers();

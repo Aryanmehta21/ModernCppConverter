@@ -9,6 +9,9 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 
+#include <iterator>
+#include <regex>
+
 namespace
 {
 QString findCompiler()
@@ -50,6 +53,14 @@ QStringList argumentsForCompiler(const QString& compiler, const QString& sourceP
             QStringLiteral("-fsyntax-only"),
             sourcePath};
 }
+
+int countMainDefinitions(const std::string& code)
+{
+    const std::regex mainPattern(R"((^|[^\w:])(?:int|auto)\s+main\s*\()",
+                                 std::regex::ECMAScript | std::regex::multiline);
+    return static_cast<int>(std::distance(std::sregex_iterator(code.begin(), code.end(), mainPattern),
+                                          std::sregex_iterator()));
+}
 } // namespace
 
 CompileVerificationResult CompileVerifier::verifySyntaxOnly(const std::string& code)
@@ -73,6 +84,13 @@ CompileVerificationResult CompileVerifier::verifySyntaxOnly(const std::string& c
 
     result.compilerFound = true;
     result.compilerUsed = compiler.toStdString();
+
+    if (countMainDefinitions(code) > 1) {
+        result.output = "Multiple main functions detected. Syntax verification was not run as one translation unit; split combined snippets and verify them separately.";
+        qWarning() << "Compile verification skipped for combined snippets with multiple main functions; elapsed_ms ="
+                   << verificationTimer.elapsed();
+        return result;
+    }
 
     QTemporaryDir tempDir;
     if (!tempDir.isValid()) {
