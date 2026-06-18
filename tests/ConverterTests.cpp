@@ -4,6 +4,7 @@
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
 #include "converter/ContainerModernizationCleanupPass.h"
+#include "converter/CrossScopeTypePropagationPass.h"
 #include "converter/ImpactCascadingCleanupPass.h"
 #include "converter/IConverterEngine.h"
 #include "converter/ModernCppExplanationGenerator.h"
@@ -3246,6 +3247,34 @@ void testScopeAwareSymbolTableTracksClassMembers()
     require(!table.hasClassMember("Store", "localValue"), "scope table should not treat method locals as class members");
 }
 
+void testScopeAwareSymbolTableTracksFunctionLocals()
+{
+    const ScopeAwareSymbolTable table = ScopeAwareSymbolTable::build(
+        "int globalCounter;\n"
+        "void first()\n"
+        "{\n"
+        "    int localCount = 0;\n"
+        "    double ratio;\n"
+        "}\n"
+        "void second()\n"
+        "{\n"
+        "    int other = 1;\n"
+        "}\n");
+
+    require(table.hasFunctionLocal("first", "localCount"), "scope table should track function-local initialized values");
+    require(table.hasFunctionLocal("first", "ratio"), "scope table should track function-local declarations");
+    require(!table.hasFunctionLocal("second", "localCount"), "function-local symbols should not leak across functions");
+    const std::vector<SymbolInfo> visible = table.visibleSymbols("first");
+    require(std::any_of(visible.begin(), visible.end(), [](const SymbolInfo& symbol) {
+                return symbol.name == "globalCounter" && symbol.scopeKind == SymbolScopeKind::Global;
+            }),
+            "visible lookup should include globals");
+    require(std::any_of(visible.begin(), visible.end(), [](const SymbolInfo& symbol) {
+                return symbol.name == "localCount" && symbol.scopeKind == SymbolScopeKind::FunctionLocal;
+            }),
+            "visible lookup should include locals for the requested function");
+}
+
 void testVectorRawBufferGetterUsesDataOnlyWhenIntentIsClear()
 {
     const RuleBasedConverterEngine converter;
@@ -4036,6 +4065,57 @@ void testSizeReturningGetterUpdatesSignedLoopIndex()
     }
 }
 
+void testCrossScopePropagationAdaptsVectorToRawArrayCallsite()
+{
+    TransformationContext context;
+    context.registerTypeChange(TypeChangeRecord{
+        "values",
+        "int*",
+        "std::vector<int>",
+        "run",
+        false,
+        "Raw dynamic array to std::vector",
+        {},
+        {},
+        true,
+    });
+
+    std::vector<ConversionChange> changes;
+    const CrossScopeTypePropagationPass pass;
+    const ModernizationOptions options = structuralOptions();
+    const std::string fixed = pass.rewrite(
+        "#include <vector>\n"
+        "void consume(int* data, int count)\n"
+        "{\n"
+        "    if (count > 0)\n"
+        "    {\n"
+        "        data[0] = 1;\n"
+        "    }\n"
+        "}\n"
+        "void run()\n"
+        "{\n"
+        "    std::vector<int> values;\n"
+        "    values.push_back(0);\n"
+        "    consume(values, 1);\n"
+        "}\n",
+        options,
+        context,
+        changes);
+
+    require(contains(fixed, "consume(values.data(), static_cast<int>(values.size()));"),
+            "converted vector should adapt to visible raw pointer/count APIs with data() and size()\nConverted code:\n"
+                + fixed);
+    require(!contains(fixed, "consume(values, 1);"),
+            "stale direct vector-to-raw-array callsite should not remain\nConverted code:\n" + fixed);
+    require(hasAppliedRule(changes, "Cross-scope vector raw-array callsite adaptation"),
+            "vector raw-array callsite adaptation should be tracked");
+
+    const CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(fixed);
+    require(verification.compilerUsed.empty() || verification.passed,
+            "cross-scope vector/raw-array adaptation should pass syntax verification\nCompiler output:\n"
+                + verification.output + "\nConverted code:\n" + fixed);
+}
+
 void testFinalFormatterCleansTransformedBlocks()
 {
     const SemanticTypeValidationPass validationPass;
@@ -4175,6 +4255,45 @@ void testConstReturnPropagationHandlesReferencesAndSmartPointerRefs()
     const CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(fixed);
     require(verification.compilerUsed.empty() || verification.passed,
             "reference receiver propagation sample should pass syntax verification\nCompiler output:\n"
+                + verification.output + "\nConverted code:\n" + fixed);
+}
+
+void testReferenceReturnPropagationRepairsStaleContainerReceiver()
+{
+    const std::string code =
+        "#include <vector>\n"
+        "struct Item {};\n"
+        "class Holder\n"
+        "{\n"
+        "public:\n"
+        "    const std::vector<Item>& items() const\n"
+        "    {\n"
+        "        return values;\n"
+        "    }\n"
+        "private:\n"
+        "    std::vector<Item> values;\n"
+        "};\n"
+        "void inspect(const Holder& holder)\n"
+        "{\n"
+        "    std::vector<Item*> stale = holder.items();\n"
+        "    (void)stale;\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const ReturnTypePropagationPass pass;
+    const std::string fixed = pass.rewrite(code, changes);
+
+    require(contains(fixed, "const auto& stale = holder.items();"),
+            "stale explicit receiver should become a const reference to the visible getter result\nConverted code:\n"
+                + fixed);
+    require(!contains(fixed, "std::vector<Item*> stale = holder.items();"),
+            "old incompatible receiver type should not remain\nConverted code:\n" + fixed);
+    require(hasAppliedRule(changes, "Reference return receiver propagation"),
+            "reference return receiver propagation should be tracked");
+
+    const CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(fixed);
+    require(verification.compilerUsed.empty() || verification.passed,
+            "reference return receiver propagation should pass syntax verification\nCompiler output:\n"
                 + verification.output + "\nConverted code:\n" + fixed);
 }
 
@@ -5984,6 +6103,7 @@ int main(int argc, char** argv)
     testLengthGetterForIndependentMemberIsPreserved();
     testScopeLeakValidatorRepairsWrongInClassSymbolWhenSafe();
     testScopeAwareSymbolTableTracksClassMembers();
+    testScopeAwareSymbolTableTracksFunctionLocals();
     testVectorRawBufferGetterUsesDataOnlyWhenIntentIsClear();
     testRuntimeVectorGetterIsNotConstexpr();
     testMalformedEmptyDestructorBlocksAreRemoved();
@@ -6001,9 +6121,11 @@ int main(int argc, char** argv)
     testContainerModernizationCleanupPolishesVectorBackedClass();
     testPostVectorCleanupRemovesUnusedCapacityWithoutReserve();
     testSizeReturningGetterUpdatesSignedLoopIndex();
+    testCrossScopePropagationAdaptsVectorToRawArrayCallsite();
     testFinalFormatterCleansTransformedBlocks();
     testConstReturnPropagationUpdatesDirectReceivers();
     testConstReturnPropagationHandlesReferencesAndSmartPointerRefs();
+    testReferenceReturnPropagationRepairsStaleContainerReceiver();
     testVectorModernizationRemovesCleanupOnlyCopySpecialMembers();
     testVectorAppendPreservesLogicalMaxCapacity();
     testVectorAppendPassConvertsReserveToResizeForFixedIndexWrites();

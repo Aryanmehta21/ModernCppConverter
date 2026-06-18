@@ -19,6 +19,12 @@ struct ConstReturnRule
     std::string functionName;
 };
 
+struct ReferenceReturnRule
+{
+    std::string functionName;
+    bool isConst = false;
+};
+
 std::string trim(std::string value)
 {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -78,6 +84,20 @@ void addAppliedChange(std::vector<ConversionChange>& changes,
     });
 }
 
+void addReferenceAppliedChange(std::vector<ConversionChange>& changes,
+                               std::string before,
+                               std::string after)
+{
+    changes.push_back(ConversionChange{
+        "Reference return receiver propagation",
+        std::move(before),
+        std::move(after),
+        "Updated a direct receiving declaration after a visible function return type became a standard-library reference.",
+        true,
+        false,
+    });
+}
+
 std::vector<ConstReturnRule> collectConstReturnRules(const std::string& code)
 {
     std::vector<ConstReturnRule> rules;
@@ -112,6 +132,25 @@ bool initializerCallsFunction(const std::string& initializer, const std::string&
                                  + R"(\s*\()",
                                  std::regex::ECMAScript);
     return std::regex_search(initializer, callPattern);
+}
+
+std::vector<ReferenceReturnRule> collectReferenceReturnRules(const std::string& code)
+{
+    std::vector<ReferenceReturnRule> rules;
+    std::set<std::string> seen;
+    const std::regex functionPattern(
+        R"(\b(const\s+)?(?:std::(?:vector|array)\s*<[^;{}()]+>|std::(?:unique_ptr|shared_ptr)\s*<[^;{}()]+>|std::string)\s*&\s*([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?(?:->\s*[^{}]+)?\{)",
+        std::regex::ECMAScript);
+    for (std::sregex_iterator iterator(code.begin(), code.end(), functionPattern), end; iterator != end; ++iterator) {
+        ReferenceReturnRule rule{
+            (*iterator)[2].str(),
+            (*iterator)[1].matched,
+        };
+        if (!rule.functionName.empty() && seen.insert(rule.functionName).second) {
+            rules.push_back(std::move(rule));
+        }
+    }
+    return rules;
 }
 
 std::string rewriteLineForRule(const std::string& line,
@@ -152,13 +191,60 @@ std::string rewriteLineForRule(const std::string& line,
     addAppliedChange(changes, trim(codePart), trim(replacement));
     return replacement + trailingComment;
 }
+
+std::string rewriteLineForReferenceRule(const std::string& line,
+                                        const ReferenceReturnRule& rule,
+                                        bool& changed,
+                                        std::vector<ConversionChange>& changes)
+{
+    std::string trailingComment;
+    const std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+    if (codePart.find('=') == std::string::npos || codePart.find(rule.functionName) == std::string::npos) {
+        return line;
+    }
+
+    const std::regex alreadyReferencePattern(R"(^[ \t]*(?:const\s+)?auto\s*&)");
+    if (std::regex_search(codePart, alreadyReferencePattern)) {
+        return line;
+    }
+    if (trim(codePart).starts_with("const ")) {
+        return line;
+    }
+
+    const std::regex declarationPattern(
+        R"(^([ \t]*)(?:const\s+)?[A-Za-z_:][A-Za-z0-9_:<>,\s*&*]*\s+([A-Za-z_]\w*)\s*=\s*(.+;\s*)$)",
+        std::regex::ECMAScript);
+    std::smatch match;
+    if (!std::regex_match(codePart, match, declarationPattern)) {
+        return line;
+    }
+
+    const std::string initializer = match[3].str();
+    if (!initializerCallsFunction(initializer, rule.functionName)) {
+        return line;
+    }
+
+    const std::string replacement = match[1].str()
+        + (rule.isConst ? "const auto& " : "auto& ")
+        + match[2].str()
+        + " = "
+        + initializer;
+    if (trim(replacement) == trim(codePart)) {
+        return line;
+    }
+
+    changed = true;
+    addReferenceAppliedChange(changes, trim(codePart), trim(replacement));
+    return replacement + trailingComment;
+}
 } // namespace
 
 std::string ReturnTypePropagationPass::rewrite(const std::string& code,
                                                std::vector<ConversionChange>& changes) const
 {
     const std::vector<ConstReturnRule> rules = collectConstReturnRules(code);
-    if (rules.empty()) {
+    const std::vector<ReferenceReturnRule> referenceRules = collectReferenceReturnRules(code);
+    if (rules.empty() && referenceRules.empty()) {
         return code;
     }
 
@@ -168,6 +254,9 @@ std::string ReturnTypePropagationPass::rewrite(const std::string& code,
         std::string rewritten = line;
         for (const ConstReturnRule& rule : rules) {
             rewritten = rewriteLineForRule(rewritten, rule, changed, changes);
+        }
+        for (const ReferenceReturnRule& rule : referenceRules) {
+            rewritten = rewriteLineForReferenceRule(rewritten, rule, changed, changes);
         }
         return rewritten;
     });

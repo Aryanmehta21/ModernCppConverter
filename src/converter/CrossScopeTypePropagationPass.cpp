@@ -37,6 +37,19 @@ struct RawPointerSink
     std::string functionName;
 };
 
+struct ValueVectorSymbol
+{
+    std::string elementType;
+    std::string name;
+};
+
+struct RawArraySink
+{
+    std::string elementType;
+    std::string countType;
+    std::string functionName;
+};
+
 std::string trim(std::string value)
 {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -58,6 +71,15 @@ std::string escapeRegex(const std::string& text)
         escaped.push_back(character);
     }
     return escaped;
+}
+
+std::string vectorElementType(const std::string& type)
+{
+    const std::string prefix = "std::vector<";
+    if (!type.starts_with(prefix) || type.back() != '>') {
+        return {};
+    }
+    return trim(type.substr(prefix.size(), type.size() - prefix.size() - 1));
 }
 
 void addAppliedChange(std::vector<ConversionChange>& changes,
@@ -102,6 +124,23 @@ std::vector<SmartPointerSymbol> collectSmartPointers(const std::string& code)
     return symbols;
 }
 
+std::vector<ValueVectorSymbol> collectValueVectors(const TransformationContext& context)
+{
+    std::vector<ValueVectorSymbol> symbols;
+    std::set<std::string> seen;
+    for (const TypeChangeRecord& record : context.typeChanges()) {
+        const std::string elementType = vectorElementType(record.newType);
+        if (elementType.empty() || elementType.starts_with("std::unique_ptr<") || elementType.starts_with("std::shared_ptr<")) {
+            continue;
+        }
+        const std::string key = record.symbolName + ":" + elementType;
+        if (seen.insert(key).second) {
+            symbols.push_back(ValueVectorSymbol{elementType, record.symbolName});
+        }
+    }
+    return symbols;
+}
+
 std::vector<RawVectorSink> collectRawVectorSinks(const std::string& code)
 {
     std::vector<RawVectorSink> sinks;
@@ -126,6 +165,36 @@ std::vector<RawPointerSink> collectRawPointerSinks(const std::string& code)
         for (std::sregex_iterator parameter(parameters.begin(), parameters.end(), rawPointerParameter), parameterEnd; parameter != parameterEnd; ++parameter) {
             sinks.push_back(RawPointerSink{(*parameter)[1].str(), functionName});
         }
+    }
+    return sinks;
+}
+
+std::vector<RawArraySink> collectRawArraySinks(const std::string& code)
+{
+    std::vector<RawArraySink> sinks;
+    const std::regex functionPattern(
+        R"((?:^|\n)[ \t]*(?:template\s*<[^;\n{}]+>\s*)?(?:[A-Za-z_:][A-Za-z0-9_:<>,\s*&*]*\s+)+([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*(?:const\s*)?(?:\{|;))",
+        std::regex::ECMAScript);
+    const std::regex pointerParameter(R"((?:^|,)\s*(?:const\s+)?([A-Za-z_:][A-Za-z0-9_:]*)\s*\*\s*[A-Za-z_]\w*)");
+    const std::regex countParameter(R"(,\s*(int|long|size_t|std::size_t)\s+[A-Za-z_]\w*)");
+
+    for (std::sregex_iterator iterator(code.begin(), code.end(), functionPattern), end; iterator != end; ++iterator) {
+        const std::string functionName = (*iterator)[1].str();
+        const std::string parameters = (*iterator)[2].str();
+        std::smatch pointerMatch;
+        if (!std::regex_search(parameters, pointerMatch, pointerParameter)) {
+            continue;
+        }
+        const std::string afterPointer = parameters.substr(static_cast<std::size_t>(pointerMatch.position() + pointerMatch.length()));
+        std::smatch countMatch;
+        if (!std::regex_search(afterPointer, countMatch, countParameter)) {
+            continue;
+        }
+        sinks.push_back(RawArraySink{
+            pointerMatch[1].str(),
+            countMatch[1].str(),
+            functionName,
+        });
     }
     return sinks;
 }
@@ -331,6 +400,72 @@ std::string adaptExternalRawVectorSinks(std::string code,
     return changed ? IncludeManager().ensureInclude(code, "#include <vector>") : code;
 }
 
+std::string adaptRawArrayCallsites(std::string code,
+                                   const std::vector<ValueVectorSymbol>& vectors,
+                                   const std::vector<RawArraySink>& sinks,
+                                   std::vector<ConversionChange>& changes)
+{
+    if (vectors.empty() || sinks.empty()) {
+        return code;
+    }
+
+    bool changed = false;
+    const SafeReplacementEngine safeReplacement;
+    std::string updated = safeReplacement.rewriteCodeLines(std::move(code), [&](const std::string& line) {
+        std::string trailingComment;
+        std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+        const std::string before = codePart;
+
+        for (const RawArraySink& sink : sinks) {
+            const std::regex signaturePattern("\\b" + escapeRegex(sink.functionName)
+                                              + R"(\s*\([^;\n{}]*\*\s*[A-Za-z_]\w*[^;\n{}]*\)\s*(?:const\s*)?(?:;|\{)?\s*$)");
+            if (std::regex_search(codePart, signaturePattern)) {
+                continue;
+            }
+
+            for (const ValueVectorSymbol& vector : vectors) {
+                if (sink.elementType != vector.elementType) {
+                    continue;
+                }
+
+                const std::regex callPattern("(\\b(?:(?:[A-Za-z_]\\w*)\\s*(?:\\.|->)\\s*)?"
+                                             + escapeRegex(sink.functionName)
+                                             + "\\s*\\(\\s*)"
+                                             + escapeRegex(vector.name)
+                                             + R"(\s*,\s*([^,\n)]+)\s*(\)\s*;?.*)$)");
+                std::smatch match;
+                if (!std::regex_search(codePart, match, callPattern)) {
+                    continue;
+                }
+
+                const std::string sizeExpression = sink.countType == "size_t" || sink.countType == "std::size_t"
+                    ? vector.name + ".size()"
+                    : "static_cast<" + sink.countType + ">(" + vector.name + ".size())";
+                const std::string replacement = match[1].str()
+                    + vector.name
+                    + ".data(), "
+                    + sizeExpression
+                    + match[3].str();
+                codePart.replace(static_cast<std::size_t>(match.position()),
+                                 static_cast<std::size_t>(match.length()),
+                                 replacement);
+                changed = true;
+            }
+        }
+
+        if (codePart != before) {
+            addAppliedChange(changes,
+                             "Cross-scope vector raw-array callsite adaptation",
+                             trim(before),
+                             trim(codePart),
+                             "Adapted a converted std::vector to a visible raw pointer/count API with data() and size().");
+        }
+        return codePart + trailingComment;
+    });
+
+    return changed ? updated : code;
+}
+
 std::string repairClassVectorGetter(std::string code, std::vector<ConversionChange>& changes)
 {
     const std::regex getterPattern(
@@ -367,7 +502,7 @@ std::string CrossScopeTypePropagationPass::rewrite(const std::string& code,
 
 std::string CrossScopeTypePropagationPass::rewrite(const std::string& code,
                                                    const ModernizationOptions&,
-                                                   const TransformationContext&,
+                                                   const TransformationContext& context,
                                                    const std::string& externalContext,
                                                    std::vector<ConversionChange>& changes) const
 {
@@ -375,9 +510,12 @@ std::string CrossScopeTypePropagationPass::rewrite(const std::string& code,
     const std::vector<SmartVectorSymbol> smartVectors = collectSmartVectors(updated);
     const std::vector<SmartPointerSymbol> smartPointers = collectSmartPointers(updated);
     const std::vector<RawPointerSink> rawPointerSinks = collectRawPointerSinks(updated);
+    const std::vector<ValueVectorSymbol> valueVectors = collectValueVectors(context);
+    const std::vector<RawArraySink> rawArraySinks = collectRawArraySinks(updated);
 
     updated = updateRawVectorSignatures(std::move(updated), smartVectors, changes);
     updated = adaptRawPointerObserverCalls(std::move(updated), smartPointers, rawPointerSinks, changes);
+    updated = adaptRawArrayCallsites(std::move(updated), valueVectors, rawArraySinks, changes);
     updated = repairClassVectorGetter(std::move(updated), changes);
 
     if (!externalContext.empty()) {

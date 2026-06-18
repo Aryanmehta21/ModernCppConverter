@@ -102,6 +102,45 @@ bool positionInsideAnyClass(const std::vector<ClassBlock>& classes, const std::s
         return position >= block.start && position < block.end;
     });
 }
+
+std::size_t findMatchingBrace(const std::string& code, const std::size_t openBracePosition)
+{
+    int depth = 0;
+    bool inString = false;
+    bool inCharacter = false;
+    bool escaped = false;
+    for (std::size_t index = openBracePosition; index < code.size(); ++index) {
+        const char character = code[index];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (character == '\\' && (inString || inCharacter)) {
+            escaped = true;
+            continue;
+        }
+        if (!inCharacter && character == '"') {
+            inString = !inString;
+            continue;
+        }
+        if (!inString && character == '\'') {
+            inCharacter = !inCharacter;
+            continue;
+        }
+        if (inString || inCharacter) {
+            continue;
+        }
+        if (character == '{') {
+            ++depth;
+        } else if (character == '}') {
+            --depth;
+            if (depth == 0) {
+                return index;
+            }
+        }
+    }
+    return std::string::npos;
+}
 } // namespace
 
 ScopeAwareSymbolTable ScopeAwareSymbolTable::build(const std::string& code)
@@ -154,6 +193,46 @@ ScopeAwareSymbolTable ScopeAwareSymbolTable::build(const std::string& code)
         position += line.size() + 1;
     }
 
+    const std::regex functionPattern(
+        R"((?:^|\n)[ \t]*(?:template\s*<[^;\n{}]+>\s*)?(?:[A-Za-z_:][A-Za-z0-9_:<>,\s*&*]*\s+)+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{)",
+        std::regex::ECMAScript);
+    for (std::sregex_iterator iterator(code.begin(), code.end(), functionPattern), end; iterator != end; ++iterator) {
+        const std::size_t headerPosition = static_cast<std::size_t>(iterator->position());
+        if (positionInsideAnyClass(classes, headerPosition)) {
+            continue;
+        }
+
+        const std::string functionName = (*iterator)[1].str();
+        const std::size_t openBrace = code.find('{', headerPosition);
+        if (openBrace == std::string::npos) {
+            continue;
+        }
+        const std::size_t closeBrace = findMatchingBrace(code, openBrace);
+        if (closeBrace == std::string::npos || closeBrace <= openBrace) {
+            continue;
+        }
+
+        const std::vector<std::string> bodyLines = splitLines(code.substr(openBrace + 1, closeBrace - openBrace - 1));
+        int localDepth = 1;
+        for (const std::string& bodyLine : bodyLines) {
+            const std::string stripped = trim(bodyLine);
+            if (localDepth == 1 && looksLikeMemberDeclaration(stripped)) {
+                std::string type;
+                std::string name;
+                if (parseDeclaration(stripped, type, name)) {
+                    table.symbols_.push_back(SymbolInfo{
+                        name,
+                        type,
+                        functionName,
+                        SymbolScopeKind::FunctionLocal,
+                        false,
+                    });
+                }
+            }
+            localDepth += braceDelta(bodyLine);
+        }
+    }
+
     return table;
 }
 
@@ -168,11 +247,42 @@ std::vector<SymbolInfo> ScopeAwareSymbolTable::classMembers(const std::string& c
     return members;
 }
 
+std::vector<SymbolInfo> ScopeAwareSymbolTable::functionLocals(const std::string& functionName) const
+{
+    std::vector<SymbolInfo> locals;
+    for (const SymbolInfo& symbol : symbols_) {
+        if (symbol.scopeKind == SymbolScopeKind::FunctionLocal && symbol.ownerName == functionName) {
+            locals.push_back(symbol);
+        }
+    }
+    return locals;
+}
+
+std::vector<SymbolInfo> ScopeAwareSymbolTable::visibleSymbols(const std::string& ownerName) const
+{
+    std::vector<SymbolInfo> visible;
+    for (const SymbolInfo& symbol : symbols_) {
+        if (symbol.scopeKind == SymbolScopeKind::Global || symbol.ownerName == ownerName) {
+            visible.push_back(symbol);
+        }
+    }
+    return visible;
+}
+
 bool ScopeAwareSymbolTable::hasClassMember(const std::string& className, const std::string& symbolName) const
 {
     return std::any_of(symbols_.begin(), symbols_.end(), [&className, &symbolName](const SymbolInfo& symbol) {
         return symbol.scopeKind == SymbolScopeKind::ClassMember
             && symbol.ownerName == className
+            && symbol.name == symbolName;
+    });
+}
+
+bool ScopeAwareSymbolTable::hasFunctionLocal(const std::string& functionName, const std::string& symbolName) const
+{
+    return std::any_of(symbols_.begin(), symbols_.end(), [&functionName, &symbolName](const SymbolInfo& symbol) {
+        return symbol.scopeKind == SymbolScopeKind::FunctionLocal
+            && symbol.ownerName == functionName
             && symbol.name == symbolName;
     });
 }
