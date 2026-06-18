@@ -16,6 +16,7 @@ The project focuses on practical refactoring safety: transformations are conserv
 - Type-change tracking with cleanup and semantic validation passes.
 - Rule of Zero cleanup after safe ownership modernization.
 - Laptop-friendly tabbed UI with scrollable options and diagnostics.
+- Added new branch for the AST changes
 
 Supported modernization categories include:
 
