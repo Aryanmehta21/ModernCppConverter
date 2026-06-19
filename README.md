@@ -16,7 +16,6 @@ The project focuses on practical refactoring safety: transformations are conserv
 - Type-change tracking with cleanup and semantic validation passes.
 - Rule of Zero cleanup after safe ownership modernization.
 - Laptop-friendly tabbed UI with scrollable options and diagnostics.
-- Added new branch for the AST changes
 
 Supported modernization categories include:
 
@@ -194,8 +193,10 @@ ctest --test-dir build -C Debug --output-on-failure
 Run backend tests when working on the Python backend:
 
 ```sh
-pytest
+backend/.venv/bin/pytest backend/tests
 ```
+
+The v1.0 release regression plan lives in `docs/V1_REGRESSION_TEST_PLAN.md`. It documents the release gate for raw arrays, string modernization, ownership propagation, enum output, FILE I/O cleanup, loop/container modernization, GUI worker lifecycle, and repository-mode smoke coverage.
 
 Major test areas include:
 
@@ -265,6 +266,15 @@ The build is modularized with folder-level CMake files:
 - Keep backend secrets in local environment files or deployment secrets.
 - The desktop app does not need API keys for offline mode.
 - Compile verification uses syntax-only compiler checks and does not execute converted code.
+
+## Known Limitations
+
+- The converter is rule-based and intentionally conservative; uncertain transformations are skipped with diagnostics.
+- Full Clang AST integration is not part of v1.0.
+- Complex template metaprogramming, SFINAE-heavy code, and advanced macro systems may need manual review.
+- Complex or binary `FILE*` usage is suggestion-only unless the text I/O pattern is simple and safe.
+- Repository mode works file by file and does not replace a full project-aware refactoring tool with complete build graph knowledge.
+- Compile verification is syntax-only. Converted programs are never executed by the app.
 
 ## Roadmap
 

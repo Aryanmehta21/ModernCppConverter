@@ -41,6 +41,20 @@ add_test(NAME FunctionalModernizationTests COMMAND Phase4EnterpriseTests functio
 add_test(NAME FunctorToLambdaSpecificTests COMMAND Phase4EnterpriseTests functor-specific)
 add_test(NAME RepositoryModeTests COMMAND Phase4EnterpriseTests repository)
 
+add_executable(V1RegressionTests
+    V1RegressionTests.cpp
+)
+modern_cpp_converter_use_root_output(V1RegressionTests)
+
+target_link_libraries(V1RegressionTests
+    PRIVATE
+        ModernCppConverterCore
+        ModernCppConverterWarnings
+        Qt6::Network
+)
+
+add_test(NAME V1RegressionTests COMMAND V1RegressionTests)
+
 add_executable(GuiConversionSmokeTests
     GuiConversionSmokeTests.cpp
 )

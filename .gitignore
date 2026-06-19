@@ -1,5 +1,6 @@
 # Build output
 build/
+build-*/
 out/
 cmake-build-*/
 
@@ -43,6 +44,12 @@ __pycache__/
 *.log
 logs/
 backend/logs/
+
+# Modernization/repository-mode generated output
+*.legacy_backup
+modernization_report.txt
+modernization_report.json
+converted.cpp
 
 # Private developer notes
 /private_docs/
