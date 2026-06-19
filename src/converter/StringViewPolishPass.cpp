@@ -51,9 +51,18 @@ void addChange(std::vector<ConversionChange>& changes,
 bool bodyStoresOrEscapesParameter(const std::string& body, const std::string& parameter)
 {
     const std::string escaped = escapeRegex(parameter);
-    return std::regex_search(body, std::regex(R"(\breturn\s+)" + escaped + R"(\b)"))
+    return std::regex_search(body, std::regex(R"(\breturn\s+)" + escaped + R"(\b(?!\s*(?:\.|->)))"))
         || std::regex_search(body, std::regex(R"(\b[A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*)*\s*=\s*)" + escaped + R"(\b)"))
         || std::regex_search(body, std::regex(R"(\b(?:push_back|emplace_back|insert|assign)\s*\([^;\n]*\b)" + escaped + R"(\b)"));
+}
+
+bool bodyRequiresNullTerminatedString(const std::string& body, const std::string& parameter)
+{
+    const std::string escaped = escapeRegex(parameter);
+    return std::regex_search(body, std::regex(R"(\b)" + escaped + R"(\s*\.\s*c_str\s*\()"))
+        || std::regex_search(body, std::regex(R"(\b(?:std::)?(?:fopen|system)\s*\(\s*)" + escaped + R"(\b)"))
+        || std::regex_search(body, std::regex(R"(\b(?:std::)?(?:strcpy|strncpy|strcat|strcmp)\s*\([^;\n]*\b)" + escaped + R"(\b)"))
+        || std::regex_search(body, std::regex(R"(\b(?:std::)?(?:printf|fprintf|sprintf|snprintf)\s*\(\s*"[^"\n]*%s[^"\n]*"[^;\n]*\b)" + escaped + R"(\b)"));
 }
 } // namespace
 
@@ -78,12 +87,14 @@ std::string StringViewPolishPass::rewrite(const std::string& code,
         const std::string parameterName = match[2].str();
         const std::string body = match[4].str();
         const std::string before = match[0].str();
-        if (bodyStoresOrEscapesParameter(body, parameterName)) {
+        if (bodyStoresOrEscapesParameter(body, parameterName) || bodyRequiresNullTerminatedString(body, parameterName)) {
             addChange(changes,
                       "std::string_view polish",
                       trim(match[1].str() + "const std::string& " + parameterName),
                       {},
-                      "The string parameter appears to escape or be stored, so std::string_view conversion was left as a suggestion only.",
+                      bodyRequiresNullTerminatedString(body, parameterName)
+                          ? "The string parameter is used with a null-terminated C API, so std::string_view conversion was left as a suggestion only."
+                          : "The string parameter appears to escape or be stored, so std::string_view conversion was left as a suggestion only.",
                       false);
             consumed += static_cast<std::size_t>(match.position() + match.length());
             search = match.suffix().str();

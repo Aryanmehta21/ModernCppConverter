@@ -28,6 +28,40 @@ std::string currentTimestamp()
     return QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss").toStdString();
 }
 
+std::string modernizationLevelName(OfflineModernizationLevel level)
+{
+    switch (level) {
+    case OfflineModernizationLevel::Conservative:
+        return "Conservative";
+    case OfflineModernizationLevel::Balanced:
+        return "Balanced";
+    case OfflineModernizationLevel::AggressiveSafe:
+        return "Aggressive Safe";
+    case OfflineModernizationLevel::AiStyleAggressiveRewrite:
+        return "AI-Style Aggressive Rewrite";
+    }
+    return "Balanced";
+}
+
+std::string targetStandardName(CppStandard standard)
+{
+    return standard == CppStandard::Cpp17 ? "C++17" : "C++20";
+}
+
+std::string optionsDiagnostic(const ModernizationOptions& options)
+{
+    return "selected modernization options level=" + modernizationLevelName(options.offlineModernizationLevel)
+        + " target=" + targetStandardName(options.targetStandard)
+        + " compileVerification=" + (options.compileVerificationEnabled ? "enabled" : "profile-default")
+        + " auto=" + (options.useAuto ? "on" : "off")
+        + " lambdas=" + (options.useLambdas ? "on" : "off")
+        + " constexpr=" + (options.useConstexpr ? "on" : "off")
+        + " smartPointers=" + (options.useSmartPointers ? "on" : "off")
+        + " rangeFor=" + (options.useRangeBasedFor ? "on" : "off")
+        + " structuredBindings=" + (options.useStructuredBindings ? "on" : "off")
+        + " ownershipModernization=" + (options.applySafeOwnershipModernization ? "on" : "off");
+}
+
 void stampResult(ConversionResult& result,
                  ConversionMode source,
                  std::string backendStatus,
@@ -97,6 +131,8 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
         ConversionResult result = localEngine_->convert(code, options);
         const qint64 elapsed = timer.elapsed();
         qInfo() << "Offline pipeline finished; elapsed_ms =" << elapsed;
+        result.diagnosticMessages.push_back("selected mode: " + modeName(requestedMode).toStdString());
+        result.diagnosticMessages.push_back(optionsDiagnostic(options));
         result.diagnosticMessages.push_back("offline pipeline finished elapsed_ms=" + std::to_string(elapsed));
         stampResult(result, ConversionMode::OfflineRuleBased, "Not used");
         applyOfflineSourceLabel(result);
@@ -113,6 +149,8 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
         ConversionResult result = localEngine_->convert(code, options);
         const qint64 elapsed = timer.elapsed();
         qInfo() << "Offline fallback pipeline finished; elapsed_ms =" << elapsed;
+        result.diagnosticMessages.push_back("selected mode: " + modeName(requestedMode).toStdString());
+        result.diagnosticMessages.push_back(optionsDiagnostic(options));
         result.diagnosticMessages.push_back("offline fallback pipeline finished elapsed_ms=" + std::to_string(elapsed));
         stampResult(result,
                     ConversionMode::OfflineRuleBased,
@@ -147,6 +185,8 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
         }
         qWarning() << "Online conversion request failed; offline fallback will be used:" << QString::fromStdString(response.errorMessage);
         ConversionResult result = localEngine_->convert(code, options);
+        result.diagnosticMessages.push_back("selected mode: " + modeName(requestedMode).toStdString());
+        result.diagnosticMessages.push_back(optionsDiagnostic(options));
         stampResult(result,
                     ConversionMode::OfflineRuleBased,
                     "Request failed",
@@ -169,6 +209,8 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
     ConversionResult localResult = localEngine_->convert(code, options);
     const qint64 localElapsed = localTimer.elapsed();
     qInfo() << "Hybrid local offline pipeline finished; elapsed_ms =" << localElapsed;
+    localResult.diagnosticMessages.push_back("selected mode: " + modeName(requestedMode).toStdString());
+    localResult.diagnosticMessages.push_back(optionsDiagnostic(options));
     localResult.diagnosticMessages.push_back("hybrid local offline pipeline finished elapsed_ms=" + std::to_string(localElapsed));
     qInfo() << "Hybrid conversion request starts after local conversion";
     BackendConversionResponse response = backendClient_->convert(localResult.modernCode, options, requestedMode, &localResult);

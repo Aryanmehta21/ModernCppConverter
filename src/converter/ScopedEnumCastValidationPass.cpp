@@ -205,6 +205,18 @@ std::string repairMemberAccessCastPlacement(std::string line, bool& changed)
     repaired.append(line.substr(searchStart));
     return repaired;
 }
+
+std::string normalizeCaseLabelCasts(std::string line, bool& changed)
+{
+    static const std::regex caseCastPattern(
+        R"((\bcase\s+)static_cast<[^>\n]+>\(\s*([A-Za-z_]\w*\s*::\s*[A-Za-z_]\w*)\s*\)(\s*:))",
+        std::regex::ECMAScript);
+
+    const std::string before = line;
+    line = std::regex_replace(line, caseCastPattern, "$1$2$3");
+    changed = changed || line != before;
+    return line;
+}
 } // namespace
 
 std::string ScopedEnumCastValidationPass::validateAndNormalize(const std::string& code,
@@ -217,6 +229,7 @@ std::string ScopedEnumCastValidationPass::validateAndNormalize(const std::string
         std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
         const std::string before = codePart;
         codePart = repairMemberAccessCastPlacement(codePart, changed);
+        codePart = normalizeCaseLabelCasts(codePart, changed);
         codePart = normalizeNestedCasts(codePart, changed);
         if (codePart != before) {
             addAppliedChange(changes,
@@ -230,4 +243,3 @@ std::string ScopedEnumCastValidationPass::validateAndNormalize(const std::string
 
     return changed ? updated : code;
 }
-

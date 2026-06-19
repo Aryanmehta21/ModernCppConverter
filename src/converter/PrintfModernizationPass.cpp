@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -88,6 +89,53 @@ std::string joinLines(const std::vector<std::string>& lines)
         output << lines[index];
     }
     return output.str();
+}
+
+std::string escapeRegex(const std::string& text)
+{
+    std::string escaped;
+    escaped.reserve(text.size() * 2U);
+    for (const char character : text) {
+        if (std::string_view(R"(\.^$|()[]{}*+?)").find(character) != std::string_view::npos) {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(character);
+    }
+    return escaped;
+}
+
+std::string accessExpressionRegex(const std::string& symbolName)
+{
+    return R"((?:(?:this|[A-Za-z_]\w*)(?:\s*\[[^\]\n;]+\])?(?:(?:\.|->)(?:[A-Za-z_]\w*)(?:\s*\[[^\]\n;]+\])?)*(?:\.|->))?)"
+        + escapeRegex(symbolName)
+        + R"(\b)";
+}
+
+std::set<std::string> collectStringSymbols(const std::string& code)
+{
+    std::set<std::string> symbols;
+    const std::regex declarationPattern(R"(\b(?:const\s+)?std::string\s*(?:[&*]\s*)?([A-Za-z_]\w*)\b)");
+    for (std::sregex_iterator iterator(code.begin(), code.end(), declarationPattern), end; iterator != end; ++iterator) {
+        const std::string name = (*iterator)[1].str();
+        if (name != "operator") {
+            symbols.insert(name);
+        }
+    }
+    return symbols;
+}
+
+bool expressionIsKnownString(const std::string& expression, const std::set<std::string>& stringSymbols)
+{
+    const std::string normalized = trim(expression);
+    if (normalized.find(".c_str()") != std::string::npos) {
+        return false;
+    }
+    for (const std::string& symbol : stringSymbols) {
+        if (std::regex_match(normalized, std::regex(accessExpressionRegex(symbol)))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool containsPrintfFamily(const std::string& code)
@@ -303,6 +351,88 @@ std::string buildFormatExpression(const std::string& stream,
     return output.str();
 }
 
+bool simpleFormatStringNeedsCStringAt(const std::string& format, const std::size_t placeholderIndex)
+{
+    std::size_t currentPlaceholder = 0;
+    for (std::size_t index = 0; index < format.size(); ++index) {
+        if (format[index] != '%') {
+            continue;
+        }
+        if (index + 1 < format.size() && format[index + 1] == '%') {
+            ++index;
+            continue;
+        }
+
+        std::size_t specifierIndex = index + 1;
+        while (specifierIndex < format.size()
+               && std::string_view("-+ #0").find(format[specifierIndex]) != std::string_view::npos) {
+            ++specifierIndex;
+        }
+        while (specifierIndex < format.size()
+               && std::isdigit(static_cast<unsigned char>(format[specifierIndex])) != 0) {
+            ++specifierIndex;
+        }
+        if (specifierIndex < format.size() && format[specifierIndex] == '.') {
+            ++specifierIndex;
+            while (specifierIndex < format.size()
+                   && std::isdigit(static_cast<unsigned char>(format[specifierIndex])) != 0) {
+                ++specifierIndex;
+            }
+        }
+        if (specifierIndex + 1 < format.size()
+            && ((format[specifierIndex] == 'l' && format[specifierIndex + 1] == 'l')
+                || (format[specifierIndex] == 'h' && format[specifierIndex + 1] == 'h'))) {
+            specifierIndex += 2;
+        } else if (specifierIndex < format.size()
+                   && std::string_view("hlzt").find(format[specifierIndex]) != std::string_view::npos) {
+            ++specifierIndex;
+        }
+        if (specifierIndex >= format.size()) {
+            return false;
+        }
+
+        if (currentPlaceholder == placeholderIndex) {
+            return format[specifierIndex] == 's';
+        }
+        ++currentPlaceholder;
+        index = specifierIndex;
+    }
+    return false;
+}
+
+std::string rewritePreservedFileStringArgument(const std::string& line,
+                                               const std::set<std::string>& stringSymbols,
+                                               bool& changed)
+{
+    std::smatch match;
+    const std::regex fprintfPattern(R"re(^([ \t]*)((?:std::)?fprintf)\s*\(\s*([^,]+)\s*,\s*"((?:\\.|[^"\\])*)"\s*(?:,\s*(.*))?\)\s*;\s*$)re");
+    if (!std::regex_match(line, match, fprintfPattern)) {
+        return line;
+    }
+
+    std::vector<std::string> arguments = splitArguments(match[5].matched ? match[5].str() : std::string{});
+    bool lineChanged = false;
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        if (simpleFormatStringNeedsCStringAt(match[4].str(), index)
+            && expressionIsKnownString(arguments[index], stringSymbols)) {
+            arguments[index] = trim(arguments[index]) + ".c_str()";
+            lineChanged = true;
+        }
+    }
+    if (!lineChanged) {
+        return line;
+    }
+
+    std::ostringstream replacement;
+    replacement << match[1].str() << match[2].str() << "(" << trim(match[3].str()) << ", \"" << match[4].str() << "\"";
+    for (const std::string& argument : arguments) {
+        replacement << ", " << argument;
+    }
+    replacement << ");";
+    changed = true;
+    return replacement.str();
+}
+
 std::string rewriteOneCall(const std::string& indent,
                            const std::string& stream,
                            const std::string& format,
@@ -341,6 +471,7 @@ std::string PrintfModernizationPass::rewrite(const std::string& code,
     std::vector<std::string> lines = splitLines(code);
     bool changed = false;
     bool usedFormat = false;
+    const std::set<std::string> stringSymbols = collectStringSymbols(code);
     const std::regex printfPattern(R"re(^([ \t]*)(?:std::)?printf\s*\(\s*"((?:\\.|[^"\\])*)"\s*(?:,\s*(.*))?\)\s*;\s*$)re");
     const std::regex fprintfStandardPattern(R"re(^([ \t]*)(?:std::)?fprintf\s*\(\s*(stdout|stderr)\s*,\s*"((?:\\.|[^"\\])*)"\s*(?:,\s*(.*))?\)\s*;\s*$)re");
     const std::regex fprintfOtherPattern(R"re(^[ \t]*(?:std::)?fprintf\s*\(\s*([^,]+),)re");
@@ -371,6 +502,18 @@ std::string PrintfModernizationPass::rewrite(const std::string& code,
                                        reason);
         } else if (std::regex_search(line, match, fprintfOtherPattern)) {
             const std::string target = trim(match[1].str());
+            bool compatibilityChanged = false;
+            const std::string compatibilityRewrite = rewritePreservedFileStringArgument(line, stringSymbols, compatibilityChanged);
+            if (compatibilityChanged) {
+                addAppliedChange(changes,
+                                 "fprintf std::string argument compatibility",
+                                 trim(line),
+                                 trim(compatibilityRewrite),
+                                 "Added c_str() for std::string values passed to preserved FILE* %s formatting.");
+                line = compatibilityRewrite;
+                changed = true;
+                continue;
+            }
             addSuggestion(changes,
                           "printf-family output modernization suggestion",
                           trim(line),

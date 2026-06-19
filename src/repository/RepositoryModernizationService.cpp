@@ -5,6 +5,9 @@
 
 #include <QDateTime>
 
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -25,6 +28,29 @@ bool writeFile(const std::filesystem::path& path, const std::string& text)
     }
     output << text;
     return output.good();
+}
+
+std::string passSummaryMessage(const std::string& passName,
+                               const std::size_t appliedCount,
+                               const std::size_t skippedCount,
+                               const std::size_t warningCount,
+                               const std::size_t rollbackCount,
+                               const std::size_t rewrites,
+                               const long long elapsedMilliseconds,
+                               const bool modified)
+{
+    std::ostringstream output;
+    output << "PASS SUMMARY pass=\"" << passName << "\""
+           << " applied=" << appliedCount
+           << " skipped=" << skippedCount
+           << " warnings=" << warningCount
+           << " rollbacks=" << rollbackCount
+           << " visited=0"
+           << " modified=" << (modified ? 1 : 0)
+           << " rewrites=" << rewrites
+           << " time_ms=" << elapsedMilliseconds
+           << " status=completed";
+    return output.str();
 }
 } // namespace
 
@@ -75,14 +101,47 @@ RepositoryModernizationResult RepositoryModernizationService::modernizeRepositor
         }
 
         ConversionResult conversion = converterEngine_->convert(original, conversionOptions);
+        fileResult.diagnosticMessages = conversion.diagnosticMessages;
+
         const CrossScopeTypePropagationPass crossScopeTypePropagationPass;
         TransformationContext repositoryTransformationContext;
         const std::string fileAwareRepositoryContext = repositoryContextText + '\n' + original + '\n' + conversion.modernCode;
+        const std::string beforeRepositoryPropagation = conversion.modernCode;
+        const std::size_t changesBeforeRepositoryPropagation = conversion.changes.size();
+        const auto repositoryPropagationStarted = std::chrono::steady_clock::now();
         conversion.modernCode = crossScopeTypePropagationPass.rewrite(conversion.modernCode,
                                                                       conversionOptions,
                                                                       repositoryTransformationContext,
                                                                       fileAwareRepositoryContext,
                                                                       conversion.changes);
+        const auto repositoryPropagationFinished = std::chrono::steady_clock::now();
+        const auto repositoryPropagationElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            repositoryPropagationFinished - repositoryPropagationStarted).count();
+        const auto firstRepositoryChange = conversion.changes.begin() + static_cast<std::ptrdiff_t>(changesBeforeRepositoryPropagation);
+        const std::size_t appliedCount = static_cast<std::size_t>(std::count_if(firstRepositoryChange,
+                                                                                conversion.changes.end(),
+                                                                                [](const ConversionChange& change) {
+                                                                                    return change.applied;
+                                                                                }));
+        const std::size_t skippedCount = static_cast<std::size_t>(std::count_if(firstRepositoryChange,
+                                                                                conversion.changes.end(),
+                                                                                [](const ConversionChange& change) {
+                                                                                    return change.skipped;
+                                                                                }));
+        const std::size_t warningCount = static_cast<std::size_t>(std::count_if(firstRepositoryChange,
+                                                                                conversion.changes.end(),
+                                                                                [](const ConversionChange& change) {
+                                                                                    return !change.applied && !change.skipped;
+                                                                                }));
+        const bool repositoryPropagationModified = beforeRepositoryPropagation != conversion.modernCode;
+        fileResult.diagnosticMessages.push_back(passSummaryMessage("Repository CrossScopeTypePropagationPass",
+                                                                   appliedCount,
+                                                                   skippedCount,
+                                                                   warningCount,
+                                                                   0,
+                                                                   appliedCount + warningCount,
+                                                                   repositoryPropagationElapsed,
+                                                                   repositoryPropagationModified));
         fileResult.changes = conversion.changes;
 
         for (const ConversionChange& change : fileResult.changes) {
@@ -116,6 +175,10 @@ RepositoryModernizationResult RepositoryModernizationService::modernizeRepositor
 
         if (options.compileVerificationEnabled) {
             verificationService_.verifyFile(fileResult, conversion.modernCode);
+            fileResult.diagnosticMessages.push_back(
+                "SKIPPED RISK category=\"Repository\" pass=\"RepositoryVerificationService\" entity=\"build-context\" "
+                "reason=\"missing build context\" severity=Warning "
+                "suggested_action=\"Provide compile_commands.json or configure CMake build directory.\" code_unchanged=true");
             if (fileResult.compileVerificationEnabled && !fileResult.compileVerificationPassed) {
                 ++result.totalWarnings;
             }

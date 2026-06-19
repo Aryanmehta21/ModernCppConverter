@@ -52,6 +52,7 @@ target_sources(ModernCppConverterCore
         ${PROJECT_SOURCE_DIR}/src/converter/ScopedEnumCastValidationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ScopedEnumOutputPropagationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ScopedEnumOutputValidator.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/ScopedEnumUsagePropagationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SemanticConsistencyValidator.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SemanticModernizationValidator.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SemanticTypeValidationPass.cpp

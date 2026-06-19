@@ -7,9 +7,16 @@
 #include <regex>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace
 {
+void addAppliedChange(std::vector<ConversionChange>& changes,
+                      std::string ruleName,
+                      std::string before,
+                      std::string after,
+                      std::string reason);
+
 std::string trim(std::string value)
 {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -38,6 +45,182 @@ std::string accessExpressionRegex(const std::string& symbolName)
     return R"((?:(?:this|[A-Za-z_]\w*)(?:\s*\[[^\]\n;]+\])?(?:(?:\.|->)(?:[A-Za-z_]\w*)(?:\s*\[[^\]\n;]+\])?)*(?:\.|->))?)"
         + escapeRegex(symbolName)
         + R"(\b)";
+}
+
+std::size_t findMatchingCloseParen(const std::string& text, const std::size_t openParen)
+{
+    if (openParen >= text.size() || text[openParen] != '(') {
+        return std::string::npos;
+    }
+
+    int depth = 0;
+    bool inString = false;
+    bool inCharacter = false;
+    bool escaped = false;
+    for (std::size_t index = openParen; index < text.size(); ++index) {
+        const char character = text[index];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (character == '\\' && (inString || inCharacter)) {
+            escaped = true;
+            continue;
+        }
+        if (character == '"' && !inCharacter) {
+            inString = !inString;
+            continue;
+        }
+        if (character == '\'' && !inString) {
+            inCharacter = !inCharacter;
+            continue;
+        }
+        if (inString || inCharacter) {
+            continue;
+        }
+        if (character == '(') {
+            ++depth;
+        } else if (character == ')') {
+            --depth;
+            if (depth == 0) {
+                return index;
+            }
+        }
+    }
+    return std::string::npos;
+}
+
+std::vector<std::string> splitTopLevelArguments(const std::string& text)
+{
+    std::vector<std::string> arguments;
+    std::size_t start = 0;
+    int parenDepth = 0;
+    int bracketDepth = 0;
+    bool inString = false;
+    bool inCharacter = false;
+    bool escaped = false;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char character = text[index];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (character == '\\' && (inString || inCharacter)) {
+            escaped = true;
+            continue;
+        }
+        if (character == '"' && !inCharacter) {
+            inString = !inString;
+            continue;
+        }
+        if (character == '\'' && !inString) {
+            inCharacter = !inCharacter;
+            continue;
+        }
+        if (inString || inCharacter) {
+            continue;
+        }
+        if (character == '(' || character == '{') {
+            ++parenDepth;
+        } else if (character == ')' || character == '}') {
+            --parenDepth;
+        } else if (character == '[') {
+            ++bracketDepth;
+        } else if (character == ']') {
+            --bracketDepth;
+        } else if (character == ',' && parenDepth == 0 && bracketDepth == 0) {
+            arguments.push_back(trim(text.substr(start, index - start)));
+            start = index + 1;
+        }
+    }
+    arguments.push_back(trim(text.substr(start)));
+    return arguments;
+}
+
+std::string stripCStringAccessorForTarget(std::string expression, const std::string& targetExpression)
+{
+    expression = trim(std::move(expression));
+    const std::regex cstrPattern(R"(^(.+?)\s*\.\s*c_str\s*\(\s*\)\s*$)");
+    std::smatch match;
+    if (!std::regex_match(expression, match, cstrPattern)) {
+        return expression;
+    }
+    const std::string base = trim(match[1].str());
+    return std::regex_match(base, std::regex(targetExpression)) ? base : expression;
+}
+
+bool expressionMatchesTargetString(const std::string& expression, const std::string& targetExpression)
+{
+    const std::string normalized = stripCStringAccessorForTarget(expression, targetExpression);
+    return std::regex_match(normalized, std::regex(targetExpression));
+}
+
+std::string rewriteStringStrcmpComparisonsInLine(std::string line,
+                                                 const std::string& targetExpression,
+                                                 bool& changed,
+                                                 std::vector<ConversionChange>& changes)
+{
+    std::size_t searchPosition = 0;
+    while (searchPosition < line.size()) {
+        std::smatch match;
+        const std::string suffix = line.substr(searchPosition);
+        if (!std::regex_search(suffix, match, std::regex(R"((?:std::)?strcmp\s*\()"))) {
+            break;
+        }
+
+        const std::size_t namePosition = searchPosition + static_cast<std::size_t>(match.position());
+        const std::size_t openParen = namePosition + static_cast<std::size_t>(match.length()) - 1;
+        const std::size_t closeParen = findMatchingCloseParen(line, openParen);
+        if (closeParen == std::string::npos) {
+            break;
+        }
+
+        std::size_t operatorStart = closeParen + 1;
+        while (operatorStart < line.size() && std::isspace(static_cast<unsigned char>(line[operatorStart])) != 0) {
+            ++operatorStart;
+        }
+        std::string comparisonOperator;
+        if (line.compare(operatorStart, 2, "==") == 0) {
+            comparisonOperator = "==";
+        } else if (line.compare(operatorStart, 2, "!=") == 0) {
+            comparisonOperator = "!=";
+        } else {
+            searchPosition = closeParen + 1;
+            continue;
+        }
+
+        std::size_t zeroStart = operatorStart + 2;
+        while (zeroStart < line.size() && std::isspace(static_cast<unsigned char>(line[zeroStart])) != 0) {
+            ++zeroStart;
+        }
+        if (zeroStart >= line.size() || line[zeroStart] != '0') {
+            searchPosition = closeParen + 1;
+            continue;
+        }
+
+        const std::vector<std::string> arguments = splitTopLevelArguments(line.substr(openParen + 1, closeParen - openParen - 1));
+        if (arguments.size() != 2
+            || (!expressionMatchesTargetString(arguments[0], targetExpression)
+                && !expressionMatchesTargetString(arguments[1], targetExpression))) {
+            searchPosition = closeParen + 1;
+            continue;
+        }
+
+        const std::string left = stripCStringAccessorForTarget(arguments[0], targetExpression);
+        const std::string right = stripCStringAccessorForTarget(arguments[1], targetExpression);
+        const std::string replacement = left + " " + comparisonOperator + " " + right;
+        const std::size_t replaceEnd = zeroStart + 1;
+        const std::string before = line.substr(namePosition, replaceEnd - namePosition);
+        line.replace(namePosition, replaceEnd - namePosition, replacement);
+        addAppliedChange(changes,
+                         "Replace C-string comparison with string comparison",
+                         trim(before),
+                         trim(replacement),
+                         "Replaced strcmp on a converted std::string with ordinary string comparison.");
+        changed = true;
+        searchPosition = namePosition + replacement.size();
+    }
+    return line;
 }
 
 void addAppliedChange(std::vector<ConversionChange>& changes,
@@ -599,27 +782,7 @@ std::string DependentUsageRewritePass::rewriteStringUsages(const std::string& co
                 return trailingComment.empty() ? std::string{} : trailingComment;
             }
 
-            const std::string beforeComparisonRewrite = rewritten;
-            rewritten = std::regex_replace(rewritten,
-                                           std::regex("(?:std::)?strcmp\\s*\\(\\s*(" + targetExpression + ")\\s*,\\s*([^)]+?)\\s*\\)\\s*==\\s*0"),
-                                           "$1 == $2");
-            rewritten = std::regex_replace(rewritten,
-                                           std::regex("(?:std::)?strcmp\\s*\\(\\s*(" + targetExpression + ")\\s*,\\s*([^)]+?)\\s*\\)\\s*!=\\s*0"),
-                                           "$1 != $2");
-            rewritten = std::regex_replace(rewritten,
-                                           std::regex("(?:std::)?strcmp\\s*\\(\\s*([^,]+?)\\s*,\\s*(" + targetExpression + ")\\s*\\)\\s*==\\s*0"),
-                                           "$1 == $2");
-            rewritten = std::regex_replace(rewritten,
-                                           std::regex("(?:std::)?strcmp\\s*\\(\\s*([^,]+?)\\s*,\\s*(" + targetExpression + ")\\s*\\)\\s*!=\\s*0"),
-                                           "$1 != $2");
-            if (rewritten != beforeComparisonRewrite) {
-                addAppliedChange(changes,
-                                 "Replace C-string comparison with string comparison",
-                                 trim(beforeComparisonRewrite),
-                                 trim(rewritten),
-                                 "Replaced strcmp on a converted std::string with ordinary string comparison.");
-                changed = true;
-            }
+            rewritten = rewriteStringStrcmpComparisonsInLine(std::move(rewritten), targetExpression, changed, changes);
 
             const std::string beforeLengthRewrite = rewritten;
             rewritten = std::regex_replace(rewritten,

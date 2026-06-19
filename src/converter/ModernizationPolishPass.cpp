@@ -306,9 +306,9 @@ std::string modernizeMapIteratorLoops(std::string code,
     const std::string collectionExpression =
         R"((?:this|[A-Za-z_]\w*)(?:\s*\[[^\]\n;]+\])?(?:(?:\.|->)[A-Za-z_]\w*(?:\s*\[[^\]\n;]+\])?)*)";
     const std::regex iteratorLoop(
-        R"((^[ \t]*)for\s*\(\s*(?:auto|[A-Za-z_:][A-Za-z0-9_:<>,\s]*::(?:const_)?iterator)\s+([A-Za-z_]\w*)\s*=\s*()"
+        R"((^[ \t]*)for\s*\(\s*((?:auto|[A-Za-z_:][A-Za-z0-9_:<>,\s]*::(?:const_)?iterator))\s+([A-Za-z_]\w*)\s*=\s*()"
             + collectionExpression
-            + R"()\s*\.c?begin\(\)\s*;\s*\2\s*!=\s*\3\s*\.c?end\(\)\s*;\s*(?:\+\+\2|\2\+\+)\s*\)\s*\n\1\{\s*\n([\s\S]*?)\n\1\})",
+            + R"()\s*\.c?begin\(\)\s*;\s*\3\s*!=\s*\4\s*\.c?end\(\)\s*;\s*(?:\+\+\3|\3\+\+)\s*\)\s*\n\1\{\s*\n([\s\S]*?)\n\1\})",
         std::regex::ECMAScript | std::regex::multiline);
 
     std::smatch match;
@@ -409,17 +409,18 @@ std::string modernizeGenericIteratorLoops(std::string code,
     const std::string collectionExpression =
         R"((?:this|[A-Za-z_]\w*)(?:\s*\[[^\]\n;]+\])?(?:(?:\.|->)[A-Za-z_]\w*(?:\s*\[[^\]\n;]+\])?)*)";
     const std::regex iteratorLoop(
-        R"((^[ \t]*)for\s*\(\s*(?:auto|[A-Za-z_:][A-Za-z0-9_:<>,\s]*::(?:const_)?iterator)\s+([A-Za-z_]\w*)\s*=\s*()"
+        R"((^[ \t]*)for\s*\(\s*((?:auto|typename\s+[A-Za-z_:][A-Za-z0-9_:<>,\s]*::(?:const_)?iterator|[A-Za-z_:][A-Za-z0-9_:<>,\s]*::(?:const_)?iterator))\s+([A-Za-z_]\w*)\s*=\s*()"
             + collectionExpression
-            + R"()\s*\.c?begin\(\)\s*;\s*\2\s*!=\s*\3\s*\.c?end\(\)\s*;\s*(?:\+\+\2|\2\+\+)\s*\)\s*\n\1\{\s*\n([\s\S]*?)\n\1\})",
+            + R"()\s*\.c?begin\(\)\s*;\s*\3\s*!=\s*\4\s*\.c?end\(\)\s*;\s*(?:\+\+\3|\3\+\+)\s*\)\s*\n\1\{\s*\n([\s\S]*?)\n\1\})",
         std::regex::ECMAScript | std::regex::multiline);
 
     std::smatch match;
     std::string search = code;
     std::size_t consumed = 0;
     while (std::regex_search(search, match, iteratorLoop)) {
-        const std::string iteratorName = match[2].str();
-        std::string body = match[4].str();
+        const std::string iteratorTypeText = match[2].str();
+        const std::string iteratorName = match[3].str();
+        std::string body = match[5].str();
         if (body.find("erase(") != std::string::npos
             || body.find("insert(") != std::string::npos
             || body.find("++" + iteratorName) != std::string::npos
@@ -435,6 +436,21 @@ std::string modernizeGenericIteratorLoops(std::string code,
             continue;
         }
 
+        const std::regex directDerefStream(R"(<<\s*(?:\(\s*)?\*\s*)"
+                                           + escapeRegex(iteratorName)
+                                           + R"(\s*(?:\))?)",
+                                           std::regex::ECMAScript);
+        if (iteratorTypeText.find("typename") != std::string::npos
+            && std::regex_search(body, directDerefStream)) {
+            addSuggestion(changes,
+                          "Explicit iterator loop to range-based for",
+                          trim(match[0].str()),
+                          "Dependent iterator loop was preserved because it streams the element directly and the element type may be a non-streamable pair.");
+            consumed += static_cast<std::size_t>(match.position() + match.length());
+            search = match.suffix().str();
+            continue;
+        }
+
         const std::string dereferencePattern = R"(\*)" + escapeRegex(iteratorName) + R"(\b)";
         const std::string bodyWithoutDereference = std::regex_replace(body, std::regex(dereferencePattern), "");
         if (std::regex_search(bodyWithoutDereference, std::regex("\\b" + escapeRegex(iteratorName) + "\\b"))) {
@@ -444,11 +460,11 @@ std::string modernizeGenericIteratorLoops(std::string code,
         }
 
         const bool mutableElement = std::regex_search(body, std::regex(dereferencePattern + R"(\s*(?:=|\+=|-=|\*=|/=|%=))"));
-        const std::string elementName = variableNameForCollection(match[3].str());
+        const std::string elementName = variableNameForCollection(match[4].str());
         body = std::regex_replace(body, std::regex(dereferencePattern), elementName);
         body = std::regex_replace(body, std::regex(R"(std::endl)"), "'\\n'");
         const std::string replacement = match[1].str() + "for (" + (mutableElement ? "auto& " : "const auto& ")
-            + elementName + " : " + match[3].str() + ")\n"
+            + elementName + " : " + match[4].str() + ")\n"
             + match[1].str() + "{\n" + body + "\n" + match[1].str() + "}";
         code.replace(consumed + static_cast<std::size_t>(match.position()),
                      static_cast<std::size_t>(match.length()),

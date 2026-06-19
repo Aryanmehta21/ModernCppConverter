@@ -4,11 +4,14 @@
 #include "converter/OrphanedGrowthSymbolCleanupPass.h"
 #include "converter/OrphanedTempBufferLoopCleanupPass.h"
 #include "converter/OwnershipSanityScanner.h"
+#include "converter/RangeForModernizationPass.h"
 #include "converter/ScopeLeakValidationPass.h"
 #include "converter/ScopedEnumCastValidationPass.h"
 #include "converter/ScopedEnumOutputPropagationPass.h"
 #include "converter/ScopedEnumOutputValidator.h"
+#include "converter/ScopedEnumUsagePropagationPass.h"
 #include "converter/SemanticConsistencyValidator.h"
+#include "converter/SemanticTypeValidationPass.h"
 #include "converter/SmartPointerCollectionPropagationPass.h"
 #include "converter/SmartPointerTypePropagationPass.h"
 #include "converter/VectorParadigmRewritePass.h"
@@ -123,6 +126,63 @@ bool hasScopedEnumOutputDiagnostic(const std::string& compilerOutput)
         || loweredCompilerOutput.find("fmt::format") != std::string::npos
         || loweredCompilerOutput.find("cannot format") != std::string::npos;
 }
+
+bool hasScopedEnumUsageDiagnostic(const std::string& compilerOutput)
+{
+    const std::string loweredCompilerOutput = lowercase(compilerOutput);
+    return loweredCompilerOutput.find("use of undeclared identifier") != std::string::npos
+        || loweredCompilerOutput.find("was not declared in this scope") != std::string::npos
+        || loweredCompilerOutput.find("not declared in this scope") != std::string::npos
+        || loweredCompilerOutput.find("invalid case") != std::string::npos
+        || loweredCompilerOutput.find("case label") != std::string::npos;
+}
+
+bool hasStringCapiDiagnostic(const std::string& compilerOutput)
+{
+    const std::string loweredCompilerOutput = lowercase(compilerOutput);
+    return loweredCompilerOutput.find("strcpy") != std::string::npos
+        || loweredCompilerOutput.find("strncpy") != std::string::npos
+        || loweredCompilerOutput.find("strcat") != std::string::npos
+        || loweredCompilerOutput.find("strcmp") != std::string::npos
+        || loweredCompilerOutput.find("strlen") != std::string::npos
+        || loweredCompilerOutput.find("no matching function") != std::string::npos
+        || loweredCompilerOutput.find("no viable conversion") != std::string::npos
+        || loweredCompilerOutput.find("cannot convert") != std::string::npos
+        || loweredCompilerOutput.find("no member named 'c_str'") != std::string::npos
+        || loweredCompilerOutput.find("has no member named 'c_str'") != std::string::npos
+        || loweredCompilerOutput.find("no member named c_str") != std::string::npos
+        || loweredCompilerOutput.find("string_view") != std::string::npos
+        || loweredCompilerOutput.find("basic_string") != std::string::npos
+        || loweredCompilerOutput.find("std::string") != std::string::npos
+        || loweredCompilerOutput.find("invalid array subscript") != std::string::npos
+        || loweredCompilerOutput.find("subscripted value") != std::string::npos;
+}
+
+bool hasSmartPointerDiagnostic(const std::string& compilerOutput)
+{
+    const std::string loweredCompilerOutput = lowercase(compilerOutput);
+    return loweredCompilerOutput.find("unique_ptr") != std::string::npos
+        || loweredCompilerOutput.find("shared_ptr") != std::string::npos
+        || loweredCompilerOutput.find("std::unique_ptr") != std::string::npos
+        || loweredCompilerOutput.find("std::shared_ptr") != std::string::npos
+        || loweredCompilerOutput.find("deleted copy constructor") != std::string::npos
+        || loweredCompilerOutput.find("call to deleted constructor") != std::string::npos
+        || loweredCompilerOutput.find("use of deleted function") != std::string::npos
+        || loweredCompilerOutput.find("cannot convert") != std::string::npos
+        || loweredCompilerOutput.find("no viable conversion") != std::string::npos
+        || loweredCompilerOutput.find("no known conversion") != std::string::npos
+        || loweredCompilerOutput.find("could not convert") != std::string::npos;
+}
+
+bool hasPairStreamDiagnostic(const std::string& compilerOutput)
+{
+    const std::string loweredCompilerOutput = lowercase(compilerOutput);
+    return loweredCompilerOutput.find("std::pair") != std::string::npos
+        && (loweredCompilerOutput.find("operator<<") != std::string::npos
+            || loweredCompilerOutput.find("invalid operands") != std::string::npos
+            || loweredCompilerOutput.find("no match") != std::string::npos
+            || loweredCompilerOutput.find("no viable") != std::string::npos);
+}
 } // namespace
 
 std::string CompilerDiagnosticCleanupPass::run(const std::string& code,
@@ -130,8 +190,13 @@ std::string CompilerDiagnosticCleanupPass::run(const std::string& code,
                                                const std::string& compilerOutput,
                                                std::vector<ConversionChange>& changes) const
 {
-    const bool enumOutputDiagnostic = hasScopedEnumOutputDiagnostic(compilerOutput);
-    if ((!enumOutputDiagnostic && context.empty()) || (!enumOutputDiagnostic && !hasKnownDiagnostic(compilerOutput, context))) {
+    const bool enumOutputDiagnostic = hasScopedEnumOutputDiagnostic(compilerOutput)
+        || (code.find("enum class") != std::string::npos && hasScopedEnumUsageDiagnostic(compilerOutput));
+    const bool stringCapiDiagnostic = hasStringCapiDiagnostic(compilerOutput);
+    const bool smartPointerDiagnostic = hasSmartPointerDiagnostic(compilerOutput);
+    const bool pairStreamDiagnostic = hasPairStreamDiagnostic(compilerOutput);
+    if ((!enumOutputDiagnostic && !stringCapiDiagnostic && !smartPointerDiagnostic && !pairStreamDiagnostic && context.empty())
+        || (!enumOutputDiagnostic && !stringCapiDiagnostic && !smartPointerDiagnostic && !pairStreamDiagnostic && !hasKnownDiagnostic(compilerOutput, context))) {
         return code;
     }
 
@@ -161,10 +226,21 @@ std::string CompilerDiagnosticCleanupPass::run(const std::string& code,
     updated = semanticConsistencyValidator.validateAndRepair(updated, retryOptions, context, compilerOutput, changes);
     const ScopedEnumCastValidationPass scopedEnumCastValidationPass;
     updated = scopedEnumCastValidationPass.validateAndNormalize(updated, changes);
+    const ScopedEnumUsagePropagationPass scopedEnumUsagePropagationPass;
+    updated = scopedEnumUsagePropagationPass.rewrite(updated, changes);
     const ScopedEnumOutputPropagationPass scopedEnumOutputPropagationPass;
     updated = scopedEnumOutputPropagationPass.rewrite(updated, retryOptions, changes);
     const ScopedEnumOutputValidator scopedEnumOutputValidator;
     updated = scopedEnumOutputValidator.validateAndRepair(updated, retryOptions, changes);
+    if (stringCapiDiagnostic) {
+        const SemanticTypeValidationPass semanticTypeValidationPass;
+        updated = semanticTypeValidationPass.validateAndRepair(updated, retryOptions, changes);
+    }
+    if (pairStreamDiagnostic) {
+        retryOptions.useStructuredBindings = true;
+        const RangeForModernizationPass rangeForModernizationPass;
+        updated = rangeForModernizationPass.rewrite(updated, retryOptions, changes);
+    }
     updated = orphanedGrowthSymbolCleanupPass.rewrite(updated, context, compilerOutput, changes);
     updated = orphanedTempBufferLoopCleanupPass.rewrite(updated, context, compilerOutput, changes);
 

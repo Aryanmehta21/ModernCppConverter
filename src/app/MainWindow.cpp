@@ -33,6 +33,7 @@
 #include <QScreen>
 #include <QScrollArea>
 #include <QSplitter>
+#include <QStringList>
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QTimer>
@@ -1028,8 +1029,89 @@ QString MainWindow::formatChanges(const ConversionResult& result) const
     details += "\n\n";
 
     if (!result.diagnosticMessages.empty()) {
-        details += "Diagnostics\n";
-        details += "===========\n\n";
+        QStringList modeAndOptions;
+        QStringList passSummaries;
+        QStringList skippedPasses;
+        QStringList skippedRisks;
+        QStringList rollbacks;
+        QStringList warnings;
+        QStringList compileDiagnostics;
+        QStringList timings;
+        QStringList finalStatuses;
+        QStringList otherDiagnostics;
+
+        for (const std::string& message : result.diagnosticMessages) {
+            const QString diagnostic = QString::fromStdString(message);
+            const QString lowered = diagnostic.toLower();
+            if (diagnostic.startsWith("selected mode:", Qt::CaseInsensitive)
+                || diagnostic.startsWith("selected modernization options", Qt::CaseInsensitive)
+                || diagnostic.startsWith("MODERNIZATION PROFILE", Qt::CaseInsensitive)) {
+                modeAndOptions.push_back(diagnostic);
+            } else if (diagnostic.startsWith("PASS SUMMARY", Qt::CaseInsensitive)) {
+                passSummaries.push_back(diagnostic);
+            } else if (diagnostic.startsWith("SKIPPED RISK", Qt::CaseInsensitive)) {
+                skippedRisks.push_back(diagnostic);
+            } else if (diagnostic.startsWith("SKIPPED PASS", Qt::CaseInsensitive)) {
+                skippedPasses.push_back(diagnostic);
+            } else if (diagnostic.startsWith("ROLLBACK/REPAIR", Qt::CaseInsensitive)
+                       || lowered.contains("rollback")) {
+                rollbacks.push_back(diagnostic);
+            } else if (diagnostic.startsWith("COMPILE VERIFICATION", Qt::CaseInsensitive)) {
+                compileDiagnostics.push_back(diagnostic);
+            } else if (diagnostic.startsWith("FINAL RESULT", Qt::CaseInsensitive)) {
+                finalStatuses.push_back(diagnostic);
+            } else if (lowered.contains("warning")
+                       || lowered.contains("unsafe")
+                       || lowered.contains("risk")
+                       || lowered.contains("ambigu")
+                       || lowered.contains("scope leak")
+                       || lowered.contains("unsupported")
+                       || lowered.contains("timeout")
+                       || lowered.contains("cancel")) {
+                warnings.push_back(diagnostic);
+            } else {
+                otherDiagnostics.push_back(diagnostic);
+            }
+
+            if (diagnostic.contains("elapsed_ms=", Qt::CaseInsensitive)
+                || diagnostic.contains("time_ms=", Qt::CaseInsensitive)) {
+                timings.push_back(diagnostic);
+            }
+        }
+
+        auto appendListSection = [&details](const QString& title, const QStringList& lines) {
+            details += title;
+            details += "\n";
+            details += QString(title.size(), QChar('='));
+            details += "\n\n";
+            if (lines.empty()) {
+                details += "None.\n\n";
+                return;
+            }
+            for (const QString& line : lines) {
+                details += "- ";
+                details += line;
+                details += "\n";
+            }
+            details += "\n";
+        };
+
+        appendListSection("Selected Mode And Options", modeAndOptions);
+        appendListSection("Pass Execution Summary", passSummaries);
+        appendListSection("Skipped Passes", skippedPasses);
+        appendListSection("Skipped Risky Transformations", skippedRisks);
+        appendListSection("Rollback And Repair Details", rollbacks);
+        appendListSection("Warnings", warnings);
+        appendListSection("Compile Verification Diagnostics", compileDiagnostics);
+        appendListSection("Elapsed Time By Stage", timings);
+        appendListSection("Final Result Status", finalStatuses);
+
+        if (!otherDiagnostics.empty()) {
+            appendListSection("Other Diagnostics", otherDiagnostics);
+        }
+
+        details += "Raw Diagnostics\n";
+        details += "===============\n\n";
         for (const std::string& message : result.diagnosticMessages) {
             details += "- ";
             details += QString::fromStdString(message);

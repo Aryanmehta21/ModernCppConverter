@@ -1176,9 +1176,15 @@ public:
                 R"((^[ \t]*(?:[A-Za-z_:][A-Za-z0-9_:<>,\s*&]*\s+)+[A-Za-z_]\w*\s*\([^)]*?)const\s+std::string\s*&\s+([A-Za-z_]\w*)([^)]*\)\s*(?:const\s*)?\{([\s\S]*?)^\s*\}))",
                 std::regex::ECMAScript | std::regex::multiline);
             auto escapes = [](const std::string& body, const std::string& parameter) {
-                return std::regex_search(body, std::regex(R"(\breturn\s+)" + parameter + R"(\b)"))
+                return std::regex_search(body, std::regex(R"(\breturn\s+)" + parameter + R"(\b(?!\s*(?:\.|->)))"))
                     || std::regex_search(body, std::regex(R"(\b[A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*)*\s*=\s*)" + parameter + R"(\b)"))
                     || std::regex_search(body, std::regex(R"(\b(?:push_back|emplace_back|insert|assign)\s*\([^;\n]*\b)" + parameter + R"(\b)"));
+            };
+            auto requiresNullTerminatedString = [](const std::string& body, const std::string& parameter) {
+                return std::regex_search(body, std::regex(R"(\b)" + parameter + R"(\s*\.\s*c_str\s*\()"))
+                    || std::regex_search(body, std::regex(R"(\b(?:std::)?(?:fopen|system)\s*\(\s*)" + parameter + R"(\b)"))
+                    || std::regex_search(body, std::regex(R"(\b(?:std::)?(?:strcpy|strncpy|strcat|strcmp)\s*\([^;\n]*\b)" + parameter + R"(\b)"))
+                    || std::regex_search(body, std::regex(R"(\b(?:std::)?(?:printf|fprintf|sprintf|snprintf)\s*\(\s*"[^"\n]*%s[^"\n]*"[^;\n]*\b)" + parameter + R"(\b)"));
             };
 
             std::string updated = code;
@@ -1188,7 +1194,7 @@ public:
             bool changed = false;
             while (std::regex_search(search, match, safeFunctionPattern)) {
                 const std::string parameter = match[2].str();
-                if (escapes(match[4].str(), parameter)) {
+                if (escapes(match[4].str(), parameter) || requiresNullTerminatedString(match[4].str(), parameter)) {
                     consumed += static_cast<std::size_t>(match.position() + match.length());
                     search = match.suffix().str();
                     continue;

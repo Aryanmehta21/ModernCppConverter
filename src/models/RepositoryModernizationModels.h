@@ -28,6 +28,7 @@ struct FileModernizationResult
     bool compileVerificationPassed = false;
     std::string compilerUsed;
     std::string compilerOutput;
+    std::vector<std::string> diagnosticMessages;
 };
 
 struct RepositoryModernizationResult

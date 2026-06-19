@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -167,7 +168,41 @@ bool hasReallocForVariable(const std::string& code, const std::string& variable)
         || std::regex_search(code, std::regex(R"(\b)" + escaped + R"(\s*=\s*(?:\([^)]*\)\s*)?(?:std::)?realloc\s*\()"));
 }
 
-bool hasEscapingUse(const std::string& code, const std::string& variable)
+bool containsIdentifier(const std::string& text, const std::string& identifier)
+{
+    return std::regex_search(text, std::regex(R"(\b)" + escapeRegex(identifier) + R"(\b)"));
+}
+
+std::set<std::string> collectNonTrivialRecordTypes(const std::string& code)
+{
+    std::set<std::string> types;
+    const std::regex recordPattern(
+        R"(\b(?:struct|class)\s+([A-Za-z_]\w*)[^{;]*\{([\s\S]*?)\}\s*;)",
+        std::regex::ECMAScript);
+    for (std::sregex_iterator iterator(code.begin(), code.end(), recordPattern), end; iterator != end; ++iterator) {
+        const std::string body = (*iterator)[2].str();
+        if (body.find("std::string") != std::string::npos
+            || body.find("std::vector") != std::string::npos
+            || body.find("std::unique_ptr") != std::string::npos
+            || body.find("std::shared_ptr") != std::string::npos
+            || body.find("std::array") != std::string::npos) {
+            types.insert((*iterator)[1].str());
+        }
+    }
+    return types;
+}
+
+bool lineOnlyUsesIndexedElements(std::string line, const std::string& variable)
+{
+    const std::string escaped = escapeRegex(variable);
+    line = std::regex_replace(line,
+                              std::regex(R"(\b)" + escaped
+                                          + R"(\s*\[[^\]\n;]+\](?:\s*(?:\.|->)\s*[A-Za-z_]\w*(?:\s*\([^;\n]*?\))?)*)"),
+                              "");
+    return !containsIdentifier(line, variable);
+}
+
+bool hasEscapingUse(const std::string& code, const std::string& variable, const bool allowIndexedElementUse)
 {
     const std::string escaped = escapeRegex(variable);
     if (std::regex_search(code, std::regex(R"(\breturn\s+)" + escaped + R"(\s*;)"))) {
@@ -187,6 +222,9 @@ bool hasEscapingUse(const std::string& code, const std::string& variable)
             && function != "while"
             && function != "for"
             && function != "switch") {
+            if (allowIndexedElementUse && lineOnlyUsesIndexedElements((*it)[0].str(), variable)) {
+                continue;
+            }
             return true;
         }
     }
@@ -503,6 +541,7 @@ std::string MallocFreeModernizationPass::rewrite(const std::string& code,
     std::string updated = code;
     bool changed = false;
     const std::vector<ConversionCandidate> candidates = collectCandidates(code, changes);
+    const std::set<std::string> nonTrivialRecordTypes = collectNonTrivialRecordTypes(code);
 
     for (const ConversionCandidate& candidate : candidates) {
         const std::regex convertedDeclarationPattern(
@@ -526,11 +565,15 @@ std::string MallocFreeModernizationPass::rewrite(const std::string& code,
                           "realloc changes allocation identity and capacity semantics, so this malloc ownership was preserved for manual review.");
             continue;
         }
-        if (hasEscapingUse(beforeCandidate, candidate.variable)) {
+        const bool nonTrivialArrayOwner = candidate.kind == ConversionCandidate::Kind::DynamicArray
+            && nonTrivialRecordTypes.find(candidate.elementType) != nonTrivialRecordTypes.end();
+        if (hasEscapingUse(beforeCandidate, candidate.variable, nonTrivialArrayOwner)) {
             addSuggestion(changes,
                           "malloc/free ownership modernization",
                           candidate.variable,
-                          "The malloc-owned pointer appears to escape or is passed to an unknown API, so the converter preserved C allocation ownership.");
+                          nonTrivialArrayOwner
+                              ? "The malloc-owned non-trivial array appears to escape as a raw pointer, so the converter preserved it for manual review."
+                              : "The malloc-owned pointer appears to escape or is passed to an unknown API, so the converter preserved C allocation ownership.");
             continue;
         }
 

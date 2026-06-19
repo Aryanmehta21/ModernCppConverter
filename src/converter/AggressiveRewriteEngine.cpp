@@ -863,7 +863,7 @@ std::string AggressiveRewriteEngine::rewriteAliasedPointerOwnership(const std::s
     bool warned = false;
 
     static const std::regex allocationPattern(
-        R"(^([ \t]*)([A-Za-z_:][A-Za-z0-9_:]*(?:\s*<[^;\n{}]+>)?)\s*\*\s*([A-Za-z_]\w*)\s*=\s*new\s+\2\s*(?:\((.*)\))?\s*;\s*$)");
+        R"(^([ \t]*)([A-Za-z_:][A-Za-z0-9_:]*(?:\s*<[^;\n{}]+>)?)\s*\*\s*([A-Za-z_]\w*)\s*=\s*new\s+([A-Za-z_:][A-Za-z0-9_:]*(?:\s*<[^;\n{}]+>)?)\s*(?:\((.*)\))?\s*;\s*$)");
 
     for (std::size_t allocationIndex = 0; allocationIndex < lines.size(); ++allocationIndex) {
         std::smatch allocationMatch;
@@ -874,7 +874,8 @@ std::string AggressiveRewriteEngine::rewriteAliasedPointerOwnership(const std::s
         const std::string indent = allocationMatch[1].str();
         const std::string type = trim(allocationMatch[2].str());
         const std::string owner = allocationMatch[3].str();
-        const std::string arguments = trim(allocationMatch[4].matched ? allocationMatch[4].str() : "");
+        const std::string allocatedType = trim(allocationMatch[4].str());
+        const std::string arguments = trim(allocationMatch[5].matched ? allocationMatch[5].str() : "");
         const std::string escapedType = escapeRegex(type);
         const std::string escapedOwner = escapeRegex(owner);
         const std::regex aliasPattern(R"(^[ \t]*)" + escapedType + R"(\s*\*\s*([A-Za-z_]\w*)\s*=\s*)" + escapedOwner + R"(\s*;\s*$)");
@@ -882,45 +883,60 @@ std::string AggressiveRewriteEngine::rewriteAliasedPointerOwnership(const std::s
         const std::regex ownerReturnPattern("\\breturn\\s+" + escapedOwner + R"(\s*;)");
         const std::regex ownerReassignmentPattern("\\b" + escapedOwner + R"(\s*=\s*[^;]+;)");
 
-        std::size_t aliasIndex = lines.size();
-        std::string alias;
+        std::vector<std::pair<std::size_t, std::string>> aliases;
         for (std::size_t index = allocationIndex + 1; index < lines.size(); ++index) {
             std::smatch aliasMatch;
             if (std::regex_match(lines[index], aliasMatch, aliasPattern)) {
-                aliasIndex = index;
-                alias = aliasMatch[1].str();
-                break;
+                aliases.emplace_back(index, aliasMatch[1].str());
+                continue;
             }
             if (std::regex_search(lines[index], deleteOwnerPattern)) {
                 break;
             }
         }
-        if (aliasIndex == lines.size()) {
+        if (aliases.empty()) {
             continue;
         }
 
-        const std::string escapedAlias = escapeRegex(alias);
-        const std::regex deleteAliasPattern(R"(^[ \t]*delete\s+)" + escapedAlias + R"(\s*;\s*$)");
-        const std::regex aliasReturnPattern("\\breturn\\s+" + escapedAlias + R"(\s*;)");
-        const std::regex aliasReassignmentPattern("\\b" + escapedAlias + R"(\s*=\s*[^;]+;)");
+        std::vector<std::regex> deleteAliasPatterns;
+        std::vector<std::regex> aliasReturnPatterns;
+        std::vector<std::regex> aliasReassignmentPatterns;
+        for (const auto& [index, alias] : aliases) {
+            (void)index;
+            const std::string escapedAlias = escapeRegex(alias);
+            deleteAliasPatterns.emplace_back(R"(^[ \t]*delete\s+)" + escapedAlias + R"(\s*;\s*$)");
+            aliasReturnPatterns.emplace_back("\\breturn\\s+" + escapedAlias + R"(\s*;)");
+            aliasReassignmentPatterns.emplace_back("\\b" + escapedAlias + R"(\s*=\s*[^;]+;)");
+        }
         const std::regex externalAliasPattern(R"(=\s*)" + escapedOwner + R"(\s*;)");
 
         std::size_t deleteIndex = lines.size();
         bool ambiguous = false;
-        for (std::size_t index = aliasIndex + 1; index < lines.size(); ++index) {
-            if (std::regex_search(lines[index], ownerReturnPattern) || std::regex_search(lines[index], aliasReturnPattern)) {
+        for (std::size_t index = allocationIndex + 1; index < lines.size(); ++index) {
+            const bool isAliasDeclaration = std::regex_match(lines[index], aliasPattern);
+            if (std::regex_search(lines[index], ownerReturnPattern)) {
                 ambiguous = true;
             }
-            if (std::regex_search(lines[index], deleteAliasPattern)) {
+            for (const std::regex& aliasReturnPattern : aliasReturnPatterns) {
+                if (std::regex_search(lines[index], aliasReturnPattern)) {
+                    ambiguous = true;
+                }
+            }
+            for (const std::regex& deleteAliasPattern : deleteAliasPatterns) {
+                if (std::regex_search(lines[index], deleteAliasPattern)) {
+                    ambiguous = true;
+                }
+            }
+            for (const std::regex& aliasReassignmentPattern : aliasReassignmentPatterns) {
+                if (!isAliasDeclaration && std::regex_search(lines[index], aliasReassignmentPattern)) {
+                    ambiguous = true;
+                }
+            }
+            if (std::regex_search(lines[index], ownerReassignmentPattern)) {
                 ambiguous = true;
             }
             if (std::regex_search(lines[index], externalAliasPattern)
-                && index != aliasIndex
                 && !std::regex_match(lines[index], aliasPattern)) {
-                ambiguous = true;
-            }
-            if (std::regex_search(lines[index], ownerReassignmentPattern)
-                || std::regex_search(lines[index], aliasReassignmentPattern)) {
                 ambiguous = true;
             }
             if (std::regex_match(lines[index], deleteOwnerPattern)) {
@@ -931,30 +947,52 @@ std::string AggressiveRewriteEngine::rewriteAliasedPointerOwnership(const std::s
 
         if (deleteIndex == lines.size() || ambiguous) {
             if (!warned) {
+                std::string aliasSummary;
+                for (const auto& [index, alias] : aliases) {
+                    (void)alias;
+                    aliasSummary += lines[index] + "\n";
+                }
                 addSuggestion(changes,
                               "Dangling pointer risk detected",
-                              trim(lines[allocationIndex] + "\n" + lines[aliasIndex]),
+                              trim(lines[allocationIndex] + "\n" + aliasSummary),
                               "Potential aliasing/dangling pointer risk detected. Manual ownership review required.");
                 warned = true;
             }
             continue;
         }
 
-        const std::string allocationReplacement = indent + "auto " + owner + " = std::make_shared<" + type + ">(" + arguments + ");";
-        const std::string aliasReplacement = indent + "auto " + alias + " = " + owner + ";";
+        auto compactType = [](std::string value) {
+            value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char character) {
+                            return std::isspace(character) != 0;
+                        }),
+                        value.end());
+            return value;
+        };
+        const bool allocatedAsDeclaredType = compactType(type) == compactType(allocatedType);
+        const std::string allocationReplacement = allocatedAsDeclaredType
+            ? indent + "auto " + owner + " = std::make_unique<" + type + ">(" + arguments + ");"
+            : indent + "std::unique_ptr<" + type + "> " + owner + " = std::make_unique<" + allocatedType + ">(" + arguments + ");";
+        std::string beforeAliases;
+        std::string afterAliases;
+        for (const auto& [index, alias] : aliases) {
+            beforeAliases += lines[index] + "\n";
+            afterAliases += indent + type + "* " + alias + " = " + owner + ".get();\n";
+        }
         addAppliedChange(changes,
-                         "Aliased raw pointer ownership to std::shared_ptr",
-                         trim(lines[allocationIndex] + "\n" + lines[aliasIndex]),
-                         trim(allocationReplacement + "\n" + aliasReplacement),
-                         "Multiple pointer variables clearly share the same allocation lifetime, so std::shared_ptr preserves shared ownership safely.");
+                         "Owning raw pointer with non-owning observer to std::unique_ptr",
+                         trim(lines[allocationIndex] + "\n" + beforeAliases),
+                         trim(allocationReplacement + "\n" + afterAliases),
+                         "Classified the allocated pointer as the owner and preserved the raw alias as a non-owning observer with get().");
         lines[allocationIndex] = allocationReplacement;
-        lines[aliasIndex] = aliasReplacement;
+        for (const auto& [index, alias] : aliases) {
+            lines[index] = indent + type + "* " + alias + " = " + owner + ".get();";
+        }
 
         addAppliedChange(changes,
                          "Remove redundant manual delete",
                          trim(lines[deleteIndex]),
                          "removed",
-                         "Manual delete is no longer needed because std::shared_ptr releases the allocation automatically.");
+                         "Manual delete is no longer needed because std::unique_ptr releases the allocation automatically.");
         lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(deleteIndex));
         changed = true;
         break;

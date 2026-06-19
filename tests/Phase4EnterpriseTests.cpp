@@ -2,6 +2,7 @@
 #include "converter/ScopedEnumCastValidationPass.h"
 #include "converter/ScopedEnumOutputPropagationPass.h"
 #include "converter/ScopedEnumOutputValidator.h"
+#include "converter/ScopedEnumUsagePropagationPass.h"
 #include "repository/RepositoryModernizationService.h"
 
 #include <algorithm>
@@ -832,6 +833,90 @@ void runScopedEnumOutputTests()
             "invalid member-access static_cast placement should be reconstructed around the complete expression");
     require(!contains(repairedMisplacedCast, "->static_cast") && !contains(repairedMisplacedCast, ".static_cast"),
             "member-access static_cast syntax should not remain after validation");
+
+    const ScopedEnumUsagePropagationPass usagePropagationPass;
+    std::vector<ConversionChange> usageChanges;
+    const std::string partiallyScopedInput =
+        "#include <iostream>\n"
+        "enum class State { Ready, Busy, Failed };\n"
+        "State choose()\n"
+        "{\n"
+        "    return Ready;\n"
+        "}\n"
+        "void accept(State) {}\n"
+        "struct Holder\n"
+        "{\n"
+        "    State state;\n"
+        "    Holder() : state(Ready) {}\n"
+        "};\n"
+        "void run(State state)\n"
+        "{\n"
+        "    State local = Ready;\n"
+        "    Holder holder{Busy};\n"
+        "    accept(Failed);\n"
+        "    if (local == Ready || holder.state != Busy) {}\n"
+        "    switch (state)\n"
+        "    {\n"
+        "    case Ready: break;\n"
+        "    case Busy: std::cout << Busy << '\\n'; break;\n"
+        "    default: break;\n"
+        "    }\n"
+        "}\n";
+    const std::string usageScoped = usagePropagationPass.rewrite(partiallyScopedInput, usageChanges);
+    require(contains(usageScoped, "return State::Ready;"), "enum class return statements should use scoped labels");
+    require(contains(usageScoped, "State local = State::Ready;"), "enum class assignments should use scoped labels");
+    require(contains(usageScoped, "Holder() : state(State::Ready)"), "constructor initializer lists should use scoped labels");
+    require(contains(usageScoped, "Holder holder{State::Busy};"), "brace initialization should use scoped labels");
+    require(contains(usageScoped, "accept(State::Failed);"), "function-call enum arguments should use scoped labels");
+    require(contains(usageScoped, "local == State::Ready"), "comparisons should use scoped labels");
+    require(contains(usageScoped, "holder.state != State::Busy"), "member comparisons should use scoped labels");
+    require(contains(usageScoped, "case State::Ready: break;"), "switch case labels should use scoped enum labels");
+    require(contains(usageScoped, "case State::Busy: std::cout << State::Busy << '\\n'; break;"),
+            "same-line case bodies should keep scoped labels before output propagation");
+    require(!contains(usageScoped, "case static_cast"), "usage propagation must not create numeric case labels");
+    require(!contains(usageScoped, "State::State::"), "usage propagation must not double-scope labels");
+
+    const std::string usageOutputRepaired = outputValidator.validateAndRepair(usageScoped, options, usageChanges);
+    require(contains(usageOutputRepaired, "case State::Busy: std::cout << static_cast<std::underlying_type_t<State>>(State::Busy) << '\\n'; break;"),
+            "output validator should cast streamed enum case body values without casting the case label");
+    require(!contains(usageOutputRepaired, "case static_cast"), "case labels should not be cast by output propagation");
+    require(!contains(usageOutputRepaired, "->static_cast") && !contains(usageOutputRepaired, ".static_cast"),
+            "usage and output propagation should not create invalid member-access casts");
+
+    const ConversionResult propagationResult = converter.convert(
+        "#include <iostream>\n"
+        "enum Result { Ok, Error };\n"
+        "Result next()\n"
+        "{\n"
+        "    return Ok;\n"
+        "}\n"
+        "void accept(Result) {}\n"
+        "void run(Result result)\n"
+        "{\n"
+        "    Result current = Ok;\n"
+        "    accept(Error);\n"
+        "    if (current == Ok) { accept(current); }\n"
+        "    switch (result)\n"
+        "    {\n"
+        "    case Ok: std::cout << Ok << '\\n'; break;\n"
+        "    case Error: break;\n"
+        "    }\n"
+        "    std::cout << next() << '\\n';\n"
+        "}\n",
+        enterpriseOptions());
+    require(contains(propagationResult.modernCode, "enum class Result"), "legacy enum should become enum class");
+    require(contains(propagationResult.modernCode, "return Result::Ok;"), "converted enum return should be scoped");
+    require(contains(propagationResult.modernCode, "Result current = Result::Ok;"), "converted enum assignment should be scoped");
+    require(contains(propagationResult.modernCode, "accept(Result::Error);"), "converted enum call argument should be scoped");
+    require(contains(propagationResult.modernCode, "current == Result::Ok"),
+            "converted enum comparison should be scoped\nOutput:\n" + propagationResult.modernCode);
+    require(contains(propagationResult.modernCode, "case Result::Ok: std::cout << static_cast<std::underlying_type_t<Result>>(Result::Ok) << '\\n'; break;"),
+            "converted enum switch case label should be scoped and streamed value should be cast");
+    require(contains(propagationResult.modernCode, "std::cout << static_cast<std::underlying_type_t<Result>>(next()) << '\\n';"),
+            "function returning enum class should be cast for stream output");
+    require(!contains(propagationResult.modernCode, "Result::Result::"), "enum usage propagation should be idempotent in full pipeline");
+    require(!contains(propagationResult.modernCode, "case static_cast"), "full pipeline should never cast enum case labels");
+    requireCompilePassIfCompilerAvailable(propagationResult, "scoped enum downstream propagation should compile");
 }
 
 void runFinalPolishTests()
@@ -953,6 +1038,57 @@ void runFinalPolishTests()
     require(contains(stringViewResult.modernCode, "void show(std::string_view name)"),
             "safe read-only string parameter should become string_view when enabled");
     requireCompilePassIfCompilerAvailable(stringViewResult, "string_view polish should compile");
+
+    const ConversionResult stringViewLengthResult = converter.convert(
+        "#include <cstddef>\n"
+        "#include <string>\n"
+        "std::size_t measure(const std::string& name)\n"
+        "{\n"
+        "    return name.length();\n"
+        "}\n",
+        stringViewOptions);
+
+    require(contains(stringViewLengthResult.modernCode, "std::size_t measure(std::string_view name)"),
+            "safe read-only string length parameter should become string_view\nOutput:\n" + stringViewLengthResult.modernCode);
+    require(contains(stringViewLengthResult.modernCode, "return name.size();"),
+            "string_view length() usage should normalize to size()\nOutput:\n" + stringViewLengthResult.modernCode);
+    require(!contains(stringViewLengthResult.modernCode, "name.length()"),
+            "stale string length() should not remain after string_view conversion");
+    requireCompilePassIfCompilerAvailable(stringViewLengthResult, "string_view length cleanup should compile");
+
+    const ConversionResult stringViewCStringBlockedResult = converter.convert(
+        "#include <cstdio>\n"
+        "#include <string>\n"
+        "FILE* openPath(const std::string& path)\n"
+        "{\n"
+        "    return std::fopen(path.c_str(), \"r\");\n"
+        "}\n",
+        stringViewOptions);
+
+    require(contains(stringViewCStringBlockedResult.modernCode, "const std::string& path"),
+            "null-terminated C API usage should block automatic string_view conversion\nOutput:\n" + stringViewCStringBlockedResult.modernCode);
+    require(!contains(stringViewCStringBlockedResult.modernCode, "std::string_view path"),
+            "path requiring c_str should not become string_view");
+    requireCompilePassIfCompilerAvailable(stringViewCStringBlockedResult, "C-string API string_view block should compile");
+
+    const ConversionResult existingStringViewArtifactResult = converter.convert(
+        "#include <cstring>\n"
+        "#include <string_view>\n"
+        "void legacy(const char* text);\n"
+        "std::size_t send(std::string_view text)\n"
+        "{\n"
+        "    legacy(text);\n"
+        "    return std::strlen(text);\n"
+        "}\n",
+        stringViewOptions);
+
+    require(contains(existingStringViewArtifactResult.modernCode, "legacy(std::string(text).c_str());"),
+            "string_view passed to visible const char* sink should use a temporary null-terminated string\nOutput:\n" + existingStringViewArtifactResult.modernCode);
+    require(contains(existingStringViewArtifactResult.modernCode, "return text.size();"),
+            "strlen on string_view should become size()");
+    require(!contains(existingStringViewArtifactResult.modernCode, "std::strlen(text)"),
+            "invalid strlen(string_view) should not remain");
+    requireCompilePassIfCompilerAvailable(existingStringViewArtifactResult, "existing string_view artifact cleanup should compile");
 
     const ConversionResult unsafeStringViewResult = converter.convert(
         "#include <string>\n"
@@ -2051,6 +2187,22 @@ void runFunctionalModernizationTests()
             "mutable iterator loop should become auto& range-for\nOutput:\n" + mutableIteratorResult.modernCode);
     requireCompilePassIfCompilerAvailable(mutableIteratorResult, "mutable iterator range-for should compile");
 
+    const ConversionResult readOnlyMutableIteratorResult = converter.convert(
+        "#include <vector>\n"
+        "int sumMutableContainer(std::vector<int>& values)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (std::vector<int>::iterator it = values.begin(); it != values.end(); ++it)\n"
+        "    {\n"
+        "        total += *it;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n",
+        options);
+    require(contains(readOnlyMutableIteratorResult.modernCode, "for (const auto& value : values)"),
+            "read-only iterator loop should use const auto& even when the source container is mutable\nOutput:\n" + readOnlyMutableIteratorResult.modernCode);
+    requireCompilePassIfCompilerAvailable(readOnlyMutableIteratorResult, "read-only mutable-container iterator loop should compile");
+
     const ConversionResult typenameIteratorResult = converter.convert(
         "#include <vector>\n"
         "template <typename Container>\n"
@@ -2134,6 +2286,34 @@ void runFunctionalModernizationTests()
             "index loop that only selects current element should become range-for");
     requireCompilePassIfCompilerAvailable(indexResult, "index range-for should compile");
 
+    const ConversionResult shadowAvoidanceResult = converter.convert(
+        "#include <vector>\n"
+        "int sumData(const std::vector<int>& data)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (std::vector<int>::const_iterator it = data.begin(); it != data.end(); ++it)\n"
+        "    {\n"
+        "        total += *it;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n"
+        "int sumDataByIndex(const std::vector<int>& data)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (std::size_t index = 0; index < data.size(); ++index)\n"
+        "    {\n"
+        "        total += data[index];\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n",
+        options);
+    require(!contains(shadowAvoidanceResult.modernCode, "for (const auto& data : data)"),
+            "range variable should not shadow the container name\nOutput:\n" + shadowAvoidanceResult.modernCode);
+    require(contains(shadowAvoidanceResult.modernCode, "for (const auto& item : data)")
+                || contains(shadowAvoidanceResult.modernCode, "for (const auto& element : data)"),
+            "range loop should choose a non-shadowing variable name for data containers\nOutput:\n" + shadowAvoidanceResult.modernCode);
+    requireCompilePassIfCompilerAvailable(shadowAvoidanceResult, "shadow-safe range loops should compile");
+
     const ConversionResult indexDependentResult = converter.convert(
         "#include <iostream>\n"
         "#include <vector>\n"
@@ -2180,6 +2360,22 @@ void runFunctionalModernizationTests()
     require(contains(multiContainerResult.modernCode, "right[index]"),
             "multi-container index loop should remain unchanged");
     requireCompilePassIfCompilerAvailable(multiContainerResult, "multi-container loop should compile");
+
+    const ConversionResult iteratorAddressResult = converter.convert(
+        "#include <vector>\n"
+        "void captureIterator(const std::vector<int>& values)\n"
+        "{\n"
+        "    for (std::vector<int>::const_iterator it = values.begin(); it != values.end(); ++it)\n"
+        "    {\n"
+        "        const auto* iteratorAddress = &it;\n"
+        "        (void)iteratorAddress;\n"
+        "        (void)*it;\n"
+        "    }\n"
+        "}\n",
+        options);
+    require(contains(iteratorAddressResult.modernCode, "std::vector<int>::const_iterator it"),
+            "iterator loop should remain explicit when the iterator object itself is used");
+    requireCompilePassIfCompilerAvailable(iteratorAddressResult, "iterator-object-use loop should compile");
 
     const ConversionResult sideEffectFunctorResult = converter.convert(
         "#include <algorithm>\n"

@@ -912,6 +912,69 @@ bool isAllocationCapacityLikeMember(const std::string& memberName)
         || lowered.find("allocation") != std::string::npos;
 }
 
+bool hasVectorAppendUse(const std::string& code, const std::string& targetExpression)
+{
+    return std::regex_search(code,
+                             std::regex(targetExpression + R"(\s*\.\s*(?:push_back|emplace_back)\s*\()"));
+}
+
+bool hasVectorIndexedAssignment(const std::string& code, const std::string& targetExpression)
+{
+    return std::regex_search(code,
+                             std::regex(targetExpression
+                                        + R"(\s*\[[^\]\n;]+\]\s*(?:(?:\.|->)\s*[A-Za-z_]\w*)?\s*(?:=|\+=|-=|\*=|/=|%=))"));
+}
+
+std::string normalizeResizeBeforeAppend(std::string code,
+                                        const TypeChangeRecord& record,
+                                        const std::string& elementType,
+                                        const std::string& targetExpression,
+                                        std::vector<ConversionChange>& changes,
+                                        bool& changed)
+{
+    if (!hasVectorAppendUse(code, targetExpression) || hasVectorIndexedAssignment(code, targetExpression)) {
+        return code;
+    }
+
+    const SafeReplacementEngine safeReplacement;
+    code = safeReplacement.rewriteCodeLines(code, [&](const std::string& line) {
+        std::string trailingComment;
+        const std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+        std::smatch match;
+
+        const std::regex sizedVectorDeclaration("^([ \\t]*)std::vector\\s*<\\s*" + escapeRegex(elementType)
+                                                + R"(\s*>\s+)" + escapeRegex(record.symbolName)
+                                                + R"(\s*\(\s*([^)]+)\s*\)\s*;\s*$)");
+        if (std::regex_match(codePart, match, sizedVectorDeclaration)) {
+            const std::string replacement = match[1].str() + "std::vector<" + elementType + "> " + record.symbolName + ";\n"
+                + match[1].str() + record.symbolName + ".reserve(" + trim(match[2].str()) + ");";
+            changed = true;
+            addAppliedChange(changes,
+                             "Vector resize/push_back normalization",
+                             trim(codePart),
+                             trim(replacement),
+                             "Converted pre-sized vector construction to reserve() because the same initialization sequence appends with push_back/emplace_back.");
+            return replacement + trailingComment;
+        }
+
+        const std::regex resizePattern("^([ \\t]*)(" + targetExpression + R"()\.resize\s*\(\s*([^)]+)\s*\)\s*;\s*$)");
+        if (std::regex_match(codePart, match, resizePattern)) {
+            const std::string replacement = match[1].str() + trim(match[2].str()) + ".reserve(" + trim(match[3].str()) + ");";
+            changed = true;
+            addAppliedChange(changes,
+                             "Vector resize/push_back normalization",
+                             trim(codePart),
+                             trim(replacement),
+                             "Converted resize() to reserve() because the vector is populated with push_back/emplace_back rather than fixed indexed writes.");
+            return replacement + trailingComment;
+        }
+
+        return line;
+    });
+
+    return code;
+}
+
 std::string removeCapacityOnlyUpdates(std::string classText, const std::string& memberName)
 {
     const std::string escapedMember = escapeRegex(memberName);
@@ -1068,6 +1131,7 @@ std::string finalVectorLeftoverSweep(std::string code,
         code = removeGrowthSymbolLines(std::move(code), targetExpression, elementType, growthSymbols, changes, changed);
         code = removeEmptyBlocks(std::move(code), changes, changed);
         code = removeObsoleteCapacityGuardFragments(std::move(code), record.symbolName, changes, changed);
+        code = normalizeResizeBeforeAppend(std::move(code), record, elementType, targetExpression, changes, changed);
 
         code = safeReplacement.rewriteCodeLines(code, [&](const std::string& line) {
             std::string trailingComment;

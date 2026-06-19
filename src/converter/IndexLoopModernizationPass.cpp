@@ -5,6 +5,7 @@
 #include <regex>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -75,7 +76,12 @@ void addSkippedDiagnostic(std::vector<ConversionChange>& changes, std::string re
     });
 }
 
-std::string variableNameForCollection(std::string collection)
+bool containsIdentifier(const std::string& text, const std::string& identifier)
+{
+    return std::regex_search(text, std::regex(R"(\b)" + escapeRegex(identifier) + R"(\b)"));
+}
+
+std::string baseNameForCollection(std::string collection)
 {
     const std::size_t separator = collection.find_last_of(".>");
     if (separator != std::string::npos) {
@@ -89,6 +95,36 @@ std::string variableNameForCollection(std::string collection)
         collection.pop_back();
     }
     return collection.empty() ? "item" : collection;
+}
+
+std::string finalIdentifierFromCollection(std::string collection)
+{
+    collection = trim(std::move(collection));
+    std::smatch match;
+    const std::regex trailingIdentifier(R"(([A-Za-z_]\w*)\s*(?:\[[^\]]+\])?\s*$)");
+    if (std::regex_search(collection, match, trailingIdentifier)) {
+        return match[1].str();
+    }
+    return {};
+}
+
+std::string variableNameForCollection(const std::string& collection, const std::string& body)
+{
+    std::vector<std::string> candidates;
+    candidates.push_back(baseNameForCollection(collection));
+    candidates.push_back("item");
+    candidates.push_back("element");
+    candidates.push_back("value");
+    candidates.push_back("entry");
+
+    const std::string collectionIdentifier = finalIdentifierFromCollection(collection);
+    for (const std::string& candidate : candidates) {
+        if (candidate.empty() || candidate == collectionIdentifier || containsIdentifier(body, candidate)) {
+            continue;
+        }
+        return candidate;
+    }
+    return collectionIdentifier == "item" ? "element" : "item";
 }
 } // namespace
 
@@ -148,9 +184,10 @@ std::string IndexLoopModernizationPass::rewrite(const std::string& code,
             continue;
         }
 
-        const bool mutableElement = std::regex_search(body, std::regex(indexedExpression + R"(\s*(?:=|\+=|-=|\*=|/=|%=))"))
-            || std::regex_search(body, std::regex(indexedExpression + R"(\s*(?:\.|->)[^;\n]*\s*(?:=|\+=|-=|\*=|/=|%=))"));
-        const std::string itemName = variableNameForCollection(collection);
+        const bool mutableElement = std::regex_search(body, std::regex(indexedExpression + R"(\s*(?:=|\+=|-=|\*=|/=|%=|\+\+|--))"))
+            || std::regex_search(body, std::regex(R"((?:\+\+|--)\s*)" + indexedExpression))
+            || std::regex_search(body, std::regex(indexedExpression + R"(\s*(?:\.|->)[^;\n]*\s*(?:=|\+=|-=|\*=|/=|%=|\+\+|--|\())"));
+        const std::string itemName = variableNameForCollection(collection, body);
         body = std::regex_replace(body, std::regex(indexedExpression), itemName);
         body = std::regex_replace(body, std::regex(R"(std::endl)"), "'\\n'");
 

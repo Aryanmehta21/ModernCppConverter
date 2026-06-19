@@ -40,6 +40,7 @@
 #include "converter/ScopedEnumCastValidationPass.h"
 #include "converter/ScopedEnumOutputPropagationPass.h"
 #include "converter/ScopedEnumOutputValidator.h"
+#include "converter/ScopedEnumUsagePropagationPass.h"
 #include "converter/SemanticConsistencyValidator.h"
 #include "converter/SemanticModernizationValidator.h"
 #include "converter/SemanticTypeValidationPass.h"
@@ -57,6 +58,7 @@
 #include <cstdint>
 #include <regex>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 
 namespace
@@ -76,6 +78,575 @@ bool shouldRunOwnershipConsistencyPass(const ModernizationOptions& options)
 bool shouldRunStructuralPass(const ModernizationOptions& options)
 {
     return options.offlineModernizationLevel != OfflineModernizationLevel::Conservative;
+}
+
+std::string modernizationLevelName(const OfflineModernizationLevel level)
+{
+    switch (level) {
+    case OfflineModernizationLevel::Conservative:
+        return "Conservative";
+    case OfflineModernizationLevel::Balanced:
+        return "Balanced";
+    case OfflineModernizationLevel::AggressiveSafe:
+        return "Aggressive Safe";
+    case OfflineModernizationLevel::AiStyleAggressiveRewrite:
+        return "AI-Style Aggressive Rewrite";
+    }
+    return "Balanced";
+}
+
+std::string targetStandardName(const CppStandard standard)
+{
+    return standard == CppStandard::Cpp17 ? "C++17" : "C++20";
+}
+
+bool containsAnyLowered(const std::string& loweredText, const std::initializer_list<std::string_view> needles)
+{
+    return std::any_of(needles.begin(), needles.end(), [&loweredText](const std::string_view needle) {
+        return loweredText.find(needle) != std::string::npos;
+    });
+}
+
+std::string lowercaseCopy(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
+}
+
+struct RollbackDiagnostic
+{
+    bool isRollback = false;
+    std::string category = "Semantic";
+    std::string reason = "semantic validator failure";
+    std::string affectedPass;
+    std::string affectedEntity = "unavailable";
+    std::string severity = "Warning";
+};
+
+struct SkippedRiskDiagnostic
+{
+    bool isRisk = false;
+    std::string category = "Semantic";
+    std::string reason = "transformation skipped for safety";
+    std::string affectedPass;
+    std::string affectedEntity = "unavailable";
+    std::string severity = "Warning";
+    std::string suggestedAction = "Review the preserved code manually before applying this modernization.";
+    bool codeLeftUnchanged = true;
+};
+
+std::string diagnosticField(std::string value)
+{
+    value.erase(std::remove(value.begin(), value.end(), '\n'), value.end());
+    value.erase(std::remove(value.begin(), value.end(), '\r'), value.end());
+    std::replace(value.begin(), value.end(), '"', '\'');
+    if (value.empty()) {
+        return "unavailable";
+    }
+    if (value.size() > 96U) {
+        value.resize(96U);
+        value += "...";
+    }
+    return value;
+}
+
+std::string affectedEntityFromChange(const ConversionChange& change)
+{
+    const std::string combined = change.before + "\n" + change.after + "\n" + change.ruleName;
+    const std::vector<std::regex> patterns = {
+        std::regex(R"(#\s*define\s+([A-Za-z_][A-Za-z0-9_]*))"),
+        std::regex(R"(\b(?:class|struct)\s+([A-Za-z_][A-Za-z0-9_]*))"),
+        std::regex(R"(\benum\s+(?:class\s+)?([A-Za-z_][A-Za-z0-9_]*))"),
+        std::regex(R"(\b(?:auto|int|long|short|char|bool|float|double|void|std::[A-Za-z_][A-Za-z0-9_:<>]*)\s*\*?\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|\(|;|\[))"),
+    };
+    for (const std::regex& pattern : patterns) {
+        std::smatch match;
+        if (std::regex_search(combined, match, pattern) && match.size() > 1U) {
+            return diagnosticField(match[1].str());
+        }
+    }
+    return "unavailable";
+}
+
+std::string boolText(const bool value)
+{
+    return value ? "true" : "false";
+}
+
+RollbackDiagnostic classifyRollback(const ConversionChange& change, const std::string& passName)
+{
+    const std::string loweredReason = lowercaseCopy(change.reason);
+    const std::string loweredRule = lowercaseCopy(change.ruleName);
+    const std::string loweredPass = lowercaseCopy(passName);
+    const std::string combined = loweredReason + " " + loweredRule + " " + loweredPass;
+
+    RollbackDiagnostic diagnostic;
+    diagnostic.affectedPass = passName;
+    diagnostic.affectedEntity = affectedEntityFromChange(change);
+
+    const auto containsAny = [&combined](const std::initializer_list<std::string_view> needles) {
+        return containsAnyLowered(combined, needles);
+    };
+
+    diagnostic.isRollback = containsAny({"rollback",
+                                         "transformation failed",
+                                         "validation failed",
+                                         "compile failed",
+                                         "compile",
+                                         "semantic validator",
+                                         "unsafe",
+                                         "risk",
+                                         "scope leak",
+                                         "string_view",
+                                         "lifetime",
+                                         "alias",
+                                         "ambiguous",
+                                         "unsupported macro",
+                                         "missing build context",
+                                         "timeout",
+                                         "cancel",
+                                         "iteration-limit",
+                                         "convergence"});
+    if (!diagnostic.isRollback) {
+        return diagnostic;
+    }
+
+    if (containsAny({"transformation failed", "transformation convergence", "convergence failure"})) {
+        diagnostic.category = "Infrastructure";
+        diagnostic.reason = "transformation convergence failure";
+        diagnostic.severity = "Error";
+    } else if (containsAny({"iteration-limit", "iteration limit"})) {
+        diagnostic.category = "Infrastructure";
+        diagnostic.reason = "pass iteration limit reached";
+        diagnostic.severity = "Error";
+    } else if (containsAny({"timeout"})) {
+        diagnostic.category = "Infrastructure";
+        diagnostic.reason = "timeout reached";
+        diagnostic.severity = "Error";
+    } else if (containsAny({"cancel"})) {
+        diagnostic.category = "Infrastructure";
+        diagnostic.reason = "worker cancelled";
+        diagnostic.severity = "Warning";
+    } else if (containsAny({"compile_commands", "compile commands"})) {
+        diagnostic.category = "Repository";
+        diagnostic.reason = "compile_commands.json unavailable";
+    } else if (containsAny({"include path", "include unresolved", "header unresolved"})) {
+        diagnostic.category = "Repository";
+        diagnostic.reason = "include path unresolved";
+    } else if (containsAny({"cross-file", "cross file"})) {
+        diagnostic.category = "Repository";
+        diagnostic.reason = "cross-file propagation unavailable";
+    } else if (containsAny({"build context", "repository context"})) {
+        diagnostic.category = "Repository";
+        diagnostic.reason = "missing build context";
+    } else if (containsAny({"syntax verification", "syntax"})) {
+        diagnostic.category = "Compilation";
+        diagnostic.reason = "syntax verification failed";
+        diagnostic.severity = "Error";
+    } else if (containsAny({"compile", "compiler"})) {
+        diagnostic.category = "Compilation";
+        diagnostic.reason = "compile verification failed";
+        diagnostic.severity = "Error";
+    } else if (containsAny({"generated code", "invalid code"})) {
+        diagnostic.category = "Compilation";
+        diagnostic.reason = "generated code invalid";
+        diagnostic.severity = "Error";
+    } else if (containsAny({"dependency resolution"})) {
+        diagnostic.category = "Compilation";
+        diagnostic.reason = "dependency resolution unavailable";
+    } else if (containsAny({"token pasting", "##"})) {
+        diagnostic.category = "Macros";
+        diagnostic.reason = "token pasting macro";
+    } else if (containsAny({"stringification", "#"})) {
+        diagnostic.category = "Macros";
+        diagnostic.reason = "stringification macro";
+    } else if (containsAny({"multi-statement", "multiple statement"})) {
+        diagnostic.category = "Macros";
+        diagnostic.reason = "multi-statement macro";
+    } else if (containsAny({"platform", "compiler specific", "compiler-specific"})) {
+        diagnostic.category = "Macros";
+        diagnostic.reason = "platform/compiler specific macro";
+    } else if (containsAny({"macro"})) {
+        diagnostic.category = "Macros";
+        diagnostic.reason = containsAny({"side effect", "side-effect"}) ? "side-effectful macro" : "unsupported macro pattern";
+    } else if (containsAny({"string_view", "lifetime"})) {
+        diagnostic.category = "String";
+        diagnostic.reason = "string_view lifetime risk";
+    } else if (containsAny({"null termination", "null-termination", "c_str"})) {
+        diagnostic.category = "String";
+        diagnostic.reason = "null termination required";
+    } else if (containsAny({"c api", "c-api", "cstring"})) {
+        diagnostic.category = "String";
+        diagnostic.reason = "C API compatibility risk";
+    } else if (containsAny({"string conversion", "std::string"})) {
+        diagnostic.category = "String";
+        diagnostic.reason = "string conversion uncertainty";
+    } else if (containsAny({"vector"})) {
+        diagnostic.category = "Containers";
+        diagnostic.reason = "vector conversion dependency mismatch";
+    } else if (containsAny({"iterator"})) {
+        diagnostic.category = "Containers";
+        diagnostic.reason = "iterator rewrite safety failure";
+    } else if (containsAny({"structured binding"})) {
+        diagnostic.category = "Containers";
+        diagnostic.reason = "structured binding conversion unsafe";
+    } else if (containsAny({"range-for", "range loop", "range-loop"})) {
+        diagnostic.category = "Containers";
+        diagnostic.reason = "range-loop conversion unsafe";
+    } else if (containsAny({"type propagation"})) {
+        diagnostic.category = "Semantic";
+        diagnostic.reason = "type propagation incomplete";
+    } else if (containsAny({"getter", "setter"})) {
+        diagnostic.category = "Semantic";
+        diagnostic.reason = "getter/setter mismatch";
+    } else if (containsAny({"parameter"})) {
+        diagnostic.category = "Semantic";
+        diagnostic.reason = "incompatible parameter conversion";
+    } else if (containsAny({"return type"})) {
+        diagnostic.category = "Semantic";
+        diagnostic.reason = "return type propagation failure";
+    } else if (containsAny({"enum"})) {
+        diagnostic.category = "Semantic";
+        diagnostic.reason = "enum modernization conflict";
+    } else if (containsAny({"scope leak", "validation failed", "semantic validator", "validator"})) {
+        diagnostic.category = "Semantic";
+        diagnostic.reason = "type propagation incomplete";
+    } else if (containsAny({"alias"})) {
+        diagnostic.category = "Ownership";
+        diagnostic.reason = "raw pointer alias ambiguity";
+    } else if (containsAny({"shared ownership", "shared_ptr"})) {
+        diagnostic.category = "Ownership";
+        diagnostic.reason = "shared ownership suspected";
+    } else if (containsAny({"borrowed", "observer"})) {
+        diagnostic.category = "Ownership";
+        diagnostic.reason = "borrowed pointer detected";
+    } else if (containsAny({"polymorphic"})) {
+        diagnostic.category = "Ownership";
+        diagnostic.reason = "polymorphic ownership uncertainty";
+    } else if (containsAny({"ownership", "owning", "ambiguous"})) {
+        diagnostic.category = "Ownership";
+        diagnostic.reason = "unclear ownership model";
+    } else {
+        diagnostic.category = "Semantic";
+        diagnostic.reason = "type propagation incomplete";
+    }
+
+    return diagnostic;
+}
+
+SkippedRiskDiagnostic classifySkippedRisk(const ConversionChange& change, const std::string& passName)
+{
+    const std::string loweredReason = lowercaseCopy(change.reason);
+    const std::string loweredRule = lowercaseCopy(change.ruleName);
+    const std::string loweredBefore = lowercaseCopy(change.before);
+    const std::string loweredPass = lowercaseCopy(passName);
+    const std::string combined = loweredReason + " " + loweredRule + " " + loweredBefore + " " + loweredPass;
+
+    SkippedRiskDiagnostic diagnostic;
+    diagnostic.affectedPass = passName;
+    diagnostic.affectedEntity = affectedEntityFromChange(change);
+    diagnostic.codeLeftUnchanged = !change.applied;
+
+    const auto containsAny = [&combined](const std::initializer_list<std::string_view> needles) {
+        return containsAnyLowered(combined, needles);
+    };
+
+    diagnostic.isRisk = !change.applied
+        && containsAny({"preserved",
+                        "manual review",
+                        "unsafe",
+                        "risk",
+                        "ambiguous",
+                        "unclear",
+                        "borrowed",
+                        "observer",
+                        "lifetime",
+                        "null-terminated",
+                        "null termination",
+                        "c api",
+                        "c-api",
+                        "file*",
+                        "fopen",
+                        "fprintf",
+                        "binary",
+                        "complex",
+                        "macro",
+                        "iterator",
+                        "structured binding",
+                        "range",
+                        "polymorphic",
+                        "compile_commands",
+                        "build context",
+                        "include path",
+                        "format"});
+    if (!diagnostic.isRisk) {
+        return diagnostic;
+    }
+
+    if (containsAny({"token-pasting", "token pasting", "##"})) {
+        diagnostic.category = "Macro";
+        diagnostic.reason = "token pasting macro";
+        diagnostic.suggestedAction = "Review manually. Token pasting depends on preprocessor semantics that constexpr functions cannot reproduce.";
+    } else if (containsAny({"stringification", "#value", "# value"})) {
+        diagnostic.category = "Macro";
+        diagnostic.reason = "stringification macro";
+        diagnostic.suggestedAction = "Review manually. Stringification depends on preprocessor text substitution.";
+    } else if (containsAny({"multi-statement", "multiple statement", "control-flow", "control flow", "do {"})) {
+        diagnostic.category = "Macro";
+        diagnostic.reason = "multi-statement macro";
+        diagnostic.suggestedAction = "Review manually. This macro contains control flow or multiple statements.";
+    } else if (containsAny({"side effect", "side-effect", "evaluated multiple times"})) {
+        diagnostic.category = "Macro";
+        diagnostic.reason = "side-effectful macro";
+        diagnostic.suggestedAction = "Review manually. Macro argument evaluation may have side effects or occur multiple times.";
+    } else if (containsAny({"platform", "compiler extension", "compiler-specific"})) {
+        diagnostic.category = "Macro";
+        diagnostic.reason = "platform/compiler specific macro";
+        diagnostic.suggestedAction = "Review manually. Preserve platform/compiler-specific macro behavior or replace it with a guarded abstraction.";
+    } else if (containsAny({"macro"})) {
+        diagnostic.category = "Macro";
+        diagnostic.reason = "unsupported macro pattern";
+        diagnostic.suggestedAction = "Review manually. Confirm the macro can be replaced without changing preprocessing semantics.";
+    } else if (containsAny({"borrowed", "observer"})) {
+        diagnostic.category = "Ownership";
+        diagnostic.reason = "borrowed pointer detected";
+        diagnostic.suggestedAction = "Ownership is unclear. Consider documenting ownership or converting manually.";
+    } else if (containsAny({"alias"})) {
+        diagnostic.category = "Ownership";
+        diagnostic.reason = "raw pointer alias ambiguity";
+        diagnostic.suggestedAction = "Review aliases manually before choosing unique_ptr, shared_ptr, or non-owning raw pointer semantics.";
+    } else if (containsAny({"shared ownership", "shared_ptr"})) {
+        diagnostic.category = "Ownership";
+        diagnostic.reason = "shared ownership suspected";
+        diagnostic.suggestedAction = "Confirm whether shared ownership is intentional before using std::shared_ptr.";
+    } else if (containsAny({"polymorphic"})) {
+        diagnostic.category = "Polymorphism";
+        diagnostic.reason = "polymorphic ownership uncertainty";
+        diagnostic.suggestedAction = "Check virtual destructors and ownership through base pointers before modernizing.";
+    } else if (containsAny({"ownership", "owning", "malloc", "free", "new", "delete"})) {
+        diagnostic.category = "Ownership";
+        diagnostic.reason = containsAny({"unclear", "ambiguous"}) ? "unclear ownership model" : "raw pointer alias ambiguity";
+        diagnostic.suggestedAction = "Ownership is unclear. Consider documenting ownership or converting manually.";
+    } else if (containsAny({"string_view", "lifetime"})) {
+        diagnostic.category = "String";
+        diagnostic.reason = "string_view lifetime risk";
+        diagnostic.suggestedAction = "Keep std::string or const char* unless the view lifetime is guaranteed.";
+    } else if (containsAny({"null-terminated", "null termination", "c_str"})) {
+        diagnostic.category = "String";
+        diagnostic.reason = "null termination required";
+        diagnostic.suggestedAction = "Null-terminated string required. Keep std::string or const char*.";
+    } else if (containsAny({"c api", "c-api", "cstring"})) {
+        diagnostic.category = "String";
+        diagnostic.reason = "C API compatibility risk";
+        diagnostic.suggestedAction = "Keep a compatible C-string boundary or introduce an owned std::string temporary with clear lifetime.";
+    } else if (containsAny({"string"})) {
+        diagnostic.category = "String";
+        diagnostic.reason = "string conversion uncertainty";
+        diagnostic.suggestedAction = "Review string ownership, lifetime, and C API boundaries before changing the interface.";
+    } else if (containsAny({"file*", "fopen", "fclose", "fprintf", "fputs", "binary"})) {
+        diagnostic.category = "File I/O";
+        diagnostic.reason = containsAny({"binary"}) ? "binary file usage detected" : "complex FILE* usage detected";
+        diagnostic.suggestedAction = "Complex or binary file usage detected. Consider std::ifstream/std::ofstream manually.";
+    } else if (containsAny({"format", "printf", "specifier"})) {
+        diagnostic.category = "Formatting";
+        diagnostic.reason = "formatting conversion unsafe";
+        diagnostic.suggestedAction = "Review format specifiers manually before replacing with streams or std::format.";
+    } else if (containsAny({"iterator"})) {
+        diagnostic.category = "Containers";
+        diagnostic.reason = "iterator rewrite safety failure";
+        diagnostic.suggestedAction = "Review manually. Iterator mutation, invalidation, or non-traversal use may make range-for unsafe.";
+    } else if (containsAny({"structured binding"})) {
+        diagnostic.category = "Containers";
+        diagnostic.reason = "structured binding conversion unsafe";
+        diagnostic.suggestedAction = "Review manually. Confirm key/value access is simple and iterator semantics are not needed.";
+    } else if (containsAny({"range", "index loop"})) {
+        diagnostic.category = "Containers";
+        diagnostic.reason = "range-loop conversion unsafe";
+        diagnostic.suggestedAction = "Review manually. Preserve index-based logic when the index has semantic meaning.";
+    } else if (containsAny({"vector"})) {
+        diagnostic.category = "Containers";
+        diagnostic.reason = "vector conversion dependency mismatch";
+        diagnostic.suggestedAction = "Review dependent getters, setters, and call sites before converting this container.";
+    } else if (containsAny({"compile_commands", "compile commands"})) {
+        diagnostic.category = "Repository";
+        diagnostic.reason = "compile_commands.json unavailable";
+        diagnostic.suggestedAction = "Provide compile_commands.json or configure a CMake build directory.";
+    } else if (containsAny({"build context"})) {
+        diagnostic.category = "Repository";
+        diagnostic.reason = "missing build context";
+        diagnostic.suggestedAction = "Provide compile_commands.json or configure CMake build directory.";
+    } else if (containsAny({"include path"})) {
+        diagnostic.category = "Repository";
+        diagnostic.reason = "include path unresolved";
+        diagnostic.suggestedAction = "Configure repository include paths before enabling project-level verification.";
+    } else if (containsAny({"compile", "syntax", "generated code"})) {
+        diagnostic.category = "Compilation";
+        diagnostic.reason = containsAny({"syntax"}) ? "syntax verification failed" : "compile verification failed";
+        diagnostic.severity = "Error";
+        diagnostic.suggestedAction = "Inspect compiler diagnostics before accepting this transformation.";
+    } else {
+        diagnostic.category = "Semantic";
+        diagnostic.reason = "transformation safety could not be proven";
+        diagnostic.suggestedAction = "Review the preserved code manually before applying this modernization.";
+    }
+
+    return diagnostic;
+}
+
+std::string rollbackDetailMessage(const RollbackDiagnostic& diagnostic)
+{
+    std::ostringstream output;
+    output << "ROLLBACK DETAIL"
+           << " category=" << diagnostic.category
+           << " reason=\"" << diagnosticField(diagnostic.reason) << "\""
+           << " pass=\"" << diagnosticField(diagnostic.affectedPass) << "\""
+           << " entity=\"" << diagnosticField(diagnostic.affectedEntity) << "\""
+           << " severity=" << diagnostic.severity;
+    return output.str();
+}
+
+std::string skippedRiskDetailMessage(const SkippedRiskDiagnostic& diagnostic)
+{
+    std::ostringstream output;
+    output << "SKIPPED RISK"
+           << " category=\"" << diagnosticField(diagnostic.category) << "\""
+           << " pass=\"" << diagnosticField(diagnostic.affectedPass) << "\""
+           << " entity=\"" << diagnosticField(diagnostic.affectedEntity) << "\""
+           << " reason=\"" << diagnosticField(diagnostic.reason) << "\""
+           << " severity=" << diagnostic.severity
+           << " suggested_action=\"" << diagnosticField(diagnostic.suggestedAction) << "\""
+           << " code_unchanged=" << boolText(diagnostic.codeLeftUnchanged);
+    return output.str();
+}
+
+std::string rollbackSummaryMessage(const std::vector<RollbackDiagnostic>& diagnostics)
+{
+    const std::vector<std::string> categories = {
+        "Ownership",
+        "Semantic",
+        "String",
+        "Containers",
+        "Macros",
+        "Compilation",
+        "Repository",
+        "Infrastructure",
+    };
+    std::ostringstream output;
+    output << "ROLLBACK SUMMARY";
+    for (const std::string& category : categories) {
+        const std::size_t count = static_cast<std::size_t>(std::count_if(diagnostics.begin(), diagnostics.end(), [&category](const RollbackDiagnostic& diagnostic) {
+            return diagnostic.category == category;
+        }));
+        output << ' ' << category << '=' << count;
+    }
+    const std::size_t infoCount = static_cast<std::size_t>(std::count_if(diagnostics.begin(), diagnostics.end(), [](const RollbackDiagnostic& diagnostic) {
+        return diagnostic.severity == "Info";
+    }));
+    const std::size_t warningCount = static_cast<std::size_t>(std::count_if(diagnostics.begin(), diagnostics.end(), [](const RollbackDiagnostic& diagnostic) {
+        return diagnostic.severity == "Warning";
+    }));
+    const std::size_t errorCount = static_cast<std::size_t>(std::count_if(diagnostics.begin(), diagnostics.end(), [](const RollbackDiagnostic& diagnostic) {
+        return diagnostic.severity == "Error";
+    }));
+    output << " Info=" << infoCount
+           << " Warnings=" << warningCount
+           << " Errors=" << errorCount;
+    return output.str();
+}
+
+std::string skippedRiskSummaryMessage(const std::vector<SkippedRiskDiagnostic>& diagnostics)
+{
+    const std::vector<std::string> categories = {
+        "Ownership",
+        "String",
+        "Macro",
+        "Repository",
+        "Semantic",
+        "Containers",
+        "Polymorphism",
+        "File I/O",
+        "Formatting",
+        "Compilation",
+    };
+    std::ostringstream output;
+    output << "SKIPPED RISK SUMMARY";
+    for (const std::string& category : categories) {
+        const std::size_t count = static_cast<std::size_t>(std::count_if(diagnostics.begin(), diagnostics.end(), [&category](const SkippedRiskDiagnostic& diagnostic) {
+            return diagnostic.category == category;
+        }));
+        output << " \"" << category << "\"=" << count;
+    }
+    const std::size_t infoCount = static_cast<std::size_t>(std::count_if(diagnostics.begin(), diagnostics.end(), [](const SkippedRiskDiagnostic& diagnostic) {
+        return diagnostic.severity == "Info";
+    }));
+    const std::size_t warningCount = static_cast<std::size_t>(std::count_if(diagnostics.begin(), diagnostics.end(), [](const SkippedRiskDiagnostic& diagnostic) {
+        return diagnostic.severity == "Warning";
+    }));
+    const std::size_t errorCount = static_cast<std::size_t>(std::count_if(diagnostics.begin(), diagnostics.end(), [](const SkippedRiskDiagnostic& diagnostic) {
+        return diagnostic.severity == "Error";
+    }));
+    output << " Info=" << infoCount
+           << " Warnings=" << warningCount
+           << " Errors=" << errorCount;
+    return output.str();
+}
+
+std::string passSummaryMessage(const std::string& passName,
+                               const std::size_t appliedCount,
+                               const std::size_t skippedCount,
+                               const std::size_t warningCount,
+                               const std::size_t rollbackCount,
+                               const std::size_t nodesVisited,
+                               const std::size_t nodesModified,
+                               const std::size_t rewriteOperations,
+                               const long long elapsedMilliseconds,
+                               const std::string& status)
+{
+    std::ostringstream output;
+    output << "PASS SUMMARY pass=\"" << passName << "\""
+           << " applied=" << appliedCount
+           << " skipped=" << skippedCount
+           << " warnings=" << warningCount
+           << " rollbacks=" << rollbackCount
+           << " visited=" << nodesVisited
+           << " modified=" << nodesModified
+           << " rewrites=" << rewriteOperations
+           << " time_ms=" << elapsedMilliseconds
+           << " status=" << status;
+    return output.str();
+}
+
+std::string finalStatusMessage(const OfflineModernizationPipelineResult& result,
+                               const std::vector<ConversionChange>& changes)
+{
+    const std::size_t applied = static_cast<std::size_t>(std::count_if(changes.begin(), changes.end(), [](const ConversionChange& change) {
+        return change.applied;
+    }));
+    const std::size_t skipped = static_cast<std::size_t>(std::count_if(changes.begin(), changes.end(), [](const ConversionChange& change) {
+        return change.skipped;
+    }));
+    const std::size_t warnings = static_cast<std::size_t>(std::count_if(changes.begin(), changes.end(), [](const ConversionChange& change) {
+        return !change.applied && !change.skipped;
+    }));
+    std::ostringstream output;
+    output << "FINAL RESULT status=";
+    if (result.compileVerificationEnabled) {
+        output << (result.compileVerificationPassed ? "success" : "compile-verification-failed-or-skipped");
+    } else {
+        output << "success-without-compile-verification";
+    }
+    output << " applied=" << applied
+           << " skipped=" << skipped
+           << " warnings=" << warnings
+           << " compile_verification=";
+    if (!result.compileVerificationEnabled) {
+        output << "not-run";
+    } else {
+        output << (result.compileVerificationPassed ? "passed" : "failed/skipped");
+    }
+    return output.str();
 }
 
 std::uint64_t stableHash(const std::string& text)
@@ -226,6 +797,53 @@ bool hasScopedEnumOutputDiagnostic(const std::string& compilerOutput)
         || loweredCompilerOutput.find("cannot format") != std::string::npos;
 }
 
+bool hasScopedEnumUsageDiagnostic(const std::string& compilerOutput)
+{
+    const std::string loweredCompilerOutput = lowercase(compilerOutput);
+    return loweredCompilerOutput.find("use of undeclared identifier") != std::string::npos
+        || loweredCompilerOutput.find("was not declared in this scope") != std::string::npos
+        || loweredCompilerOutput.find("not declared in this scope") != std::string::npos
+        || loweredCompilerOutput.find("invalid case") != std::string::npos
+        || loweredCompilerOutput.find("case label") != std::string::npos;
+}
+
+bool hasStringCapiDiagnostic(const std::string& compilerOutput)
+{
+    const std::string loweredCompilerOutput = lowercase(compilerOutput);
+    return loweredCompilerOutput.find("strcpy") != std::string::npos
+        || loweredCompilerOutput.find("strncpy") != std::string::npos
+        || loweredCompilerOutput.find("strcat") != std::string::npos
+        || loweredCompilerOutput.find("strcmp") != std::string::npos
+        || loweredCompilerOutput.find("strlen") != std::string::npos
+        || loweredCompilerOutput.find("no matching function") != std::string::npos
+        || loweredCompilerOutput.find("no viable conversion") != std::string::npos
+        || loweredCompilerOutput.find("cannot convert") != std::string::npos
+        || loweredCompilerOutput.find("no member named 'c_str'") != std::string::npos
+        || loweredCompilerOutput.find("has no member named 'c_str'") != std::string::npos
+        || loweredCompilerOutput.find("no member named c_str") != std::string::npos
+        || loweredCompilerOutput.find("string_view") != std::string::npos
+        || loweredCompilerOutput.find("basic_string") != std::string::npos
+        || loweredCompilerOutput.find("std::string") != std::string::npos
+        || loweredCompilerOutput.find("invalid array subscript") != std::string::npos
+        || loweredCompilerOutput.find("subscripted value") != std::string::npos;
+}
+
+bool hasSmartPointerDiagnostic(const std::string& compilerOutput)
+{
+    const std::string loweredCompilerOutput = lowercase(compilerOutput);
+    return loweredCompilerOutput.find("unique_ptr") != std::string::npos
+        || loweredCompilerOutput.find("shared_ptr") != std::string::npos
+        || loweredCompilerOutput.find("std::unique_ptr") != std::string::npos
+        || loweredCompilerOutput.find("std::shared_ptr") != std::string::npos
+        || loweredCompilerOutput.find("deleted copy constructor") != std::string::npos
+        || loweredCompilerOutput.find("call to deleted constructor") != std::string::npos
+        || loweredCompilerOutput.find("use of deleted function") != std::string::npos
+        || loweredCompilerOutput.find("cannot convert") != std::string::npos
+        || loweredCompilerOutput.find("no viable conversion") != std::string::npos
+        || loweredCompilerOutput.find("no known conversion") != std::string::npos
+        || loweredCompilerOutput.find("could not convert") != std::string::npos;
+}
+
 bool hasNsdmiScopeDiagnostic(const std::string& compilerOutput)
 {
     const std::string loweredCompilerOutput = lowercase(compilerOutput);
@@ -289,7 +907,103 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     const bool aggressiveAiLike = isAggressiveAiLike(options);
     TransformationContext transformationContext;
     std::unordered_map<std::string, int> passIterations;
+    std::vector<RollbackDiagnostic> rollbackDiagnostics;
+    std::vector<SkippedRiskDiagnostic> skippedRiskDiagnostics;
     constexpr int maxModernizationIterations = 20;
+
+    result.diagnosticMessages.push_back("MODERNIZATION PROFILE level="
+                                        + modernizationLevelName(options.offlineModernizationLevel)
+                                        + " target=" + targetStandardName(options.targetStandard)
+                                        + " structural_passes=" + (shouldRunStructuralPass(options) ? "enabled" : "disabled")
+                                        + " ownership_consistency=" + (shouldRunOwnershipConsistencyPass(options) ? "enabled" : "disabled")
+                                        + " compile_verification=" + (options.compileVerificationEnabled ? "requested" : "pipeline-default"));
+    if (!shouldRunStructuralPass(options)) {
+        result.diagnosticMessages.push_back("SKIPPED PASS GROUP Structural modernization reason=offline modernization level is Conservative");
+    }
+    if (!shouldRunOwnershipConsistencyPass(options) && !isAggressiveAiLike(options)) {
+        result.diagnosticMessages.push_back("SKIPPED PASS GROUP Ownership consistency reason=ownership/string-view consistency options are disabled for this profile");
+    }
+
+    auto appendRollbackDiagnostic = [&](RollbackDiagnostic diagnostic) {
+        diagnostic.affectedPass = diagnostic.affectedPass.empty() ? "unavailable" : diagnostic.affectedPass;
+        rollbackDiagnostics.push_back(diagnostic);
+        result.diagnosticMessages.push_back(rollbackDetailMessage(diagnostic));
+    };
+
+    auto appendSkippedRiskDiagnostic = [&](SkippedRiskDiagnostic diagnostic) {
+        diagnostic.affectedPass = diagnostic.affectedPass.empty() ? "unavailable" : diagnostic.affectedPass;
+        skippedRiskDiagnostics.push_back(diagnostic);
+        result.diagnosticMessages.push_back(skippedRiskDetailMessage(diagnostic));
+    };
+
+    for (const ConversionChange& change : changes) {
+        RollbackDiagnostic rollbackDiagnostic = classifyRollback(change, "PrePipelineRules");
+        if (rollbackDiagnostic.isRollback) {
+            appendRollbackDiagnostic(std::move(rollbackDiagnostic));
+        }
+        SkippedRiskDiagnostic skippedRiskDiagnostic = classifySkippedRisk(change, "PrePipelineRules");
+        if (skippedRiskDiagnostic.isRisk) {
+            appendSkippedRiskDiagnostic(std::move(skippedRiskDiagnostic));
+        }
+    }
+
+    if (options.useStringView && normalizedCode.find("const std::string&") != std::string::npos) {
+        const std::regex stringReferencePattern(R"(\bconst\s+std::string\s*&\s*([A-Za-z_][A-Za-z0-9_]*))");
+        for (std::sregex_iterator iterator(normalizedCode.begin(), normalizedCode.end(), stringReferencePattern), end;
+             iterator != end;
+             ++iterator) {
+            const std::string parameterName = (*iterator)[1].str();
+            const std::string escapedParameter = parameterName;
+            const bool cStringRequired = normalizedCode.find(parameterName + ".c_str()") != std::string::npos
+                || normalizedCode.find(parameterName + " .c_str()") != std::string::npos;
+            const bool escapesOrStores = std::regex_search(normalizedCode, std::regex(R"(=\s*)" + escapedParameter + R"(\b)"))
+                || std::regex_search(normalizedCode, std::regex(R"(\breturn\s+)" + escapedParameter + R"(\b)"))
+                || std::regex_search(normalizedCode, std::regex(R"(\b(?:push_back|emplace_back|insert|assign)\s*\([^;\n]*\b)" + escapedParameter + R"(\b)"));
+            if (!cStringRequired && !escapesOrStores) {
+                continue;
+            }
+            appendSkippedRiskDiagnostic(SkippedRiskDiagnostic{
+                true,
+                "String",
+                cStringRequired ? "null termination required" : "string_view lifetime risk",
+                "StringViewSafetyDiagnostics",
+                parameterName,
+                "Warning",
+                cStringRequired
+                    ? "Null-terminated string required. Keep std::string or const char*."
+                    : "Keep std::string or const char* unless the view lifetime is guaranteed.",
+                true,
+            });
+        }
+    }
+
+    bool complexFileIoRisk = false;
+    if (normalizedCode.find("FILE") != std::string::npos) {
+        const std::regex fprintfTargetPattern(R"(\bfprintf\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,)");
+        for (std::sregex_iterator iterator(normalizedCode.begin(), normalizedCode.end(), fprintfTargetPattern), end;
+             iterator != end;
+             ++iterator) {
+            const std::string target = (*iterator)[1].str();
+            if (target != "stdout" && target != "stderr") {
+                complexFileIoRisk = true;
+                break;
+            }
+        }
+        complexFileIoRisk = complexFileIoRisk
+            || std::regex_search(normalizedCode, std::regex(R"(\bfopen\s*\([^,\n]+,\s*"[^"]*b[^"]*"\s*\))"));
+    }
+    if (complexFileIoRisk) {
+        appendSkippedRiskDiagnostic(SkippedRiskDiagnostic{
+            true,
+            "File I/O",
+            "complex FILE* usage detected",
+            "FileIoSafetyDiagnostics",
+            "FILE*",
+            "Warning",
+            "Complex or binary file usage detected. Consider std::ifstream/std::ofstream manually.",
+            true,
+        });
+    }
 
     auto runTracedPass = [&](const std::string& passName, auto&& transform) {
         const int iteration = ++passIterations[passName];
@@ -309,6 +1023,24 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                                                                     0,
                                                                     0,
                                                                     "iteration-limit-exceeded; returned-last-stable-version"));
+            appendRollbackDiagnostic(RollbackDiagnostic{
+                true,
+                "Infrastructure",
+                "pass iteration limit reached",
+                passName,
+                "pipeline",
+                "Error",
+            });
+            result.diagnosticMessages.push_back(passSummaryMessage(passName,
+                                                                   0,
+                                                                   0,
+                                                                   1,
+                                                                   1,
+                                                                   nodesVisited,
+                                                                   0,
+                                                                   0,
+                                                                   0,
+                                                                   "iteration-limit-exceeded; returned-last-stable-version"));
             return;
         }
 
@@ -326,6 +1058,29 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
             + ((candidate != before && countAppliedChangesSince(changes, changeCountBefore) == 0U) ? 1U : 0U);
         const std::size_t nodesModified = candidate == before ? 0U : countChangedLines(before, candidate);
         const std::string status = candidate == before ? "converged-no-change" : "changed";
+        const auto changesBegin = changes.begin() + static_cast<std::ptrdiff_t>(changeCountBefore);
+        const std::size_t appliedCount = static_cast<std::size_t>(std::count_if(changesBegin, changes.end(), [](const ConversionChange& change) {
+            return change.applied;
+        }));
+        const std::size_t skippedCount = static_cast<std::size_t>(std::count_if(changesBegin, changes.end(), [](const ConversionChange& change) {
+            return change.skipped;
+        }));
+        const std::size_t warningCount = static_cast<std::size_t>(std::count_if(changesBegin, changes.end(), [](const ConversionChange& change) {
+            return !change.applied && !change.skipped;
+        }));
+        std::vector<RollbackDiagnostic> passRollbackDiagnostics;
+        std::vector<SkippedRiskDiagnostic> passSkippedRiskDiagnostics;
+        for (auto change = changesBegin; change != changes.end(); ++change) {
+            RollbackDiagnostic rollbackDiagnostic = classifyRollback(*change, passName);
+            if (rollbackDiagnostic.isRollback) {
+                passRollbackDiagnostics.push_back(std::move(rollbackDiagnostic));
+            }
+            SkippedRiskDiagnostic skippedRiskDiagnostic = classifySkippedRisk(*change, passName);
+            if (skippedRiskDiagnostic.isRisk) {
+                passSkippedRiskDiagnostics.push_back(std::move(skippedRiskDiagnostic));
+            }
+        }
+        const std::size_t rollbackCount = passRollbackDiagnostics.size();
         result.diagnosticMessages.push_back(endPassTraceMessage(passName,
                                                                 iteration,
                                                                 hashBefore,
@@ -335,6 +1090,22 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                                                                 rewriteOperations,
                                                                 elapsedMilliseconds,
                                                                 status));
+        for (RollbackDiagnostic& rollbackDiagnostic : passRollbackDiagnostics) {
+            appendRollbackDiagnostic(std::move(rollbackDiagnostic));
+        }
+        for (SkippedRiskDiagnostic& skippedRiskDiagnostic : passSkippedRiskDiagnostics) {
+            appendSkippedRiskDiagnostic(std::move(skippedRiskDiagnostic));
+        }
+        result.diagnosticMessages.push_back(passSummaryMessage(passName,
+                                                               appliedCount,
+                                                               skippedCount,
+                                                               warningCount,
+                                                               rollbackCount,
+                                                               nodesVisited,
+                                                               nodesModified,
+                                                               rewriteOperations,
+                                                               elapsedMilliseconds,
+                                                               status));
         result.modernCode = std::move(candidate);
     };
 
@@ -358,6 +1129,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         runTracedPass("ClassStringBufferModernizationPass", [&](const std::string& input) {
             const ClassStringBufferModernizationPass pass;
             return pass.rewrite(input, changes);
+        });
+        runTracedPass("MallocFreeModernizationPass::postStringFieldCleanup", [&](const std::string& input) {
+            const MallocFreeModernizationPass pass;
+            return pass.rewrite(input, options, transformationContext, changes);
         });
         runTracedPass("CrossScopeTypePropagationPass", [&](const std::string& input) {
             const CrossScopeTypePropagationPass pass;
@@ -490,6 +1265,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
             const IteratorModernizationPass pass;
             return pass.rewrite(input, options, transformationContext, changes);
         });
+        runTracedPass("ScopedEnumUsagePropagationPass", [&](const std::string& input) {
+            const ScopedEnumUsagePropagationPass pass;
+            return pass.rewrite(input, changes);
+        });
         runTracedPass("ScopedEnumCastValidationPass", [&](const std::string& input) {
             const ScopedEnumCastValidationPass pass;
             return pass.validateAndNormalize(input, changes);
@@ -600,17 +1379,38 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     }
 
     if (options.compileVerificationEnabled || aggressiveAiLike || shouldRunStructuralPass(options)) {
+        result.diagnosticMessages.push_back("COMPILE VERIFICATION status=started stage=initial");
+        const auto compileStarted = std::chrono::steady_clock::now();
         CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(result.modernCode, options.targetStandard);
+        const auto compileFinished = std::chrono::steady_clock::now();
+        const auto compileElapsedMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(compileFinished - compileStarted).count();
         result.compileVerificationEnabled = verification.verificationEnabled;
         result.compileVerificationPassed = verification.passed;
         result.compilerUsed = verification.compilerUsed;
         result.compilerOutput = verification.output;
+        result.diagnosticMessages.push_back("COMPILE VERIFICATION status="
+                                            + std::string(verification.passed ? "passed" : "failed/skipped")
+                                            + " stage=initial compiler="
+                                            + (verification.compilerUsed.empty() ? "not-found" : verification.compilerUsed)
+                                            + " time_ms=" + std::to_string(compileElapsedMilliseconds));
 
         if (verification.compilerFound
             && !verification.passed
             && (!transformationContext.empty()
                 || hasScopedEnumOutputDiagnostic(verification.output)
+                || (result.modernCode.find("enum class") != std::string::npos && hasScopedEnumUsageDiagnostic(verification.output))
+                || hasStringCapiDiagnostic(verification.output)
+                || hasSmartPointerDiagnostic(verification.output)
                 || hasNsdmiScopeDiagnostic(verification.output))) {
+            RollbackDiagnostic compileRollback;
+            compileRollback.isRollback = true;
+            compileRollback.category = "Compilation";
+            compileRollback.reason = "compile verification failed";
+            compileRollback.affectedPass = "CompileVerification";
+            compileRollback.affectedEntity = "translation-unit";
+            compileRollback.severity = "Error";
+            appendRollbackDiagnostic(compileRollback);
+            result.diagnosticMessages.push_back("ROLLBACK/REPAIR category=Compilation reason=\"compile verification failed\" pass=\"CompileVerification\" entity=\"translation-unit\" severity=Error action=\"targeted cleanup retry\"");
             const std::string beforeCleanup = result.modernCode;
             runTracedPass("CompilerDiagnosticCleanupPass", [&](const std::string& input) {
                 const CompilerDiagnosticCleanupPass pass;
@@ -692,6 +1492,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                 const IteratorModernizationPass pass;
                 return pass.rewrite(input, options, transformationContext, changes);
             });
+            runTracedPass("ScopedEnumUsagePropagationPass", [&](const std::string& input) {
+                const ScopedEnumUsagePropagationPass pass;
+                return pass.rewrite(input, changes);
+            });
             runTracedPass("ScopedEnumCastValidationPass", [&](const std::string& input) {
                 const ScopedEnumCastValidationPass pass;
                 return pass.validateAndNormalize(input, changes);
@@ -723,16 +1527,34 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
 
             if (result.modernCode != beforeCleanup) {
                 result.compileVerificationAutoFixAttempted = true;
+                result.diagnosticMessages.push_back("COMPILE VERIFICATION status=started stage=dependent-cleanup-retry");
+                const auto retryStarted = std::chrono::steady_clock::now();
                 const CompileVerificationResult secondVerification = CompileVerifier::verifySyntaxOnly(result.modernCode, options.targetStandard);
+                const auto retryFinished = std::chrono::steady_clock::now();
+                const auto retryElapsedMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(retryFinished - retryStarted).count();
                 result.compileVerificationPassed = secondVerification.passed;
                 result.compilerUsed = secondVerification.compilerUsed;
                 result.compilerOutput = "Initial compile output:\n" + verification.output
                     + "\n\nAfter dependent cleanup retry:\n" + secondVerification.output;
+                result.diagnosticMessages.push_back("COMPILE VERIFICATION status="
+                                                    + std::string(secondVerification.passed ? "passed" : "failed/skipped")
+                                                    + " stage=dependent-cleanup-retry compiler="
+                                                    + (secondVerification.compilerUsed.empty() ? "not-found" : secondVerification.compilerUsed)
+                                                    + " time_ms=" + std::to_string(retryElapsedMilliseconds));
                 verification = secondVerification;
             }
         }
 
         if (aggressiveAiLike && verification.compilerFound && !verification.passed) {
+            RollbackDiagnostic includeRollback;
+            includeRollback.isRollback = true;
+            includeRollback.category = "Compilation";
+            includeRollback.reason = "syntax verification failed";
+            includeRollback.affectedPass = "CompileVerification";
+            includeRollback.affectedEntity = "standard-library-includes";
+            includeRollback.severity = "Error";
+            appendRollbackDiagnostic(includeRollback);
+            result.diagnosticMessages.push_back("ROLLBACK/REPAIR category=Compilation reason=\"syntax verification failed\" pass=\"CompileVerification\" entity=\"standard-library-includes\" severity=Error action=\"include auto-fix retry\"");
             AggressiveRewriteEngine aggressiveRewriteEngine;
             const std::string beforeAutoFix = result.modernCode;
             result.modernCode = aggressiveRewriteEngine.ensureModernIncludes(result.modernCode, options, nullptr);
@@ -741,11 +1563,20 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
             }
 
             result.compileVerificationAutoFixAttempted = true;
+            result.diagnosticMessages.push_back("COMPILE VERIFICATION status=started stage=include-auto-fix-retry");
+            const auto includeRetryStarted = std::chrono::steady_clock::now();
             const CompileVerificationResult secondVerification = CompileVerifier::verifySyntaxOnly(result.modernCode, options.targetStandard);
+            const auto includeRetryFinished = std::chrono::steady_clock::now();
+            const auto includeRetryElapsedMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(includeRetryFinished - includeRetryStarted).count();
             result.compileVerificationPassed = secondVerification.passed;
             result.compilerUsed = secondVerification.compilerUsed;
             result.compilerOutput = "Initial compile output:\n" + verification.output
                 + "\n\nAfter include auto-fix:\n" + secondVerification.output;
+            result.diagnosticMessages.push_back("COMPILE VERIFICATION status="
+                                                + std::string(secondVerification.passed ? "passed" : "failed/skipped")
+                                                + " stage=include-auto-fix-retry compiler="
+                                                + (secondVerification.compilerUsed.empty() ? "not-found" : secondVerification.compilerUsed)
+                                                + " time_ms=" + std::to_string(includeRetryElapsedMilliseconds));
 
             if (result.modernCode != beforeAutoFix) {
                 changes.push_back(ConversionChange{
@@ -758,7 +1589,12 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                 });
             }
         }
+    } else {
+        result.diagnosticMessages.push_back("SKIPPED PASS CompileVerification reason=compile verification disabled for selected options/profile");
     }
 
+    result.diagnosticMessages.push_back(skippedRiskSummaryMessage(skippedRiskDiagnostics));
+    result.diagnosticMessages.push_back(rollbackSummaryMessage(rollbackDiagnostics));
+    result.diagnosticMessages.push_back(finalStatusMessage(result, changes));
     return result;
 }
