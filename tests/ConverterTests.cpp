@@ -46,6 +46,7 @@
 #include <iterator>
 #include <memory>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -66,6 +67,22 @@ void require(bool condition, const std::string& message)
 bool contains(const std::string& text, const std::string& needle)
 {
     return text.find(needle) != std::string::npos;
+}
+
+bool containsTrimmedLine(const std::string& text, const std::string& expected)
+{
+    std::istringstream input(text);
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos) {
+            continue;
+        }
+        if (line.substr(first) == expected) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool diagnosticsContain(const ConversionResult& result, const std::string& needle)
@@ -5381,6 +5398,11 @@ void testConstReturnPropagationUpdatesObserverContainersAndPredicates()
         "    if (accepts(provider.current())) {}\n"
         "    Predicate predicate;\n"
         "    if (predicate(found[0])) {}\n"
+        "    for (std::vector<Item*>::iterator it = found.begin(); it != found.end(); ++it)\n"
+        "    {\n"
+        "        Item* current = *it;\n"
+        "        if (accepts(current)) {}\n"
+        "    }\n"
         "}\n";
 
     std::vector<ConversionChange> changes;
@@ -5397,12 +5419,23 @@ void testConstReturnPropagationUpdatesObserverContainersAndPredicates()
             "visible helper accepting const-return values should become const-correct\nConverted code:\n" + fixed);
     require(contains(fixed, "bool operator()(const Item* item) const"),
             "predicate functor accepting values from a const-pointer container should become const-correct\nConverted code:\n" + fixed);
+    require(contains(fixed, "std::vector<const Item*>::iterator it = found.begin();")
+                || contains(fixed, "auto it = found.begin();"),
+            "explicit iterator over a const-pointer vector should use the updated container type or auto\nConverted code:\n" + fixed);
+    require(contains(fixed, "const Item* current = *it;"),
+            "local pointer initialized from const-pointer iterator dereference should become const-correct\nConverted code:\n" + fixed);
     require(!contains(fixed, "std::vector<Item*> found;"),
             "stale mutable observer container should not remain\nConverted code:\n" + fixed);
+    require(!contains(fixed, "std::vector<Item*>::iterator it"),
+            "stale mutable iterator type should not remain for const-pointer vector\nConverted code:\n" + fixed);
+    require(!containsTrimmedLine(fixed, "Item* current = *it;"),
+            "stale mutable local pointer from const-pointer iterator should not remain\nConverted code:\n" + fixed);
     require(hasAppliedRule(changes, "Const pointer container propagation"),
             "container const propagation should be tracked");
     require(hasAppliedRule(changes, "Const pointer parameter propagation"),
             "predicate/helper const propagation should be tracked");
+    require(hasAppliedRule(changes, "Const pointer iterator propagation"),
+            "iterator/local pointer const propagation should be tracked");
 
     const CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(fixed);
     require(verification.compilerUsed.empty() || verification.passed,
@@ -5607,6 +5640,78 @@ void testVectorAppendPreservesLogicalMaxCapacity()
     if (!result.compilerUsed.empty()) {
         require(result.compileVerificationPassed, "logical max vector append sample should pass syntax verification");
     }
+}
+
+void testPostVectorCleanupRewritesStaleCountCapacityGuard()
+{
+    TransformationContext context;
+    context.registerTypeChange(TypeChangeRecord{
+        "items",
+        "Item*",
+        "std::vector<Item>",
+        "LimitedItems",
+        true,
+        "Raw dynamic array to std::vector",
+        {},
+        {},
+        true,
+    });
+
+    std::vector<ConversionChange> changes;
+    const ContainerModernizationCleanupPass cleanupPass;
+    const std::string updated = cleanupPass.rewrite(
+        "#include <vector>\n"
+        "#include <cstddef>\n"
+        "struct Item\n"
+        "{\n"
+        "    int value;\n"
+        "};\n\n"
+        "class LimitedItems\n"
+        "{\n"
+        "public:\n"
+        "    LimitedItems()\n"
+        "        : count(0), capacity(4)\n"
+        "    {\n"
+        "        items.reserve(capacity);\n"
+        "    }\n\n"
+        "    bool add(int value)\n"
+        "    {\n"
+        "        if (count < capacity) {\n"
+        "            Item item{};\n"
+        "            item.value = value;\n"
+        "            items.push_back(item);\n"
+        "            return true;\n"
+        "        }\n"
+        "        return false;\n"
+        "    }\n\n"
+        "    std::size_t getCount() const { return count; }\n\n"
+        "private:\n"
+        "    std::vector<Item> items;\n"
+        "    std::size_t count;\n"
+        "    std::size_t capacity;\n"
+        "};\n",
+        context,
+        changes);
+
+    require(contains(updated, "if (items.size() < static_cast<std::size_t>(capacity))"),
+            "stale count/capacity guard should use vector.size() for the logical max check\nConverted code:\n" + updated);
+    require(contains(updated, "return items.size();"),
+            "count getter should return vector.size() after count mirror is no longer maintained\nConverted code:\n" + updated);
+    require(!contains(updated, "std::size_t count;"),
+            "stale count member should be removed after all mirror uses are rewritten\nConverted code:\n" + updated);
+    require(!contains(updated, "count(0)"),
+            "stale count initializer should be removed\nConverted code:\n" + updated);
+    require(!contains(updated, "if (count < capacity)"),
+            "count-based push_back guard should not remain after vector conversion\nConverted code:\n" + updated);
+    require(!contains(updated, "++count") && !contains(updated, "count++"),
+            "manual count updates should not be needed for vector-owned size\nConverted code:\n" + updated);
+    require(hasAppliedRule(changes, "Post-vector stale count usage rewrite"),
+            "stale count usage rewrite should be tracked");
+
+    const CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(updated);
+    require(verification.compilerUsed.empty() || verification.passed,
+            "stale count guard cleanup should pass syntax verification\nCompiler output:\n"
+                + verification.output + "\nConverted code:\n" + updated);
 }
 
 void testVectorAppendPassConvertsReserveToResizeForFixedIndexWrites()
@@ -7402,6 +7507,7 @@ int main(int argc, char** argv)
     testReferenceReturnPropagationRepairsStaleContainerReceiver();
     testVectorModernizationRemovesCleanupOnlyCopySpecialMembers();
     testVectorAppendPreservesLogicalMaxCapacity();
+    testPostVectorCleanupRewritesStaleCountCapacityGuard();
     testVectorAppendPassConvertsReserveToResizeForFixedIndexWrites();
     testVectorEmulationRemovesOrphanedTempGrowthReferences();
     testOrphanedGrowthSymbolCleanupUsesCompilerDiagnostics();

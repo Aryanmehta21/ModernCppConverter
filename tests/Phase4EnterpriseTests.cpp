@@ -2314,6 +2314,269 @@ void runFunctionalModernizationTests()
             "range loop should choose a non-shadowing variable name for data containers\nOutput:\n" + shadowAvoidanceResult.modernCode);
     requireCompilePassIfCompilerAvailable(shadowAvoidanceResult, "shadow-safe range loops should compile");
 
+    const ConversionResult templateCollectionNameResult = converter.convert(
+        "template <class Collection>\n"
+        "int sumCollection(const Collection& collection)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (typename Collection::const_iterator it = collection.begin(); it != collection.end(); ++it)\n"
+        "    {\n"
+        "        total += *it;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n",
+        options);
+    require(!contains(templateCollectionNameResult.modernCode, "for (const auto& collection : collection)"),
+            "template range loop must not use the container name as the element name\nOutput:\n"
+                + templateCollectionNameResult.modernCode);
+    require(contains(templateCollectionNameResult.modernCode, "for (const auto& item : collection)")
+                || contains(templateCollectionNameResult.modernCode, "for (const auto& element : collection)")
+                || contains(templateCollectionNameResult.modernCode, "for (const auto& value : collection)"),
+            "safe template iterator modernization should still convert despite the collection name conflict\nOutput:\n"
+                + templateCollectionNameResult.modernCode);
+    requireCompilePassIfCompilerAvailable(templateCollectionNameResult,
+                                          "template collection range variable naming should compile");
+
+    const ConversionResult recordsNameResult = converter.convert(
+        "#include <vector>\n"
+        "struct Record { int value; };\n"
+        "int sumRecords(const std::vector<Record>& records)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (std::size_t index = 0; index < records.size(); ++index)\n"
+        "    {\n"
+        "        total += records[index].value;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n",
+        options);
+    require(contains(recordsNameResult.modernCode, "for (const auto& record : records)"),
+            "records should singularize to record when no body conflict exists\nOutput:\n"
+                + recordsNameResult.modernCode);
+    requireCompilePassIfCompilerAvailable(recordsNameResult, "records range variable naming should compile");
+
+    const ConversionResult mapLabelsResult = converter.convert(
+        "#include <map>\n"
+        "#include <string>\n"
+        "int sumLabels(const std::map<std::string, int>& labels)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (std::map<std::string, int>::const_iterator it = labels.begin(); it != labels.end(); ++it)\n"
+        "    {\n"
+        "        total += static_cast<int>(it->first.size()) + it->second;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n",
+        options);
+    require(contains(mapLabelsResult.modernCode, "for (const auto& [key, value] : labels)")
+                || contains(mapLabelsResult.modernCode, "for (const auto& [key, mapped] : labels)"),
+            "map-like container named labels should use structured binding instead of label/labels shadowing\nOutput:\n"
+                + mapLabelsResult.modernCode);
+    requireCompilePassIfCompilerAvailable(mapLabelsResult, "labels structured binding should compile");
+
+    const ConversionResult bodyLocalConflictResult = converter.convert(
+        "#include <vector>\n"
+        "struct Record { int value; };\n"
+        "int sumWithLocalRecord(const std::vector<Record>& records)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (std::size_t index = 0; index < records.size(); ++index)\n"
+        "    {\n"
+        "        int record = 1;\n"
+        "        total += records[index].value + record;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n",
+        options);
+    require(!contains(bodyLocalConflictResult.modernCode, "for (const auto& record : records)"),
+            "range variable should not duplicate a local variable declared in the loop body\nOutput:\n"
+                + bodyLocalConflictResult.modernCode);
+    require(contains(bodyLocalConflictResult.modernCode, "for (const auto& item : records)")
+                || contains(bodyLocalConflictResult.modernCode, "for (const auto& element : records)")
+                || contains(bodyLocalConflictResult.modernCode, "for (const auto& value : records)"),
+            "loop should still modernize with a fallback variable name when preferred singular conflicts\nOutput:\n"
+                + bodyLocalConflictResult.modernCode);
+    require(contains(bodyLocalConflictResult.modernCode, "item.value")
+                || contains(bodyLocalConflictResult.modernCode, "element.value")
+                || contains(bodyLocalConflictResult.modernCode, "value.value"),
+            "member access originally using records[index] should follow the renamed range variable\nOutput:\n"
+                + bodyLocalConflictResult.modernCode);
+    requireCompilePassIfCompilerAvailable(bodyLocalConflictResult, "body-local conflict range loop should compile");
+
+    const ConversionResult functionArgumentRenameResult = converter.convert(
+        "#include <vector>\n"
+        "struct Record { int value; };\n"
+        "void printRecord(const Record& record);\n"
+        "void printAll(const std::vector<Record>& records)\n"
+        "{\n"
+        "    for (std::size_t index = 0; index < records.size(); ++index)\n"
+        "    {\n"
+        "        int record = 0;\n"
+        "        printRecord(records[index]);\n"
+        "        (void)record;\n"
+        "    }\n"
+        "}\n",
+        options);
+    require(!contains(functionArgumentRenameResult.modernCode, "printRecord(record);"),
+            "function argument should be updated when the range variable is renamed\nOutput:\n"
+                + functionArgumentRenameResult.modernCode);
+    require(contains(functionArgumentRenameResult.modernCode, "printRecord(item);")
+                || contains(functionArgumentRenameResult.modernCode, "printRecord(element);")
+                || contains(functionArgumentRenameResult.modernCode, "printRecord(value);"),
+            "function argument should use the new range variable name\nOutput:\n"
+                + functionArgumentRenameResult.modernCode);
+    requireCompilePassIfCompilerAvailable(functionArgumentRenameResult,
+                                          "renamed range variable function argument should compile");
+
+    const ConversionResult pointerAccessRenameResult = converter.convert(
+        "#include <vector>\n"
+        "struct Record { int value; };\n"
+        "int sumPointers(const std::vector<Record*>& records)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (std::size_t index = 0; index < records.size(); ++index)\n"
+        "    {\n"
+        "        int record = 0;\n"
+        "        total += records[index]->value + record;\n"
+        "    }\n"
+        "    return total;\n"
+        "}\n",
+        options);
+    require(contains(pointerAccessRenameResult.modernCode, "item->value")
+                || contains(pointerAccessRenameResult.modernCode, "element->value")
+                || contains(pointerAccessRenameResult.modernCode, "value->value"),
+            "pointer member access should follow the renamed range variable\nOutput:\n"
+                + pointerAccessRenameResult.modernCode);
+    requireCompilePassIfCompilerAvailable(pointerAccessRenameResult,
+                                          "renamed range variable pointer access should compile");
+
+    const ConversionResult nestedIfRenameResult = converter.convert(
+        "#include <vector>\n"
+        "struct Record { int value; };\n"
+        "void printRecord(const Record& record);\n"
+        "void printPositive(const std::vector<Record>& records)\n"
+        "{\n"
+        "    for (std::size_t index = 0; index < records.size(); ++index)\n"
+        "    {\n"
+        "        int record = 0;\n"
+        "        if (records[index].value > record)\n"
+        "        {\n"
+        "            printRecord(records[index]);\n"
+        "        }\n"
+        "    }\n"
+        "}\n",
+        options);
+    require(!contains(nestedIfRenameResult.modernCode, "printRecord(record);"),
+            "nested block references should be updated when the range variable is renamed\nOutput:\n"
+                + nestedIfRenameResult.modernCode);
+    require(contains(nestedIfRenameResult.modernCode, "printRecord(item);")
+                || contains(nestedIfRenameResult.modernCode, "printRecord(element);")
+                || contains(nestedIfRenameResult.modernCode, "printRecord(value);"),
+            "nested block function argument should use the new range variable name\nOutput:\n"
+                + nestedIfRenameResult.modernCode);
+    requireCompilePassIfCompilerAvailable(nestedIfRenameResult,
+                                          "renamed range variable nested if should compile");
+
+    const ConversionResult nestedLambdaRenameResult = converter.convert(
+        "#include <vector>\n"
+        "struct Record { int value; };\n"
+        "void printRecord(const Record& record);\n"
+        "void printDeferred(const std::vector<Record>& records)\n"
+        "{\n"
+        "    for (std::size_t index = 0; index < records.size(); ++index)\n"
+        "    {\n"
+        "        int record = 0;\n"
+        "        auto emit = [&]() { printRecord(records[index]); };\n"
+        "        emit();\n"
+        "        (void)record;\n"
+        "    }\n"
+        "}\n",
+        options);
+    require(!contains(nestedLambdaRenameResult.modernCode, "printRecord(record);"),
+            "nested lambda should update unshadowed loop-variable references after rename\nOutput:\n"
+                + nestedLambdaRenameResult.modernCode);
+    require(contains(nestedLambdaRenameResult.modernCode, "printRecord(item);")
+                || contains(nestedLambdaRenameResult.modernCode, "printRecord(element);")
+                || contains(nestedLambdaRenameResult.modernCode, "printRecord(value);"),
+            "nested lambda should use the new range variable name\nOutput:\n"
+                + nestedLambdaRenameResult.modernCode);
+    requireCompilePassIfCompilerAvailable(nestedLambdaRenameResult,
+                                          "renamed range variable nested lambda should compile");
+
+    const ConversionResult shadowedLambdaRenameResult = converter.convert(
+        "#include <vector>\n"
+        "struct Record { int value; };\n"
+        "void printRecord(const Record& record);\n"
+        "void printWithShadowedLambda(const std::vector<Record>& records)\n"
+        "{\n"
+        "    for (std::size_t index = 0; index < records.size(); ++index)\n"
+        "    {\n"
+        "        auto emit = [&](const Record& record) { printRecord(record); };\n"
+        "        printRecord(records[index]);\n"
+        "        emit(records[index]);\n"
+        "    }\n"
+        "}\n",
+        options);
+    require(contains(shadowedLambdaRenameResult.modernCode, "const Record& record"),
+            "lambda parameter named like the preferred loop variable should remain unchanged\nOutput:\n"
+                + shadowedLambdaRenameResult.modernCode);
+    require(contains(shadowedLambdaRenameResult.modernCode, "printRecord(item);")
+                || contains(shadowedLambdaRenameResult.modernCode, "printRecord(element);")
+                || contains(shadowedLambdaRenameResult.modernCode, "printRecord(value);"),
+            "outer loop references should still use the renamed range variable\nOutput:\n"
+                + shadowedLambdaRenameResult.modernCode);
+    requireCompilePassIfCompilerAvailable(shadowedLambdaRenameResult,
+                                          "shadowed lambda range variable rename should compile");
+
+    const ConversionResult redundantReferenceLocalResult = converter.convert(
+        "#include <iostream>\n"
+        "#include <vector>\n"
+        "struct DiagnosticRecord { int code; };\n"
+        "void printRecords(const std::vector<DiagnosticRecord>& records)\n"
+        "{\n"
+        "    for (std::size_t index = 0; index < records.size(); ++index)\n"
+        "    {\n"
+        "        const DiagnosticRecord& record = records[index];\n"
+        "        std::cout << record.code << '\\n';\n"
+        "    }\n"
+        "}\n",
+        options);
+    require(contains(redundantReferenceLocalResult.modernCode, "for (const auto& record : records)")
+                || contains(redundantReferenceLocalResult.modernCode, "for (const auto& item : records)")
+                || contains(redundantReferenceLocalResult.modernCode, "for (const auto& element : records)"),
+            "index loop with redundant reference local should become a non-shadowing range loop\nOutput:\n"
+                + redundantReferenceLocalResult.modernCode);
+    require(!contains(redundantReferenceLocalResult.modernCode, "const DiagnosticRecord& record = record"),
+            "range-for rewrite must not leave self-initializing reference locals\nOutput:\n"
+                + redundantReferenceLocalResult.modernCode);
+    require(!contains(redundantReferenceLocalResult.modernCode, "auto& record = record"),
+            "range-for rewrite must not leave self-initializing auto reference locals\nOutput:\n"
+                + redundantReferenceLocalResult.modernCode);
+    requireCompilePassIfCompilerAvailable(redundantReferenceLocalResult,
+                                          "redundant reference local range-for should compile");
+
+    const ConversionResult pointerLocalResult = converter.convert(
+        "#include <iostream>\n"
+        "#include <vector>\n"
+        "struct Item { int value; };\n"
+        "Item* getItem(std::vector<Item>& items, std::size_t index) { return &items[index]; }\n"
+        "void printItems(std::vector<Item>& items)\n"
+        "{\n"
+        "    for (std::size_t index = 0; index < items.size(); ++index)\n"
+        "    {\n"
+        "        Item* item = getItem(items, index);\n"
+        "        std::cout << item->value << '\\n';\n"
+        "    }\n"
+        "}\n",
+        options);
+    require(!contains(pointerLocalResult.modernCode, "Item* item = item"),
+            "range-for rewrite must not leave self-initializing pointer locals\nOutput:\n"
+                + pointerLocalResult.modernCode);
+    require(!contains(pointerLocalResult.modernCode, "auto* item = item"),
+            "range-for rewrite must not leave self-initializing auto pointer locals\nOutput:\n"
+                + pointerLocalResult.modernCode);
+    requireCompilePassIfCompilerAvailable(pointerLocalResult, "pointer local range-for should compile");
+
     const ConversionResult indexDependentResult = converter.convert(
         "#include <iostream>\n"
         "#include <vector>\n"

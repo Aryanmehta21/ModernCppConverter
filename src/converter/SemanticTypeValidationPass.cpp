@@ -1022,6 +1022,450 @@ std::string cleanupTransformationFormatting(std::string code, std::vector<Conver
     }
     return code;
 }
+
+std::string removeSelfInitializingPointerReferenceArtifacts(std::string code,
+                                                            std::vector<ConversionChange>& changes)
+{
+    const std::string before = code;
+    std::ostringstream output;
+    std::istringstream input(code);
+    std::string line;
+    bool changed = false;
+    bool firstLine = true;
+
+    const std::regex selfInitializingDeclaration(
+        R"(^[ \t]*(?:const\s+)?(?:auto|[A-Za-z_:][A-Za-z0-9_:<>, \t]*(?:\s+const)?)\s*[&*]\s*([A-Za-z_]\w*)\s*=\s*\1\s*;\s*$)",
+        std::regex::ECMAScript);
+
+    while (std::getline(input, line)) {
+        if (std::regex_match(line, selfInitializingDeclaration)) {
+            changed = true;
+            continue;
+        }
+
+        if (!firstLine) {
+            output << '\n';
+        }
+        firstLine = false;
+        output << line;
+    }
+
+    if (!changed) {
+        return code;
+    }
+
+    code = output.str();
+    if (!before.empty() && before.back() == '\n' && (code.empty() || code.back() != '\n')) {
+        code.push_back('\n');
+    }
+
+    addAppliedChange(changes,
+                     "Range-for self-initialization cleanup",
+                     "self-initializing pointer/reference local",
+                     "removed redundant local declaration",
+                     "Removed a self-initializing pointer/reference declaration left after range-for modernization.");
+    return code;
+}
+
+std::string safeRangeVariableName(const std::string& body, const std::string& forbiddenName)
+{
+    const std::vector<std::string> candidates{"item", "entry", "value", "element"};
+    for (const std::string& candidate : candidates) {
+        if (candidate == forbiddenName) {
+            continue;
+        }
+        if (!std::regex_search(body, std::regex(R"(\b)" + escapeRegex(candidate) + R"(\b)"))) {
+            return candidate;
+        }
+    }
+
+    int suffix = 1;
+    while (std::regex_search(body, std::regex(R"(\bitem)" + std::to_string(suffix) + R"(\b)"))) {
+        ++suffix;
+    }
+    return "item" + std::to_string(suffix);
+}
+
+bool isIdentifierStart(char character)
+{
+    const auto value = static_cast<unsigned char>(character);
+    return std::isalpha(value) != 0 || character == '_';
+}
+
+bool isIdentifierBody(char character)
+{
+    const auto value = static_cast<unsigned char>(character);
+    return std::isalnum(value) != 0 || character == '_';
+}
+
+std::size_t findMatchingBraceInText(const std::string& text, const std::size_t openBrace)
+{
+    if (openBrace >= text.size() || text[openBrace] != '{') {
+        return std::string::npos;
+    }
+
+    int depth = 0;
+    bool inString = false;
+    bool inCharacter = false;
+    bool inLineComment = false;
+    bool inBlockComment = false;
+    bool escaped = false;
+    for (std::size_t index = openBrace; index < text.size(); ++index) {
+        const char current = text[index];
+        const char next = index + 1 < text.size() ? text[index + 1] : '\0';
+        if (inLineComment) {
+            if (current == '\n') {
+                inLineComment = false;
+            }
+            continue;
+        }
+        if (inBlockComment) {
+            if (current == '*' && next == '/') {
+                inBlockComment = false;
+                ++index;
+            }
+            continue;
+        }
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (current == '\\' && (inString || inCharacter)) {
+            escaped = true;
+            continue;
+        }
+        if (!inString && !inCharacter && current == '/' && next == '/') {
+            inLineComment = true;
+            ++index;
+            continue;
+        }
+        if (!inString && !inCharacter && current == '/' && next == '*') {
+            inBlockComment = true;
+            ++index;
+            continue;
+        }
+        if (!inCharacter && current == '"') {
+            inString = !inString;
+            continue;
+        }
+        if (!inString && current == '\'') {
+            inCharacter = !inCharacter;
+            continue;
+        }
+        if (inString || inCharacter) {
+            continue;
+        }
+        if (current == '{') {
+            ++depth;
+        } else if (current == '}') {
+            --depth;
+            if (depth == 0) {
+                return index;
+            }
+        }
+    }
+    return std::string::npos;
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> lambdaParameterShadowRanges(const std::string& body,
+                                                                             const std::string& identifier)
+{
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
+    const std::regex lambdaWithParameter(
+        R"(\[[^\]\n]*\]\s*\([^)]*\b)"
+            + escapeRegex(identifier)
+            + R"(\b[^)]*\)\s*(?:mutable\s*)?(?:noexcept\s*)?(?:->[^{}\n]+)?\{)",
+        std::regex::ECMAScript);
+    for (std::sregex_iterator iterator(body.begin(), body.end(), lambdaWithParameter), end; iterator != end; ++iterator) {
+        const std::size_t openBrace = static_cast<std::size_t>(iterator->position() + iterator->length() - 1);
+        const std::size_t closeBrace = findMatchingBraceInText(body, openBrace);
+        if (closeBrace != std::string::npos) {
+            ranges.emplace_back(openBrace + 1, closeBrace);
+        }
+    }
+    return ranges;
+}
+
+bool isInsideAnyRange(const std::vector<std::pair<std::size_t, std::size_t>>& ranges,
+                      const std::size_t position)
+{
+    return std::any_of(ranges.begin(), ranges.end(), [position](const auto& range) {
+        return position >= range.first && position < range.second;
+    });
+}
+
+bool isLikelyDeclarationIdentifier(const std::string& body,
+                                   const std::size_t identifierBegin,
+                                   const std::size_t identifierEnd)
+{
+    std::size_t before = identifierBegin;
+    while (before > 0 && std::isspace(static_cast<unsigned char>(body[before - 1])) != 0) {
+        --before;
+    }
+    if (before > 0 && (body[before - 1] == '.' || body[before - 1] == '>')) {
+        return false;
+    }
+
+    std::size_t after = identifierEnd;
+    while (after < body.size() && std::isspace(static_cast<unsigned char>(body[after])) != 0) {
+        ++after;
+    }
+    if (after < body.size() && body[after] == '(') {
+        return false;
+    }
+
+    std::size_t prefixBegin = identifierBegin;
+    while (prefixBegin > 0) {
+        const char previous = body[prefixBegin - 1];
+        if (previous == ';' || previous == '{' || previous == '}' || previous == '\n' || previous == '(' || previous == ',') {
+            break;
+        }
+        --prefixBegin;
+    }
+    const std::string prefix = trim(body.substr(prefixBegin, identifierBegin - prefixBegin));
+    if (prefix.empty() || prefix.find("<<") != std::string::npos || prefix.find(">>") != std::string::npos) {
+        return false;
+    }
+
+    const std::regex declarationPrefix(
+        R"((?:const\s+|volatile\s+|static\s+)*(?:auto|bool|char|short|int|long|float|double|std::[A-Za-z_]\w*(?:\s*<[^;\n{}()]*>)?|[A-Z][A-Za-z0-9_:]*(?:\s*<[^;\n{}()]*>)?|[A-Za-z_]\w*::[A-Za-z_]\w*)(?:\s+const)?\s*[*&]*$)",
+        std::regex::ECMAScript);
+    return std::regex_match(prefix, declarationPrefix);
+}
+
+bool isPrimitiveDeclarationIdentifier(const std::string& body, const std::size_t identifierBegin)
+{
+    std::size_t prefixBegin = identifierBegin;
+    while (prefixBegin > 0) {
+        const char previous = body[prefixBegin - 1];
+        if (previous == ';' || previous == '{' || previous == '}' || previous == '\n' || previous == '(' || previous == ',') {
+            break;
+        }
+        --prefixBegin;
+    }
+    const std::string prefix = trim(body.substr(prefixBegin, identifierBegin - prefixBegin));
+    const std::regex primitivePrefix(
+        R"((?:const\s+|volatile\s+|static\s+)*(?:bool|char|short|int|long|float|double)(?:\s+const)?\s*[*&]*$)",
+        std::regex::ECMAScript);
+    return std::regex_match(prefix, primitivePrefix);
+}
+
+enum class ShadowKind
+{
+    None,
+    Primitive,
+    Full,
+};
+
+bool anyScopeShadows(const std::vector<ShadowKind>& scopeShadows)
+{
+    return std::any_of(scopeShadows.begin(), scopeShadows.end(), [](ShadowKind shadowed) {
+        return shadowed != ShadowKind::None;
+    });
+}
+
+bool anyFullShadow(const std::vector<ShadowKind>& scopeShadows)
+{
+    return std::any_of(scopeShadows.begin(), scopeShadows.end(), [](ShadowKind shadowed) {
+        return shadowed == ShadowKind::Full;
+    });
+}
+
+bool anyPrimitiveShadow(const std::vector<ShadowKind>& scopeShadows)
+{
+    return std::any_of(scopeShadows.begin(), scopeShadows.end(), [](ShadowKind shadowed) {
+        return shadowed == ShadowKind::Primitive;
+    });
+}
+
+bool identifierIsFollowedByMemberAccess(const std::string& body, std::size_t identifierEnd)
+{
+    while (identifierEnd < body.size() && std::isspace(static_cast<unsigned char>(body[identifierEnd])) != 0) {
+        ++identifierEnd;
+    }
+    return identifierEnd < body.size()
+        && (body[identifierEnd] == '.'
+            || (body[identifierEnd] == '-' && identifierEnd + 1 < body.size() && body[identifierEnd + 1] == '>'));
+}
+
+std::string renameLoopVariableReferencesInBody(const std::string& body,
+                                               const std::string& oldName,
+                                               const std::string& newName)
+{
+    if (oldName == newName) {
+        return body;
+    }
+
+    const auto lambdaShadowRanges = lambdaParameterShadowRanges(body, oldName);
+    std::vector<std::pair<std::size_t, std::size_t>> replacements;
+    std::vector<ShadowKind> scopeShadows{ShadowKind::None};
+
+    bool inString = false;
+    bool inCharacter = false;
+    bool inLineComment = false;
+    bool inBlockComment = false;
+    bool escaped = false;
+    for (std::size_t index = 0; index < body.size();) {
+        const char current = body[index];
+        const char next = index + 1 < body.size() ? body[index + 1] : '\0';
+        if (inLineComment) {
+            if (current == '\n') {
+                inLineComment = false;
+            }
+            ++index;
+            continue;
+        }
+        if (inBlockComment) {
+            if (current == '*' && next == '/') {
+                inBlockComment = false;
+                index += 2;
+            } else {
+                ++index;
+            }
+            continue;
+        }
+        if (escaped) {
+            escaped = false;
+            ++index;
+            continue;
+        }
+        if (current == '\\' && (inString || inCharacter)) {
+            escaped = true;
+            ++index;
+            continue;
+        }
+        if (!inString && !inCharacter && current == '/' && next == '/') {
+            inLineComment = true;
+            index += 2;
+            continue;
+        }
+        if (!inString && !inCharacter && current == '/' && next == '*') {
+            inBlockComment = true;
+            index += 2;
+            continue;
+        }
+        if (!inCharacter && current == '"') {
+            inString = !inString;
+            ++index;
+            continue;
+        }
+        if (!inString && current == '\'') {
+            inCharacter = !inCharacter;
+            ++index;
+            continue;
+        }
+        if (inString || inCharacter) {
+            ++index;
+            continue;
+        }
+        if (current == '{') {
+            scopeShadows.push_back(ShadowKind::None);
+            ++index;
+            continue;
+        }
+        if (current == '}') {
+            if (scopeShadows.size() > 1) {
+                scopeShadows.pop_back();
+            }
+            ++index;
+            continue;
+        }
+        if (!isIdentifierStart(current)) {
+            ++index;
+            continue;
+        }
+
+        const std::size_t identifierBegin = index;
+        ++index;
+        while (index < body.size() && isIdentifierBody(body[index])) {
+            ++index;
+        }
+        const std::size_t identifierEnd = index;
+        if (body.compare(identifierBegin, identifierEnd - identifierBegin, oldName) != 0) {
+            continue;
+        }
+
+        if (isLikelyDeclarationIdentifier(body, identifierBegin, identifierEnd)) {
+            if (!isInsideAnyRange(lambdaShadowRanges, identifierBegin)) {
+                scopeShadows.back() = isPrimitiveDeclarationIdentifier(body, identifierBegin)
+                    ? ShadowKind::Primitive
+                    : ShadowKind::Full;
+            }
+            continue;
+        }
+        if (isInsideAnyRange(lambdaShadowRanges, identifierBegin)) {
+            continue;
+        }
+        if (anyScopeShadows(scopeShadows)) {
+            const bool memberAccessFromPrimitiveShadow =
+                identifierIsFollowedByMemberAccess(body, identifierEnd)
+                && anyPrimitiveShadow(scopeShadows)
+                && !anyFullShadow(scopeShadows);
+            if (!memberAccessFromPrimitiveShadow) {
+                continue;
+            }
+        }
+        replacements.emplace_back(identifierBegin, identifierEnd);
+    }
+
+    std::string updated = body;
+    for (auto iterator = replacements.rbegin(); iterator != replacements.rend(); ++iterator) {
+        updated.replace(iterator->first, iterator->second - iterator->first, newName);
+    }
+    return updated;
+}
+
+std::string repairRangeForVariableNamingArtifacts(std::string code,
+                                                  std::vector<ConversionChange>& changes)
+{
+    std::string updated = code;
+    const std::regex rangeLoop(
+        R"((^[ \t]*)for\s*\(\s*((?:const\s+)?auto\s*&?\s+)([A-Za-z_]\w*)\s*:\s*([A-Za-z_]\w*)\s*\)\s*\n?\1\{\s*\n([\s\S]*?)\n\1\})",
+        std::regex::ECMAScript | std::regex::multiline);
+
+    std::smatch match;
+    std::string search = updated;
+    std::size_t consumed = 0;
+    while (std::regex_search(search, match, rangeLoop)) {
+        const std::string indent = match[1].str();
+        const std::string qualifier = match[2].str();
+        const std::string variableName = match[3].str();
+        const std::string containerName = match[4].str();
+        std::string body = match[5].str();
+
+        const std::regex duplicateDeclaration(
+            R"((^|\n)[ \t]*(?:const\s+)?(?:auto|[A-Za-z_:][A-Za-z0-9_:<>, \t]*(?:\s+const)?)\s*(?:[&*]\s*)?)"
+                + escapeRegex(variableName)
+                + R"(\s*(?:=|;|\{))",
+            std::regex::ECMAScript);
+        const bool shadowsContainer = variableName == containerName;
+        const bool duplicatesBodyLocal = std::regex_search(body, duplicateDeclaration);
+        if (!shadowsContainer && !duplicatesBodyLocal) {
+            consumed += static_cast<std::size_t>(match.position() + match.length());
+            search = match.suffix().str();
+            continue;
+        }
+
+        const std::string newName = safeRangeVariableName(body, containerName);
+        body = renameLoopVariableReferencesInBody(body, variableName, newName);
+
+        const std::string replacement =
+            indent + "for (" + qualifier + newName + " : " + containerName + ")\n"
+            + indent + "{\n" + body + "\n" + indent + "}";
+        updated.replace(consumed + static_cast<std::size_t>(match.position()),
+                        static_cast<std::size_t>(match.length()),
+                        replacement);
+        addAppliedChange(changes,
+                         "Range-for variable naming cleanup",
+                         trim(match[0].str()),
+                         trim(replacement),
+                         "Renamed a range-for variable to avoid shadowing its container or a local declaration in the loop body.");
+        consumed += static_cast<std::size_t>(match.position()) + replacement.size();
+        search = updated.substr(consumed);
+    }
+
+    return updated;
+}
 } // namespace
 
 std::string SemanticTypeValidationPass::validateAndRepair(const std::string& code,
@@ -1037,6 +1481,8 @@ std::string SemanticTypeValidationPass::validateAndRepair(const std::string& cod
     updated = cleanupCStringApiAfterStringModernization(std::move(updated), changes);
     updated = rewriteFprintfStringArguments(std::move(updated), collectStringSymbols(updated), changes);
     updated = repairSignedLoopIndicesForSizeGetters(updated, changes);
+    updated = repairRangeForVariableNamingArtifacts(std::move(updated), changes);
+    updated = removeSelfInitializingPointerReferenceArtifacts(std::move(updated), changes);
     const NsdmiScopeSafetyPass nsdmiScopeSafetyPass;
     updated = nsdmiScopeSafetyPass.validateAndRepair(updated, changes);
     if (hadAppliedChanges || updated != code) {

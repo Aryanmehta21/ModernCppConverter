@@ -85,6 +85,34 @@ bool streamsKnownPairRangeElementDirectly(const std::string& code)
     }
     return false;
 }
+
+bool containsSelfInitializingPointerOrReference(const std::string& code)
+{
+    return std::regex_search(
+        code,
+        std::regex(R"((^|\n)[ \t]*(?:const\s+)?(?:auto|[A-Za-z_:][A-Za-z0-9_:<>, \t]*(?:\s+const)?)\s*[&*]\s*([A-Za-z_]\w*)\s*=\s*\2\s*;)",
+                   std::regex::ECMAScript));
+}
+
+bool rangeLoopBodyRedeclaresLoopVariable(const std::string& code)
+{
+    const std::regex rangeLoop(
+        R"(for\s*\(\s*(?:const\s+)?auto\s*&?\s+([A-Za-z_]\w*)\s*:\s*[^)]+\)\s*\{([\s\S]*?)\n[ \t]*\})",
+        std::regex::ECMAScript);
+    for (std::sregex_iterator iterator(code.begin(), code.end(), rangeLoop), end; iterator != end; ++iterator) {
+        const std::string variableName = (*iterator)[1].str();
+        const std::string body = (*iterator)[2].str();
+        const std::regex declarationPattern(
+            R"((^|\n)[ \t]*(?:const\s+)?(?:auto|[A-Za-z_:][A-Za-z0-9_:<>, \t]*(?:\s+const)?)\s*(?:[&*]\s*)?)"
+                + variableName
+                + R"(\s*(?:=|;|\{))",
+            std::regex::ECMAScript);
+        if (std::regex_search(body, declarationPattern)) {
+            return true;
+        }
+    }
+    return false;
+}
 } // namespace
 
 bool FunctionalModernizationValidator::isValid(const std::string& code, std::string& reason) const
@@ -107,6 +135,14 @@ bool FunctionalModernizationValidator::isValid(const std::string& code, std::str
     }
     if (std::regex_search(code, std::regex(R"(for\s*\(\s*(?:const\s+)?auto\s*&?\s+([A-Za-z_]\w*)\s*:\s*\1\s*\))"))) {
         reason = "Functional modernization produced a range variable that shadows its container.";
+        return false;
+    }
+    if (containsSelfInitializingPointerOrReference(code)) {
+        reason = "Functional modernization produced a self-initializing pointer or reference variable.";
+        return false;
+    }
+    if (rangeLoopBodyRedeclaresLoopVariable(code)) {
+        reason = "Functional modernization produced a range loop variable that is redeclared inside the loop body.";
         return false;
     }
     if (streamsKnownPairRangeElementDirectly(code)) {

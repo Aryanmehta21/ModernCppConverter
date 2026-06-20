@@ -70,3 +70,16 @@ target_link_libraries(GuiConversionSmokeTests
 
 add_test(NAME GuiConversionSmokeTests COMMAND GuiConversionSmokeTests)
 set_tests_properties(GuiConversionSmokeTests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(ParserLayerTests
+    ParserLayerTests.cpp
+)
+modern_cpp_converter_use_root_output(ParserLayerTests)
+
+target_link_libraries(ParserLayerTests
+    PRIVATE
+        ModernCppConverterCore
+        ModernCppConverterWarnings
+)
+
+add_test(NAME ParserLayerTests COMMAND ParserLayerTests)

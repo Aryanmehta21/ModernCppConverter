@@ -35,7 +35,11 @@ std::string collapseWhitespace(std::string value)
 std::string singularName(const std::string& collectionName)
 {
     if (collectionName.size() > 1 && collectionName.back() == 's') {
-        return collectionName.substr(0, collectionName.size() - 1);
+        const std::string singular = collectionName.substr(0, collectionName.size() - 1);
+        if (singular == collectionName || singular == "collection") {
+            return "item";
+        }
+        return singular == "label" ? "entry" : singular;
     }
     return "value";
 }

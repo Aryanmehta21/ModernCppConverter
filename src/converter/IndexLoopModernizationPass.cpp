@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <regex>
 #include <string_view>
 #include <utility>
@@ -126,6 +127,39 @@ std::string variableNameForCollection(const std::string& collection, const std::
     }
     return collectionIdentifier == "item" ? "element" : "item";
 }
+
+struct RedundantReferenceAlias
+{
+    std::string name;
+    bool mutableReference = false;
+};
+
+std::optional<RedundantReferenceAlias> removeRedundantReferenceAlias(std::string& body,
+                                                                     const std::string& indexedExpression)
+{
+    const std::regex aliasPattern(
+        R"((^|\n)([ \t]*(?:const\s+)?[A-Za-z_:][A-Za-z0-9_:<>, \t]*(?:\s+const)?\s*&\s*([A-Za-z_]\w*)\s*=\s*)"
+            + indexedExpression
+            + R"(\s*;\s*(?:\n|$)))",
+        std::regex::ECMAScript);
+
+    std::smatch match;
+    if (!std::regex_search(body, match, aliasPattern)) {
+        return std::nullopt;
+    }
+
+    RedundantReferenceAlias alias;
+    alias.name = match[3].str();
+    const std::string declarationPrefix = match[2].str();
+    alias.mutableReference = !std::regex_search(declarationPrefix, std::regex(R"(\bconst\b)"));
+
+    const std::string linePrefix = match[1].str();
+    const std::string replacement = linePrefix.empty() ? std::string{} : "\n";
+    body.replace(static_cast<std::size_t>(match.position()),
+                 static_cast<std::size_t>(match.length()),
+                 replacement);
+    return alias;
+}
 } // namespace
 
 std::string IndexLoopModernizationPass::rewrite(const std::string& code,
@@ -184,10 +218,16 @@ std::string IndexLoopModernizationPass::rewrite(const std::string& code,
             continue;
         }
 
-        const bool mutableElement = std::regex_search(body, std::regex(indexedExpression + R"(\s*(?:=|\+=|-=|\*=|/=|%=|\+\+|--))"))
+        const std::optional<RedundantReferenceAlias> redundantAlias =
+            removeRedundantReferenceAlias(body, indexedExpression);
+
+        const bool mutableElement = (redundantAlias.has_value() && redundantAlias->mutableReference)
+            || std::regex_search(body, std::regex(indexedExpression + R"(\s*(?:=|\+=|-=|\*=|/=|%=|\+\+|--))"))
             || std::regex_search(body, std::regex(R"((?:\+\+|--)\s*)" + indexedExpression))
             || std::regex_search(body, std::regex(indexedExpression + R"(\s*(?:\.|->)[^;\n]*\s*(?:=|\+=|-=|\*=|/=|%=|\+\+|--|\())"));
-        const std::string itemName = variableNameForCollection(collection, body);
+        const std::string itemName = redundantAlias.has_value()
+            ? redundantAlias->name
+            : variableNameForCollection(collection, body);
         body = std::regex_replace(body, std::regex(indexedExpression), itemName);
         body = std::regex_replace(body, std::regex(R"(std::endl)"), "'\\n'");
 

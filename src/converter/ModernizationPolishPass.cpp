@@ -280,10 +280,27 @@ std::string replaceSimpleEndl(std::string code, std::vector<ConversionChange>& c
     return changed ? code : code;
 }
 
-std::string variableNameForCollection(const std::string& collection)
+bool containsIdentifier(const std::string& text, const std::string& identifier)
+{
+    return std::regex_search(text, std::regex(R"(\b)" + escapeRegex(identifier) + R"(\b)"));
+}
+
+std::string finalIdentifierFromCollection(std::string collection)
+{
+    collection = trim(std::move(collection));
+    std::smatch match;
+    const std::regex trailingIdentifier(R"(([A-Za-z_]\w*)\s*(?:\[[^\]]+\])?\s*$)");
+    if (std::regex_search(collection, match, trailingIdentifier)) {
+        return match[1].str();
+    }
+    return {};
+}
+
+std::string variableNameForCollection(const std::string& collection, const std::string& body)
 {
     const std::size_t separator = collection.find_last_of(".>");
     std::string name = separator == std::string::npos ? collection : collection.substr(separator + 1);
+    const std::string collectionIdentifier = finalIdentifierFromCollection(collection);
     name.erase(std::remove_if(name.begin(), name.end(), [](unsigned char character) {
                    return !std::isalnum(character) && character != '_';
                }),
@@ -291,7 +308,13 @@ std::string variableNameForCollection(const std::string& collection)
     if (name.size() > 1 && name.back() == 's') {
         name.pop_back();
     }
-    return name.empty() ? "item" : name;
+    std::vector<std::string> candidates{name.empty() ? "item" : name, "item", "entry", "value", "element"};
+    for (const std::string& candidate : candidates) {
+        if (!candidate.empty() && candidate != collectionIdentifier && !containsIdentifier(body, candidate)) {
+            return candidate;
+        }
+    }
+    return collectionIdentifier == "item" ? "element" : "item";
 }
 
 std::string modernizeMapIteratorLoops(std::string code,
@@ -460,7 +483,7 @@ std::string modernizeGenericIteratorLoops(std::string code,
         }
 
         const bool mutableElement = std::regex_search(body, std::regex(dereferencePattern + R"(\s*(?:=|\+=|-=|\*=|/=|%=))"));
-        const std::string elementName = variableNameForCollection(match[4].str());
+        const std::string elementName = variableNameForCollection(match[4].str(), body);
         body = std::regex_replace(body, std::regex(dereferencePattern), elementName);
         body = std::regex_replace(body, std::regex(R"(std::endl)"), "'\\n'");
         const std::string replacement = match[1].str() + "for (" + (mutableElement ? "auto& " : "const auto& ")

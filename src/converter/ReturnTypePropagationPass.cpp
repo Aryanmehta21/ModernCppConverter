@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <map>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -141,6 +142,20 @@ void addConstParameterAppliedChange(std::vector<ConversionChange>& changes,
         std::move(before),
         std::move(after),
         "Updated a visible observer/predicate parameter to accept const T* after call sites began passing const pointer values.",
+        true,
+        false,
+    });
+}
+
+void addConstIteratorAppliedChange(std::vector<ConversionChange>& changes,
+                                   std::string before,
+                                   std::string after)
+{
+    changes.push_back(ConversionChange{
+        "Const pointer iterator propagation",
+        std::move(before),
+        std::move(after),
+        "Updated an explicit iterator/local pointer declaration after an observer container began storing const pointers.",
         true,
         false,
     });
@@ -762,6 +777,99 @@ std::string rewriteConstPointerParameterLine(const std::string& line,
     return codePart + trailingComment;
 }
 
+std::string rewriteConstPointerIteratorLine(const std::string& line,
+                                            const std::vector<ConstPointerContainer>& containers,
+                                            std::map<std::string, std::string>& iteratorValueTypes,
+                                            bool& changed,
+                                            std::vector<ConversionChange>& changes)
+{
+    if (containers.empty()) {
+        return line;
+    }
+
+    std::string trailingComment;
+    std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+    const std::string before = codePart;
+
+    for (const ConstPointerContainer& container : containers) {
+        if (codePart.find(container.name) == std::string::npos) {
+            continue;
+        }
+
+        const std::regex iteratorDeclaration(
+            R"(^([ \t]*(?:for\s*\(\s*)?)std::vector\s*<\s*)"
+                + typeRegex(container.valueType)
+                + R"(\s*\*\s*>\s*(::\s*(?:const_)?iterator)\s+([A-Za-z_]\w*)\s*=\s*)"
+                + escapeRegex(container.name)
+                + R"(\s*\.\s*(c?begin)\s*\(\s*\)(.*)$)",
+            std::regex::ECMAScript);
+        std::smatch match;
+        if (!std::regex_match(codePart, match, iteratorDeclaration)) {
+            continue;
+        }
+
+        const std::string iteratorName = match[3].str();
+        iteratorValueTypes[iteratorName] = container.valueType;
+        const std::string beginCall = match[4].str();
+        const std::string suffix = match[5].str();
+        const bool constIterator = match[2].str().find("const_iterator") != std::string::npos || beginCall == "cbegin";
+        const std::string iteratorKind = constIterator ? "const_iterator" : "iterator";
+        codePart = match[1].str()
+            + "std::vector<const " + container.valueType + "*>::" + iteratorKind
+            + " " + iteratorName + " = " + container.name + "." + beginCall + "()" + suffix;
+        break;
+    }
+
+    if (codePart == before) {
+        return line;
+    }
+
+    changed = true;
+    addConstIteratorAppliedChange(changes, trim(before), trim(codePart));
+    return codePart + trailingComment;
+}
+
+std::string rewriteConstPointerIteratorLocalLine(const std::string& line,
+                                                 const std::map<std::string, std::string>& iteratorValueTypes,
+                                                 bool& changed,
+                                                 std::vector<ConversionChange>& changes)
+{
+    if (iteratorValueTypes.empty()) {
+        return line;
+    }
+
+    std::string trailingComment;
+    std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+    const std::string before = codePart;
+
+    for (const auto& [iteratorName, valueType] : iteratorValueTypes) {
+        if (codePart.find(iteratorName) == std::string::npos) {
+            continue;
+        }
+        const std::regex localPointerDeclaration(
+            R"(^([ \t]*)(?!const\b))"
+                + typeRegex(valueType)
+                + R"(\s*\*\s*([A-Za-z_]\w*)\s*=\s*\*\s*)"
+                + escapeRegex(iteratorName)
+                + R"(\s*;\s*$)",
+            std::regex::ECMAScript);
+        std::smatch match;
+        if (!std::regex_match(codePart, match, localPointerDeclaration)) {
+            continue;
+        }
+        codePart = match[1].str() + "const " + valueType + "* " + match[2].str() + " = *" + iteratorName + ";";
+        break;
+    }
+
+    if (codePart == before) {
+        return line;
+    }
+
+    changed = true;
+    addConstIteratorAppliedChange(changes, trim(before), trim(codePart));
+    return codePart + trailingComment;
+}
+
 std::string rewriteLineForReferenceRule(const std::string& line,
                                         const ReferenceReturnRule& rule,
                                         bool& changed,
@@ -858,6 +966,18 @@ std::string ReturnTypePropagationPass::rewrite(const std::string& code,
     const std::vector<ConstPointerContainer> constContainers = collectConstPointerContainers(updated);
     for (const ConstPointerContainer& container : constContainers) {
         constPointerTypes.insert(container.valueType);
+    }
+
+    if (!constContainers.empty()) {
+        std::map<std::string, std::string> iteratorValueTypes;
+        updated = safeReplacement.rewriteCodeLines(updated, [&](const std::string& line) {
+            return rewriteConstPointerIteratorLine(line, constContainers, iteratorValueTypes, changed, changes);
+        });
+        if (!iteratorValueTypes.empty()) {
+            updated = safeReplacement.rewriteCodeLines(updated, [&](const std::string& line) {
+                return rewriteConstPointerIteratorLocalLine(line, iteratorValueTypes, changed, changes);
+            });
+        }
     }
 
     const std::set<std::pair<std::string, std::string>> parameterTargets = findParametersNeedingConstPointers(updated,

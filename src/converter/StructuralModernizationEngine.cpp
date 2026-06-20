@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -73,9 +74,31 @@ std::string singularName(const std::string& collectionName)
     const std::size_t lastSeparator = collectionName.find_last_of(".>");
     const std::string leafName = lastSeparator == std::string::npos ? collectionName : collectionName.substr(lastSeparator + 1);
     if (leafName.size() > 1 && leafName.back() == 's') {
-        return leafName.substr(0, leafName.size() - 1);
+        const std::string singular = leafName.substr(0, leafName.size() - 1);
+        if (singular == leafName || singular == "collection") {
+            return "item";
+        }
+        return singular == "label" ? "entry" : singular;
     }
     return "item";
+}
+
+bool containsIdentifier(const std::string& text, const std::string& identifier)
+{
+    return std::regex_search(text, std::regex(R"(\b)" + escapeRegex(identifier) + R"(\b)"));
+}
+
+std::string rangeVariableName(const std::string& collectionName, const std::string& body)
+{
+    const std::size_t lastSeparator = collectionName.find_last_of(".>");
+    const std::string leafName = lastSeparator == std::string::npos ? collectionName : collectionName.substr(lastSeparator + 1);
+    const std::vector<std::string> candidates{singularName(collectionName), "item", "entry", "value", "element"};
+    for (const std::string& candidate : candidates) {
+        if (!candidate.empty() && candidate != leafName && !containsIdentifier(body, candidate)) {
+            return candidate;
+        }
+    }
+    return leafName == "item" ? "element" : "item";
 }
 
 void addAppliedChange(std::vector<ConversionChange>& changes,
@@ -1130,7 +1153,7 @@ std::string StructuralModernizationEngine::modernizeLoops(const std::string& cod
                 continue;
             }
 
-            const std::string element = singularName(collection);
+            const std::string element = rangeVariableName(collection, body);
             const bool mutableElement = std::regex_search(body, std::regex(dereferencePattern + R"(\s*(?:=|\+=|-=|\*=|/=|%=))"))
                 || std::regex_search(body, std::regex(R"((?:\+\+|--)\s*)" + dereferencePattern))
                 || std::regex_search(body, std::regex(dereferencePattern + R"(\s*(?:\+\+|--))"));
@@ -1192,7 +1215,7 @@ std::string StructuralModernizationEngine::modernizeLoops(const std::string& cod
             continue;
         }
 
-        const std::string element = singularName(collection);
+        const std::string element = rangeVariableName(collection, body);
         const bool mutableElement = std::regex_search(body, std::regex(indexedExpression + R"(\s*=)"));
         body = std::regex_replace(body, std::regex(indexedExpression), element);
         body = std::regex_replace(body, std::regex(R"(std::endl)"), "'\\n'");

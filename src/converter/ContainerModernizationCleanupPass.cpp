@@ -650,6 +650,14 @@ std::vector<std::string> numericMemberNames(const std::string& classText)
     return names;
 }
 
+bool isCountMirrorLikeMember(const std::string& memberName)
+{
+    const std::string lowered = lowercase(memberName);
+    return lowered == "count"
+        || lowered == "used"
+        || lowered.find("count") != std::string::npos;
+}
+
 std::string rewriteVectorSizeGetters(std::string classText,
                                      const TypeChangeRecord& record,
                                      std::vector<ConversionChange>& changes,
@@ -846,11 +854,7 @@ std::string removeStaleCountMembers(std::string classText,
                                     bool& changed)
 {
     for (const std::string& memberName : numericMemberNames(classText)) {
-        const std::string lowered = lowercase(memberName);
-        const bool countLike = lowered == "count"
-            || lowered == "used"
-            || lowered.find("count") != std::string::npos;
-        if (!countLike || memberName == record.symbolName) {
+        if (!isCountMirrorLikeMember(memberName) || memberName == record.symbolName) {
             continue;
         }
 
@@ -975,6 +979,118 @@ std::string normalizeResizeBeforeAppend(std::string code,
     return code;
 }
 
+bool hasActiveCountUpdate(const std::string& classText, const std::string& countName)
+{
+    const std::string escapedCount = escapeRegex(countName);
+    const std::vector<std::regex> updatePatterns{
+        std::regex(R"((\+\+\s*)" + escapedCount + R"(|)" + escapedCount + R"(\s*\+\+))"),
+        std::regex(R"((--\s*)" + escapedCount + R"(|)" + escapedCount + R"(\s*--))"),
+        std::regex(R"(\b)" + escapedCount + R"(\s*(\+=|-=)\s*[^;]+;)"),
+        std::regex(R"(\b)" + escapedCount + R"(\s*=\s*)" + escapedCount + R"(\s*(\+|-)\s*[^;]+;)"),
+    };
+
+    return std::any_of(updatePatterns.begin(), updatePatterns.end(), [&](const std::regex& pattern) {
+        return std::regex_search(classText, pattern);
+    });
+}
+
+std::string sizeLimitExpression(const std::string& expression)
+{
+    const std::string trimmed = trim(expression);
+    if (trimmed.empty()) {
+        return trimmed;
+    }
+    if (trimmed.starts_with("static_cast") || trimmed.find(".size()") != std::string::npos) {
+        return trimmed;
+    }
+    return "static_cast<std::size_t>(" + trimmed + ")";
+}
+
+std::string rewriteStaleCountMirrorUses(std::string classText,
+                                        const TypeChangeRecord& record,
+                                        std::vector<ConversionChange>& changes,
+                                        bool& changed)
+{
+    if (!hasVectorAppendUse(classText, escapeRegex(record.symbolName))) {
+        return classText;
+    }
+
+    const SafeReplacementEngine safeReplacement;
+    for (const std::string& memberName : numericMemberNames(classText)) {
+        if (!isCountMirrorLikeMember(memberName)
+            || memberName == record.symbolName
+            || hasActiveCountUpdate(classText, memberName)) {
+            continue;
+        }
+
+        bool memberChanged = false;
+        const std::string escapedMember = escapeRegex(memberName);
+        classText = safeReplacement.rewriteCodeLines(classText, [&](const std::string& line) {
+            std::string trailingComment;
+            std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+            const std::string beforeLine = codePart;
+            std::smatch match;
+
+            const std::regex returnPattern(R"(^([ \t]*return\s+))" + escapedMember + R"(\s*;\s*$)");
+            if (std::regex_match(codePart, match, returnPattern)) {
+                codePart = match[1].str() + record.symbolName + ".size();";
+            }
+
+            const std::regex inlineGetterPattern(
+                R"(^([ \t]*(int|long|size_t|std::size_t|auto)\s+[A-Za-z_]\w*\s*\(\s*\)\s*(const\s*)?\{\s*return\s*))"
+                + escapedMember
+                + R"(\s*(;\s*\}\s*)$)");
+            if (std::regex_match(codePart, match, inlineGetterPattern)) {
+                codePart = match[1].str() + record.symbolName + ".size()" + match[4].str();
+            }
+
+            const std::regex countLeftCondition(
+                R"(^([ \t]*(if|while)\s*\(\s*))" + escapedMember + R"(\s*(<|<=|>=|>)\s*([^()]+?)\s*\)(.*)$)");
+            if (std::regex_match(codePart, match, countLeftCondition)) {
+                codePart = match[1].str()
+                    + record.symbolName + ".size() "
+                    + match[3].str() + " "
+                    + sizeLimitExpression(match[4].str())
+                    + ")" + match[5].str();
+            }
+
+            const std::regex countRightCondition(
+                R"(^([ \t]*(if|while)\s*\(\s*([^()]+?)\s*(<|<=|>=|>)\s*))" + escapedMember + R"(\s*\)(.*)$)");
+            if (std::regex_match(codePart, match, countRightCondition)) {
+                codePart = match[1].str()
+                    + sizeLimitExpression(match[3].str())
+                    + " " + match[4].str() + " "
+                    + record.symbolName + ".size()"
+                    + ")" + match[5].str();
+            }
+
+            const std::regex loopBoundPattern(
+                R"(^([ \t]*for\s*\([^;\n]+;\s*[A-Za-z_]\w*\s*<\s*))" + escapedMember + R"(\s*(;\s*[^)]*\).*)$)");
+            if (std::regex_match(codePart, match, loopBoundPattern)) {
+                codePart = match[1].str() + record.symbolName + ".size()" + match[2].str();
+            }
+
+            if (codePart == beforeLine) {
+                return line;
+            }
+
+            memberChanged = true;
+            changed = true;
+            return codePart + trailingComment;
+        });
+
+        if (memberChanged) {
+            addAppliedChange(changes,
+                             "Post-vector stale count usage rewrite",
+                             memberName,
+                             record.symbolName + ".size()",
+                             "Replaced stale count-mirror uses with std::vector::size() after append logic moved to push_back/emplace_back and the count was no longer maintained.");
+        }
+    }
+
+    return classText;
+}
+
 std::string removeCapacityOnlyUpdates(std::string classText, const std::string& memberName)
 {
     const std::string escapedMember = escapeRegex(memberName);
@@ -1086,6 +1202,7 @@ std::string polishVectorClasses(std::string code,
             }
             classText = rewriteVectorSizeGetters(std::move(classText), record, changes, changed);
             classText = rewriteVectorIndexGetters(std::move(classText), record, elementType, changes, changed);
+            classText = rewriteStaleCountMirrorUses(std::move(classText), record, changes, changed);
             classText = removeStaleCapacityMembers(std::move(classText), record, changes, changed);
             classText = removeStaleCountMembers(std::move(classText), record, changes, changed);
         }
