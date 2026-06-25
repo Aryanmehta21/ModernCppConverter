@@ -123,6 +123,17 @@ SourceRange rangeFromTokens(const std::vector<CppToken>& tokens, std::size_t beg
     return range;
 }
 
+SourceRange annotateRange(SourceRange range,
+                          SourceEntityKind kind,
+                          std::string name = {},
+                          std::optional<std::size_t> parentScopeId = std::nullopt)
+{
+    range.entityKind = kind;
+    range.entityName = std::move(name);
+    range.parentScopeId = parentScopeId;
+    return range;
+}
+
 class ParserImpl
 {
 public:
@@ -144,6 +155,8 @@ public:
         globalScope.name = "<global>";
         globalScope.range.start = {0, 1, 1};
         globalScope.range.end = endPosition();
+        globalScope.range.entityKind = SourceEntityKind::Scope;
+        globalScope.range.entityName = globalScope.name;
         document_.scopes.push_back(globalScope);
 
         parseEntities(0, significantTokens_.size(), {}, 0);
@@ -186,6 +199,8 @@ private:
         token.kind = kind;
         token.range.start = start;
         token.range.end = end;
+        token.range.entityKind = SourceEntityKind::Token;
+        token.range.entityName = token.text;
         document_.tokens.push_back(std::move(token));
     }
 
@@ -323,17 +338,17 @@ private:
             if (startsWith(text, "#include")) {
                 ParsedIncludeDirective include;
                 include.path = trim(std::string_view(text).substr(std::string_view("#include").size()));
-                include.range = token.range;
+                include.range = annotateRange(token.range, SourceEntityKind::Include, include.path);
                 document_.includes.push_back(std::move(include));
             } else if (startsWith(text, "#define")) {
                 std::string rest = trim(std::string_view(text).substr(std::string_view("#define").size()));
                 ParsedMacroDirective macro;
-                macro.range = token.range;
                 std::size_t nameEnd = 0;
                 while (nameEnd < rest.size() && isIdentifierBody(rest[nameEnd])) {
                     ++nameEnd;
                 }
                 macro.name = rest.substr(0, nameEnd);
+                macro.range = annotateRange(token.range, SourceEntityKind::Macro, macro.name);
                 document_.macros.push_back(std::move(macro));
             }
         }
@@ -450,9 +465,18 @@ private:
         ParsedAggregate aggregate;
         aggregate.kind = isStruct ? ParsedAggregateKind::Struct : ParsedAggregateKind::Class;
         aggregate.name = significantTokens_[nameIndex].text;
-        aggregate.nameRange = significantTokens_[nameIndex].range;
-        aggregate.range = rangeFromTokens(significantTokens_, index, *declarationEnd);
-        aggregate.bodyRange = rangeFromTokens(significantTokens_, *bodyOpen, bodyClose);
+        aggregate.nameRange = annotateRange(significantTokens_[nameIndex].range,
+                                            isStruct ? SourceEntityKind::Struct : SourceEntityKind::Class,
+                                            aggregate.name,
+                                            parentScopeIndex);
+        aggregate.range = annotateRange(rangeFromTokens(significantTokens_, index, *declarationEnd),
+                                        isStruct ? SourceEntityKind::Struct : SourceEntityKind::Class,
+                                        aggregate.name,
+                                        parentScopeIndex);
+        aggregate.bodyRange = annotateRange(rangeFromTokens(significantTokens_, *bodyOpen, bodyClose),
+                                           SourceEntityKind::Scope,
+                                           aggregate.name,
+                                           parentScopeIndex);
         aggregate.baseNames = parseBaseNames(nameIndex + 1, *bodyOpen);
         document_.aggregates.push_back(aggregate);
 
@@ -531,9 +555,13 @@ private:
         ParsedEnum parsedEnum;
         parsedEnum.name = significantTokens_[nameIndex].text;
         parsedEnum.scoped = scoped;
-        parsedEnum.nameRange = significantTokens_[nameIndex].range;
-        parsedEnum.range = rangeFromTokens(significantTokens_, index, declarationEnd);
-        parsedEnum.bodyRange = rangeFromTokens(significantTokens_, *bodyOpen, bodyClose);
+        parsedEnum.nameRange = annotateRange(significantTokens_[nameIndex].range, SourceEntityKind::Enum, parsedEnum.name);
+        parsedEnum.range = annotateRange(rangeFromTokens(significantTokens_, index, declarationEnd),
+                                         SourceEntityKind::Enum,
+                                         parsedEnum.name);
+        parsedEnum.bodyRange = annotateRange(rangeFromTokens(significantTokens_, *bodyOpen, bodyClose),
+                                            SourceEntityKind::Scope,
+                                            parsedEnum.name);
         parsedEnum.underlyingType = parseEnumUnderlyingType(nameIndex + 1, *bodyOpen);
         parsedEnum.enumerators = parseEnumerators(*bodyOpen + 1, bodyClose);
         document_.enums.push_back(std::move(parsedEnum));
@@ -630,12 +658,21 @@ private:
         function.isMember = !parentName.empty();
         function.returnType = cleanLeadingAccess(joinTokenText(significantTokens_, declarationStart, nameIndex));
         function.parameters = parseParameters(index + 1, closeParen);
-        function.range = rangeFromTokens(significantTokens_, declarationStart, *signatureEnd);
-        function.nameRange = significantTokens_[nameIndex].range;
+        function.range = annotateRange(rangeFromTokens(significantTokens_, declarationStart, *signatureEnd),
+                                       SourceEntityKind::Function,
+                                       function.name,
+                                       parentScopeIndex);
+        function.nameRange = annotateRange(significantTokens_[nameIndex].range,
+                                           SourceEntityKind::Function,
+                                           function.name,
+                                           parentScopeIndex);
         function.hasBody = bodyOpen.has_value();
         function.isConst = hasQualifier(closeParen + 1, bodyOpen.value_or(*signatureEnd), "const");
         if (bodyOpen.has_value() && bodyClose.has_value()) {
-            function.bodyRange = rangeFromTokens(significantTokens_, *bodyOpen, *bodyClose);
+            function.bodyRange = annotateRange(rangeFromTokens(significantTokens_, *bodyOpen, *bodyClose),
+                                               SourceEntityKind::Scope,
+                                               function.name,
+                                               parentScopeIndex);
         }
         document_.functions.push_back(function);
 
@@ -741,14 +778,18 @@ private:
         }
 
         ParsedParameter parameter;
-        parameter.range = rangeFromTokens(significantTokens_, begin, stop - 1);
+        parameter.range = annotateRange(rangeFromTokens(significantTokens_, begin, stop - 1),
+                                        SourceEntityKind::Variable);
         if (nameIndex.has_value() && *nameIndex > begin) {
             parameter.name = significantTokens_[*nameIndex].text;
-            parameter.nameRange = significantTokens_[*nameIndex].range;
+            parameter.nameRange = annotateRange(significantTokens_[*nameIndex].range,
+                                                SourceEntityKind::Variable,
+                                                parameter.name);
             parameter.type = joinTokenText(significantTokens_, begin, *nameIndex);
         } else {
             parameter.type = joinTokenText(significantTokens_, begin, stop);
         }
+        parameter.range.entityName = parameter.name;
         return parameter;
     }
 
@@ -851,8 +892,12 @@ private:
         variable.type = cleanLeadingAccess(joinTokenText(significantTokens_, begin, *nameIndex));
         variable.parentName = parentName;
         variable.isMember = isMember;
-        variable.range = rangeFromTokens(significantTokens_, begin, semicolonIndex);
-        variable.nameRange = significantTokens_[*nameIndex].range;
+        variable.range = annotateRange(rangeFromTokens(significantTokens_, begin, semicolonIndex),
+                                       isMember ? SourceEntityKind::Member : SourceEntityKind::Local,
+                                       variable.name);
+        variable.nameRange = annotateRange(significantTokens_[*nameIndex].range,
+                                           isMember ? SourceEntityKind::Member : SourceEntityKind::Local,
+                                           variable.name);
         if (variable.type.empty()) {
             return std::nullopt;
         }
@@ -898,8 +943,12 @@ private:
             ParsedCallExpression call;
             call.callee = significantTokens_[calleeIndex].text;
             call.parentFunction = functionName;
-            call.nameRange = significantTokens_[calleeIndex].range;
-            call.range = rangeFromTokens(significantTokens_, calleeIndex, closeIt->second);
+            call.nameRange = annotateRange(significantTokens_[calleeIndex].range,
+                                           SourceEntityKind::Expression,
+                                           call.callee);
+            call.range = annotateRange(rangeFromTokens(significantTokens_, calleeIndex, closeIt->second),
+                                       SourceEntityKind::Expression,
+                                       call.callee);
             document_.callExpressions.push_back(std::move(call));
         }
     }
@@ -917,7 +966,10 @@ private:
             ScopeInfo scope;
             scope.kind = ScopeKind::Block;
             scope.name = "<block>";
-            scope.range = rangeFromTokens(significantTokens_, index, closeIt->second);
+            scope.range = annotateRange(rangeFromTokens(significantTokens_, index, closeIt->second),
+                                        SourceEntityKind::Scope,
+                                        scope.name,
+                                        functionScopeIndex);
             scope.parentIndex = functionScopeIndex;
             document_.scopes.push_back(std::move(scope));
         }

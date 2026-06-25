@@ -55,6 +55,7 @@ struct ModernizationOptions
     bool applySafeOwnershipModernization = true;
     bool applyStringViewWhenSafe = false;
     bool compileVerificationEnabled = false;
+    bool enablePostConversionFormatting = false;
     OfflineModernizationLevel offlineModernizationLevel = OfflineModernizationLevel::Balanced;
     OfflineRewriteStyle offlineRewriteStyle = OfflineRewriteStyle::SafeModernization;
     CppStandard targetStandard = CppStandard::Cpp20;

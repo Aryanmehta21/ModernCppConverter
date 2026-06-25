@@ -148,6 +148,49 @@ bool isQualifiedPrefix(const std::string& code, const std::size_t tokenEnd)
         && code[next] == ':'
         && code[next + 1] == ':';
 }
+
+bool isPreprocessorDirectiveStart(const std::string& code, const std::size_t position)
+{
+    if (position >= code.size() || code[position] != '#') {
+        return false;
+    }
+    const std::size_t lineStart = code.rfind('\n', position);
+    const std::size_t begin = lineStart == std::string::npos ? 0 : lineStart + 1;
+    for (std::size_t cursor = begin; cursor < position; ++cursor) {
+        if (!std::isspace(static_cast<unsigned char>(code[cursor]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool lineEndsWithContinuation(const std::string& code, std::size_t lineStart, std::size_t lineEnd)
+{
+    std::size_t cursor = lineEnd;
+    while (cursor > lineStart && std::isspace(static_cast<unsigned char>(code[cursor - 1])) && code[cursor - 1] != '\n') {
+        --cursor;
+    }
+    return cursor > lineStart && code[cursor - 1] == '\\';
+}
+
+void appendPreprocessorLogicalLine(const std::string& code, std::size_t& index, std::string& output)
+{
+    while (index < code.size()) {
+        const std::size_t lineStart = index;
+        const std::size_t newline = code.find('\n', index);
+        const std::size_t lineEnd = newline == std::string::npos ? code.size() : newline;
+        output.append(code, lineStart, lineEnd - lineStart);
+        index = lineEnd;
+        const bool continued = lineEndsWithContinuation(code, lineStart, lineEnd);
+        if (index < code.size() && code[index] == '\n') {
+            output.push_back('\n');
+            ++index;
+        }
+        if (!continued) {
+            break;
+        }
+    }
+}
 } // namespace
 
 std::string ScopedEnumUsagePropagationPass::rewrite(const std::string& code,
@@ -187,6 +230,11 @@ std::string ScopedEnumUsagePropagationPass::rewrite(const std::string& code,
     for (std::size_t index = 0; index < code.size();) {
         const char current = code[index];
         const char next = index + 1 < code.size() ? code[index + 1] : '\0';
+
+        if (isPreprocessorDirectiveStart(code, index)) {
+            appendPreprocessorLogicalLine(code, index, updated);
+            continue;
+        }
 
         if (inLineComment) {
             updated.push_back(current);
@@ -282,4 +330,3 @@ std::string ScopedEnumUsagePropagationPass::rewrite(const std::string& code,
     }
     return changed ? updated : code;
 }
-

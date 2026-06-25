@@ -41,10 +41,12 @@ target_sources(ModernCppConverterCore
         ${PROJECT_SOURCE_DIR}/src/converter/PolymorphicContractPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/PolymorphicContractPolishPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/PolymorphicSafetyPass.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/PostConversionFormatter.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/PrintfModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/QualityModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/RangeForModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ReturnTypePropagationPass.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/RewriteCoordinator.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/RuleOfZeroPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/RuleOfZeroPolishPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ScopeAwareSymbolTable.cpp
@@ -56,6 +58,7 @@ target_sources(ModernCppConverterCore
         ${PROJECT_SOURCE_DIR}/src/converter/SemanticConsistencyValidator.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SemanticModernizationValidator.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SemanticTypeValidationPass.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/SemanticValidationAndRepairPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SmartPointerCollectionPropagationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SmartPointerSinkPropagationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SmartPointerTypePropagationPass.cpp

@@ -213,7 +213,7 @@ std::vector<ConstPointerContainer> collectConstPointerContainers(const std::stri
     std::vector<ConstPointerContainer> containers;
     std::set<std::string> seen;
     const std::regex declarationPattern(
-        R"(\bstd::vector\s*<\s*const\s+([A-Za-z_:][A-Za-z0-9_:]*(?:::[A-Za-z_]\w*)?(?:\s*<[^;\n{}()]+>)?)\s*\*\s*>\s+([A-Za-z_]\w*)\b)",
+        R"(\b(?:const\s+)?std::vector\s*<\s*const\s+([A-Za-z_:][A-Za-z0-9_:]*(?:::[A-Za-z_]\w*)?(?:\s*<[^;\n{}()]+>)?)\s*\*\s*>\s*(?:const\s*)?(?:[&*]\s*)?([A-Za-z_]\w*)\b)",
         std::regex::ECMAScript);
     for (std::sregex_iterator iterator(code.begin(), code.end(), declarationPattern), end; iterator != end; ++iterator) {
         ConstPointerContainer container{
@@ -870,6 +870,169 @@ std::string rewriteConstPointerIteratorLocalLine(const std::string& line,
     return codePart + trailingComment;
 }
 
+std::map<std::string, std::string> collectConstPointerRangeVariables(const std::string& code,
+                                                                     const std::vector<ConstPointerContainer>& containers)
+{
+    std::map<std::string, std::string> rangeValueTypes;
+    if (containers.empty()) {
+        return rangeValueTypes;
+    }
+
+    std::stringstream stream(code);
+    std::string line;
+    while (std::getline(stream, line)) {
+        std::string trailingComment;
+        const std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+        for (const ConstPointerContainer& container : containers) {
+            if (codePart.find(container.name) == std::string::npos) {
+                continue;
+            }
+
+            const std::string pointerType = typeRegex(container.valueType);
+            const std::string rangeDeclarationPattern =
+                "(?:(?:const\\s+auto\\s*&|auto\\s*&|const\\s+auto\\s*\\*|auto\\s*\\*|auto)"
+                "|(?:const\\s+" + pointerType + "\\s*\\*)"
+                "|(?:" + pointerType + "\\s*\\*))";
+            const std::regex rangeForPattern(
+                R"(\bfor\s*\(\s*)"
+                    + rangeDeclarationPattern
+                    + R"(\s+([A-Za-z_]\w*)\s*:\s*)"
+                    + escapeRegex(container.name)
+                    + R"(\s*\))",
+                std::regex::ECMAScript);
+            std::smatch match;
+            if (std::regex_search(codePart, match, rangeForPattern)) {
+                rangeValueTypes[match[1].str()] = container.valueType;
+            }
+        }
+    }
+    return rangeValueTypes;
+}
+
+std::string rewriteConstPointerRangeLocalLine(const std::string& line,
+                                              const std::map<std::string, std::string>& rangeValueTypes,
+                                              bool& changed,
+                                              std::vector<ConversionChange>& changes)
+{
+    if (rangeValueTypes.empty()) {
+        return line;
+    }
+
+    std::string trailingComment;
+    std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+    const std::string before = codePart;
+
+    for (const auto& [rangeVariable, valueType] : rangeValueTypes) {
+        if (codePart.find(rangeVariable) == std::string::npos) {
+            continue;
+        }
+        const std::regex localPointerDeclaration(
+            R"(^([ \t]*)(?!const\b))"
+                + typeRegex(valueType)
+                + R"(\s*\*\s*([A-Za-z_]\w*)\s*=\s*)"
+                + escapeRegex(rangeVariable)
+                + R"(\s*;\s*$)",
+            std::regex::ECMAScript);
+        std::smatch match;
+        if (!std::regex_match(codePart, match, localPointerDeclaration)) {
+            continue;
+        }
+        codePart = match[1].str() + "const " + valueType + "* " + match[2].str() + " = " + rangeVariable + ";";
+        break;
+    }
+
+    if (codePart == before) {
+        return line;
+    }
+
+    changed = true;
+    addConstIteratorAppliedChange(changes, trim(before), trim(codePart));
+    return codePart + trailingComment;
+}
+
+std::string rewriteConstPointerSymbolLocalLine(const std::string& line,
+                                               const std::vector<ConstPointerSymbol>& symbols,
+                                               bool& changed,
+                                               std::vector<ConversionChange>& changes)
+{
+    if (symbols.empty()) {
+        return line;
+    }
+
+    std::string trailingComment;
+    std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+    const std::string before = codePart;
+
+    for (const ConstPointerSymbol& symbol : symbols) {
+        if (codePart.find(symbol.name) == std::string::npos) {
+            continue;
+        }
+        const std::regex localPointerDeclaration(
+            R"(^([ \t]*)(?!const\b))"
+                + typeRegex(symbol.valueType)
+                + R"(\s*\*\s*([A-Za-z_]\w*)\s*=\s*)"
+                + escapeRegex(symbol.name)
+                + R"(\s*;\s*$)",
+            std::regex::ECMAScript);
+        std::smatch match;
+        if (!std::regex_match(codePart, match, localPointerDeclaration)) {
+            continue;
+        }
+        codePart = match[1].str() + "const " + symbol.valueType + "* " + match[2].str() + " = " + symbol.name + ";";
+        break;
+    }
+
+    if (codePart == before) {
+        return line;
+    }
+
+    changed = true;
+    addConstIteratorAppliedChange(changes, trim(before), trim(codePart));
+    return codePart + trailingComment;
+}
+
+std::string rewriteConstPointerContainerElementLocalLine(const std::string& line,
+                                                        const std::vector<ConstPointerContainer>& containers,
+                                                        bool& changed,
+                                                        std::vector<ConversionChange>& changes)
+{
+    if (containers.empty()) {
+        return line;
+    }
+
+    std::string trailingComment;
+    std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+    const std::string before = codePart;
+
+    for (const ConstPointerContainer& container : containers) {
+        if (codePart.find(container.name) == std::string::npos) {
+            continue;
+        }
+        const std::regex localPointerDeclaration(
+            R"(^([ \t]*)(?!const\b))"
+                + typeRegex(container.valueType)
+                + R"(\s*\*\s*([A-Za-z_]\w*)\s*=\s*)"
+                + escapeRegex(container.name)
+                + R"((\s*\[[^\]\n]+\]\s*;\s*)$)",
+            std::regex::ECMAScript);
+        std::smatch match;
+        if (!std::regex_match(codePart, match, localPointerDeclaration)) {
+            continue;
+        }
+        codePart = match[1].str() + "const " + container.valueType + "* " + match[2].str()
+            + " = " + container.name + match[3].str();
+        break;
+    }
+
+    if (codePart == before) {
+        return line;
+    }
+
+    changed = true;
+    addConstIteratorAppliedChange(changes, trim(before), trim(codePart));
+    return codePart + trailingComment;
+}
+
 std::string rewriteLineForReferenceRule(const std::string& line,
                                         const ReferenceReturnRule& rule,
                                         bool& changed,
@@ -922,7 +1085,12 @@ std::string ReturnTypePropagationPass::rewrite(const std::string& code,
 {
     const std::vector<ConstReturnRule> rules = collectConstReturnRules(code);
     const std::vector<ReferenceReturnRule> referenceRules = collectReferenceReturnRules(code);
-    if (rules.empty() && referenceRules.empty()) {
+    const std::vector<ConstPointerSymbol> initialConstPointerSymbols = collectConstPointerSymbols(code);
+    const std::vector<ConstPointerContainer> initialConstContainers = collectConstPointerContainers(code);
+    if (rules.empty()
+        && referenceRules.empty()
+        && initialConstPointerSymbols.empty()
+        && initialConstContainers.empty()) {
         return code;
     }
 
@@ -943,11 +1111,11 @@ std::string ReturnTypePropagationPass::rewrite(const std::string& code,
     });
 
     const std::vector<ConstPointerSymbol> constPointerSymbols = collectConstPointerSymbols(updated);
-    const std::vector<ConstPointerContainer> initialConstContainers = collectConstPointerContainers(updated);
+    const std::vector<ConstPointerContainer> containersBeforeConstRewrite = collectConstPointerContainers(updated);
     const std::set<std::string> containersToConst = findContainersNeedingConstPointers(updated,
                                                                                        rules,
                                                                                        constPointerSymbols,
-                                                                                       initialConstContainers);
+                                                                                       containersBeforeConstRewrite);
     if (!containersToConst.empty()) {
         updated = safeReplacement.rewriteCodeLines(updated, [&](const std::string& line) {
             return rewriteConstPointerContainerDeclaration(line, containersToConst, changed, changes);
@@ -968,6 +1136,8 @@ std::string ReturnTypePropagationPass::rewrite(const std::string& code,
         constPointerTypes.insert(container.valueType);
     }
 
+    std::vector<ConstPointerSymbol> constPointerSymbolsForRepair = collectConstPointerSymbols(updated);
+
     if (!constContainers.empty()) {
         std::map<std::string, std::string> iteratorValueTypes;
         updated = safeReplacement.rewriteCodeLines(updated, [&](const std::string& line) {
@@ -978,6 +1148,26 @@ std::string ReturnTypePropagationPass::rewrite(const std::string& code,
                 return rewriteConstPointerIteratorLocalLine(line, iteratorValueTypes, changed, changes);
             });
         }
+
+        const std::map<std::string, std::string> rangeValueTypes = collectConstPointerRangeVariables(updated, constContainers);
+        for (const auto& [name, valueType] : rangeValueTypes) {
+            constPointerSymbolsForRepair.push_back(ConstPointerSymbol{valueType, name});
+        }
+        if (!rangeValueTypes.empty()) {
+            updated = safeReplacement.rewriteCodeLines(updated, [&](const std::string& line) {
+                return rewriteConstPointerRangeLocalLine(line, rangeValueTypes, changed, changes);
+            });
+        }
+
+        updated = safeReplacement.rewriteCodeLines(updated, [&](const std::string& line) {
+            return rewriteConstPointerContainerElementLocalLine(line, constContainers, changed, changes);
+        });
+    }
+
+    if (!constPointerSymbolsForRepair.empty()) {
+        updated = safeReplacement.rewriteCodeLines(updated, [&](const std::string& line) {
+            return rewriteConstPointerSymbolLocalLine(line, constPointerSymbolsForRepair, changed, changes);
+        });
     }
 
     const std::set<std::pair<std::string, std::string>> parameterTargets = findParametersNeedingConstPointers(updated,

@@ -1,6 +1,7 @@
 #include "converter/QualityModernizationPass.h"
 
 #include "converter/IncludeManager.h"
+#include "converter/RewriteCoordinator.h"
 #include "converter/SafeReplacementEngine.h"
 #include "converter/StructuralAnalyzers.h"
 
@@ -10,6 +11,7 @@
 #include <sstream>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -120,6 +122,139 @@ std::string finalIdentifierFromCollection(std::string collection)
 bool containsIdentifier(const std::string& text, const std::string& identifier)
 {
     return std::regex_search(text, std::regex(R"(\b)" + escapeRegex(identifier) + R"(\b)"));
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> protectedSourceRanges(const std::string& text)
+{
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
+    enum class State
+    {
+        Code,
+        LineComment,
+        BlockComment,
+        StringLiteral,
+        CharLiteral,
+    };
+
+    State state = State::Code;
+    std::size_t rangeStart = 0;
+    for (std::size_t index = 0; index < text.size();) {
+        const char current = text[index];
+        const char next = index + 1 < text.size() ? text[index + 1] : '\0';
+
+        switch (state) {
+        case State::Code:
+            if (current == '/' && next == '/') {
+                state = State::LineComment;
+                rangeStart = index;
+                index += 2;
+            } else if (current == '/' && next == '*') {
+                state = State::BlockComment;
+                rangeStart = index;
+                index += 2;
+            } else if (current == '"') {
+                state = State::StringLiteral;
+                rangeStart = index++;
+            } else if (current == '\'') {
+                state = State::CharLiteral;
+                rangeStart = index++;
+            } else {
+                ++index;
+            }
+            break;
+        case State::LineComment:
+            if (current == '\n') {
+                ranges.push_back({rangeStart, index});
+                state = State::Code;
+            }
+            ++index;
+            break;
+        case State::BlockComment:
+            if (current == '*' && next == '/') {
+                index += 2;
+                ranges.push_back({rangeStart, index});
+                state = State::Code;
+            } else {
+                ++index;
+            }
+            break;
+        case State::StringLiteral:
+        case State::CharLiteral:
+            if (current == '\\' && index + 1 < text.size()) {
+                index += 2;
+                break;
+            }
+            if ((state == State::StringLiteral && current == '"')
+                || (state == State::CharLiteral && current == '\'')) {
+                ++index;
+                ranges.push_back({rangeStart, index});
+                state = State::Code;
+            } else {
+                ++index;
+            }
+            break;
+        }
+    }
+
+    if (state != State::Code) {
+        ranges.push_back({rangeStart, text.size()});
+    }
+    return ranges;
+}
+
+bool isInsideProtectedRange(const std::vector<std::pair<std::size_t, std::size_t>>& ranges,
+                            std::size_t start,
+                            std::size_t end)
+{
+    return std::any_of(ranges.begin(), ranges.end(), [start, end](const auto& range) {
+        return start < range.second && range.first < end;
+    });
+}
+
+std::string maskProtectedSource(const std::string& text)
+{
+    std::string masked = text;
+    for (const auto& range : protectedSourceRanges(text)) {
+        for (std::size_t index = range.first; index < range.second && index < masked.size(); ++index) {
+            if (masked[index] != '\n') {
+                masked[index] = ' ';
+            }
+        }
+    }
+    return masked;
+}
+
+RewriteApplicationResult replaceIndexedExpressionsWithRangeEdits(const std::string& body,
+                                                                  const std::string& indexedExpression,
+                                                                  const std::string& itemName)
+{
+    std::vector<RewriteEdit> edits;
+    const std::regex expressionPattern(indexedExpression, std::regex::ECMAScript);
+    const std::vector<std::pair<std::size_t, std::size_t>> protectedRanges = protectedSourceRanges(body);
+    for (std::sregex_iterator it(body.begin(), body.end(), expressionPattern), end; it != end; ++it) {
+        const std::size_t start = static_cast<std::size_t>(it->position());
+        const std::size_t finish = start + static_cast<std::size_t>(it->length());
+        if (isInsideProtectedRange(protectedRanges, start, finish)) {
+            continue;
+        }
+
+        SourceRange range;
+        range.start.offset = start;
+        range.start.column = start + 1;
+        range.end.offset = finish;
+        range.end.column = finish + 1;
+        range.entityKind = SourceEntityKind::Expression;
+        range.entityName = it->str();
+
+        RewriteEdit edit;
+        edit.range = std::move(range);
+        edit.replacementText = itemName;
+        edit.passName = "QualityModernizationPass";
+        edit.reason = "Replace index expression with the generated range-for variable.";
+        edit.affectedSymbol = itemName;
+        edits.push_back(std::move(edit));
+    }
+    return RewriteCoordinator{}.apply(body, edits);
 }
 
 std::string variableNameForCollection(std::string collection, const std::string& body)
@@ -294,15 +429,16 @@ std::string rewriteIndexLoops(std::string code,
         }
 
         const std::string indexedExpression = escapeRegex(collection) + R"(\s*\[\s*)" + escapeRegex(indexName) + R"(\s*\])";
-        const std::string bodyWithoutIndexed = std::regex_replace(body, std::regex(indexedExpression), "");
+        const std::string analysisBody = maskProtectedSource(body);
+        const std::string bodyWithoutIndexed = std::regex_replace(analysisBody, std::regex(indexedExpression), "");
         if (std::regex_search(bodyWithoutIndexed, std::regex("\\b" + escapeRegex(indexName) + "\\b"))) {
             consumed += static_cast<std::size_t>(match.position() + match.length());
             search = match.suffix().str();
             continue;
         }
-        const bool mutableElement = std::regex_search(body, std::regex(indexedExpression + R"(\s*(=|\+=|-=|\*=|/=|%=))"));
+        const bool mutableElement = std::regex_search(analysisBody, std::regex(indexedExpression + R"(\s*(=|\+=|-=|\*=|/=|%=))"));
         const std::string itemName = variableNameForCollection(collection, body);
-        body = std::regex_replace(body, std::regex(indexedExpression), itemName);
+        body = replaceIndexedExpressionsWithRangeEdits(body, indexedExpression, itemName).code;
         const std::string replacement = indent + "for (" + (mutableElement ? "auto& " : "const auto& ")
             + itemName + " : " + collection + ")\n" + indent + "{\n" + body + "\n" + indent + "}";
         code.replace(consumed + static_cast<std::size_t>(match.position()),

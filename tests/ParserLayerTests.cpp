@@ -1,9 +1,14 @@
 #include "converter/RawTextRepresentation.h"
+#include "converter/RewriteCoordinator.h"
+#include "frontend/FrontendFactory.h"
+#include "frontend/LightweightFrontend.h"
 #include "parser/LightweightCppParser.h"
 
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -60,6 +65,43 @@ const ParsedVariable* findLocal(const ParsedDocument& document, const std::strin
     return nullptr;
 }
 
+bool diagnosticsContain(const std::vector<std::string>& diagnostics, const std::string& needle)
+{
+    for (const std::string& diagnostic : diagnostics) {
+        if (diagnostic.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+SourceRange testRange(std::size_t start, std::size_t end, SourceEntityKind kind = SourceEntityKind::Expression)
+{
+    SourceRange range;
+    range.start.offset = start;
+    range.start.line = 1;
+    range.start.column = start + 1;
+    range.end.offset = end;
+    range.end.line = 1;
+    range.end.column = end + 1;
+    range.entityKind = kind;
+    return range;
+}
+
+RewriteEdit testEdit(std::size_t start,
+                     std::size_t end,
+                     std::string replacement,
+                     std::string symbol = {})
+{
+    RewriteEdit edit;
+    edit.range = testRange(start, end);
+    edit.replacementText = std::move(replacement);
+    edit.passName = "ParserLayerTestPass";
+    edit.reason = "test edit";
+    edit.affectedSymbol = std::move(symbol);
+    return edit;
+}
+
 void testTokenizationAndDirectives()
 {
     const std::string source =
@@ -81,9 +123,15 @@ void testTokenizationAndDirectives()
             sawMain = true;
             require(token.range.start.line == 3, "token line should be tracked");
             require(token.range.start.column == 5, "token column should be tracked");
+            require(token.range.entityKind == SourceEntityKind::Token, "token range should report token entity kind");
+            require(token.range.entityName == "main", "token range should retain token text as entity name");
         }
     }
     require(sawMain, "identifier tokens should be available");
+    require(document.includes.front().range.entityKind == SourceEntityKind::Include,
+            "include ranges should be annotated as include entities");
+    require(document.macros.front().range.entityKind == SourceEntityKind::Macro,
+            "macro ranges should be annotated as macro entities");
 }
 
 void testClassFunctionMemberAndLocalDetection()
@@ -103,6 +151,9 @@ void testClassFunctionMemberAndLocalDetection()
     require(aggregate != nullptr, "class should be detected");
     require(aggregate->kind == ParsedAggregateKind::Class, "class kind should be recorded");
     require(slice(source, aggregate->range).find("class Widget") == 0, "class source range should start at declaration");
+    require(aggregate->range.entityKind == SourceEntityKind::Class, "class range should carry class entity kind");
+    require(aggregate->range.entityName == "Widget", "class range should carry class name");
+    require(aggregate->range.parentScopeId.has_value(), "class range should record parent scope id");
 
     const ParsedFunction* reset = findFunction(document, "reset");
     require(reset != nullptr, "member function should be detected");
@@ -112,15 +163,18 @@ void testClassFunctionMemberAndLocalDetection()
     require(reset->parameters.size() == 1, "function parameter should be detected");
     require(reset->parameters.front().name == "value", "parameter name should be captured");
     require(reset->parameters.front().type == "int", "parameter type should be captured");
+    require(reset->range.entityKind == SourceEntityKind::Function, "function range should carry function entity kind");
 
     const ParsedVariable* count = findMember(document, "count");
     require(count != nullptr, "member variable should be detected");
     require(count->type == "int", "member variable type should be captured");
     require(count->parentName == "Widget", "member variable parent should be captured");
+    require(count->range.entityKind == SourceEntityKind::Member, "member range should carry member entity kind");
 
     const ParsedVariable* local = findLocal(document, "local");
     require(local != nullptr, "local variable should be detected");
     require(local->parentName == "reset", "local variable parent function should be captured");
+    require(local->range.entityKind == SourceEntityKind::Local, "local range should carry local entity kind");
 
     bool sawHelperCall = false;
     for (const ParsedCallExpression& call : document.callExpressions) {
@@ -198,6 +252,57 @@ void testRepresentationParserBacking()
     require(findAggregate(*secondDocument, "Item") != nullptr, "refreshed parser metadata should reflect new source");
 }
 
+void testFrontendInterfaceDefaultsToLightweight()
+{
+    const std::string source =
+        "enum class Mode { One };\n"
+        "class Widget { int value; };\n"
+        "int run() { return 0; }\n";
+
+    const std::unique_ptr<IModernizationFrontend> frontend = createDefaultModernizationFrontend();
+    require(frontend != nullptr, "default modernization frontend should be available");
+    require(frontend->kind() == ModernizationFrontendKind::Lightweight, "default frontend should remain lightweight");
+    require(frontend->name() == "LightweightFrontend", "default frontend name should be stable");
+    require(!frontend->isExperimental(), "default frontend must not be experimental");
+
+    const ModernizationFrontendResult result = frontend->analyze(source);
+    require(result.parseSucceeded, "lightweight frontend should parse simple source");
+    require(result.entityCounts.classes == 1, "lightweight frontend should report class count");
+    require(result.entityCounts.functions == 1, "lightweight frontend should report function count");
+    require(result.entityCounts.enums == 1, "lightweight frontend should report enum count");
+    require(diagnosticsContain(result.diagnostics, "FRONTEND used=LightweightFrontend"),
+            "frontend diagnostics should report the frontend used");
+    require(diagnosticsContain(result.diagnostics, "clang_experiment=disabled"),
+            "default build diagnostics should report Clang experiment disabled");
+}
+
+void testOptionalClangFrontendFactory()
+{
+    const std::string source =
+        "enum Color { Red };\n"
+        "struct Sample { int value; };\n"
+        "int compute() { return 1; }\n";
+
+    const std::unique_ptr<IModernizationFrontend> clangFrontend = createClangExperimentalFrontend();
+    if (!clangExperimentsEnabled()) {
+        require(clangFrontend == nullptr, "Clang frontend factory should return null when experiments are disabled");
+        return;
+    }
+
+    require(clangFrontend != nullptr, "Clang frontend should be available when experiments are enabled");
+    require(clangFrontend->kind() == ModernizationFrontendKind::ClangExperimental,
+            "Clang experiment should report its frontend kind");
+    require(clangFrontend->isExperimental(), "Clang frontend should be marked experimental");
+
+    const ModernizationFrontendResult result = clangFrontend->analyze(source);
+    require(diagnosticsContain(result.diagnostics, "FRONTEND used=ClangExperimentalFrontend"),
+            "Clang frontend diagnostics should report the frontend used");
+    require(result.parseSucceeded, "Clang experimental frontend should parse simple source when enabled");
+    require(result.entityCounts.classes >= 1, "Clang experimental frontend should detect a simple aggregate");
+    require(result.entityCounts.functions >= 1, "Clang experimental frontend should detect a simple function");
+    require(result.entityCounts.enums >= 1, "Clang experimental frontend should detect a simple enum");
+}
+
 void testFallbackOnUnsupportedSyntax()
 {
     const std::string source = "void broken() { if (true) {\n";
@@ -206,6 +311,43 @@ void testFallbackOnUnsupportedSyntax()
     require(document.originalSource == source, "fallback should preserve original source text");
     require(!document.tokens.empty(), "fallback should still expose tokenization where possible");
     require(!document.warnings.empty(), "fallback should report parser warning");
+}
+
+void testRewriteCoordinatorAppliesDescendingEdits()
+{
+    const std::string source = "abc def ghi";
+    const RewriteApplicationResult result = RewriteCoordinator{}.apply(source,
+                                                                       {
+                                                                           testEdit(0, 3, "ABC", "first"),
+                                                                           testEdit(8, 11, "GHI", "last"),
+                                                                       });
+
+    require(result.code == "ABC def GHI", "rewrite coordinator should apply edits by descending source offset");
+    require(result.appliedEdits.size() == 2, "non-overlapping edits should both apply");
+    require(result.skippedEdits.empty(), "valid non-overlapping edits should not be skipped");
+}
+
+void testRewriteCoordinatorRejectsOverlapsDuplicatesAndInvalidRanges()
+{
+    const std::string source = "abcdef";
+    RewriteEdit duplicate = testEdit(0, 1, "A", "dup");
+    RewriteEdit invalid = testEdit(4, 9, "Z", "invalid");
+    RewriteEdit overlap = testEdit(1, 4, "BCD", "overlap");
+
+    const RewriteApplicationResult result = RewriteCoordinator{}.apply(source,
+                                                                       {
+                                                                           duplicate,
+                                                                           duplicate,
+                                                                           testEdit(2, 5, "CDE", "winner"),
+                                                                           overlap,
+                                                                           invalid,
+                                                                       });
+
+    require(result.duplicateEdits == 1, "duplicate edits should be detected");
+    require(result.invalidRanges == 1, "invalid source ranges should be detected");
+    require(result.overlapConflicts == 1, "overlapping edits should be rejected");
+    require(result.skippedEdits.size() == 3, "duplicate, invalid, and overlapping edits should be reported as skipped");
+    require(result.appliedEdits.size() == 2, "valid non-overlapping edits should still apply");
 }
 }
 
@@ -216,7 +358,11 @@ int main()
     testStructEnumAndSourceRanges();
     testFunctionScopeAndLocalVariableDetection();
     testRepresentationParserBacking();
+    testFrontendInterfaceDefaultsToLightweight();
+    testOptionalClangFrontendFactory();
     testFallbackOnUnsupportedSyntax();
+    testRewriteCoordinatorAppliesDescendingEdits();
+    testRewriteCoordinatorRejectsOverlapsDuplicatesAndInvalidRanges();
 
     std::cout << "All parser layer tests passed.\n";
     return EXIT_SUCCESS;

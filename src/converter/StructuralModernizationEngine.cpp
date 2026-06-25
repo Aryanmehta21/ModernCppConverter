@@ -1,6 +1,7 @@
 #include "converter/StructuralModernizationEngine.h"
 
 #include "converter/IncludeManager.h"
+#include "converter/RewriteCoordinator.h"
 #include "converter/SafeReplacementEngine.h"
 #include "converter/StructuralAnalyzers.h"
 #include "converter/TransformationContext.h"
@@ -86,6 +87,288 @@ std::string singularName(const std::string& collectionName)
 bool containsIdentifier(const std::string& text, const std::string& identifier)
 {
     return std::regex_search(text, std::regex(R"(\b)" + escapeRegex(identifier) + R"(\b)"));
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> protectedSourceRanges(const std::string& text)
+{
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
+    enum class State
+    {
+        Code,
+        LineComment,
+        BlockComment,
+        StringLiteral,
+        CharLiteral,
+    };
+
+    State state = State::Code;
+    std::size_t rangeStart = 0;
+    for (std::size_t index = 0; index < text.size();) {
+        const char current = text[index];
+        const char next = index + 1 < text.size() ? text[index + 1] : '\0';
+        switch (state) {
+        case State::Code:
+            if (current == '/' && next == '/') {
+                state = State::LineComment;
+                rangeStart = index;
+                index += 2;
+            } else if (current == '/' && next == '*') {
+                state = State::BlockComment;
+                rangeStart = index;
+                index += 2;
+            } else if (current == '"') {
+                state = State::StringLiteral;
+                rangeStart = index++;
+            } else if (current == '\'') {
+                state = State::CharLiteral;
+                rangeStart = index++;
+            } else {
+                ++index;
+            }
+            break;
+        case State::LineComment:
+            if (current == '\n') {
+                ranges.push_back({rangeStart, index});
+                state = State::Code;
+            }
+            ++index;
+            break;
+        case State::BlockComment:
+            if (current == '*' && next == '/') {
+                index += 2;
+                ranges.push_back({rangeStart, index});
+                state = State::Code;
+            } else {
+                ++index;
+            }
+            break;
+        case State::StringLiteral:
+        case State::CharLiteral:
+            if (current == '\\' && index + 1 < text.size()) {
+                index += 2;
+                break;
+            }
+            if ((state == State::StringLiteral && current == '"')
+                || (state == State::CharLiteral && current == '\'')) {
+                ++index;
+                ranges.push_back({rangeStart, index});
+                state = State::Code;
+            } else {
+                ++index;
+            }
+            break;
+        }
+    }
+
+    if (state != State::Code) {
+        ranges.push_back({rangeStart, text.size()});
+    }
+    return ranges;
+}
+
+bool isInsideProtectedRange(const std::vector<std::pair<std::size_t, std::size_t>>& ranges,
+                            std::size_t start,
+                            std::size_t end)
+{
+    return std::any_of(ranges.begin(), ranges.end(), [start, end](const auto& range) {
+        return start < range.second && range.first < end;
+    });
+}
+
+bool lineEndsWithContinuation(const std::string& text, std::size_t lineStart, std::size_t lineEnd)
+{
+    std::size_t cursor = lineEnd;
+    while (cursor > lineStart && std::isspace(static_cast<unsigned char>(text[cursor - 1])) && text[cursor - 1] != '\n') {
+        --cursor;
+    }
+    return cursor > lineStart && text[cursor - 1] == '\\';
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> preprocessorLogicalLineRanges(const std::string& text)
+{
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
+    std::size_t lineStart = 0;
+    while (lineStart < text.size()) {
+        std::size_t cursor = lineStart;
+        while (cursor < text.size() && (text[cursor] == ' ' || text[cursor] == '\t' || text[cursor] == '\r')) {
+            ++cursor;
+        }
+        const std::size_t lineEnd = text.find('\n', lineStart);
+        const std::size_t effectiveLineEnd = lineEnd == std::string::npos ? text.size() : lineEnd;
+        if (cursor < text.size() && text[cursor] == '#') {
+            std::size_t rangeEnd = effectiveLineEnd;
+            std::size_t nextLineStart = lineEnd == std::string::npos ? text.size() : lineEnd + 1;
+            while (lineEndsWithContinuation(text, lineStart, rangeEnd) && nextLineStart < text.size()) {
+                lineStart = nextLineStart;
+                const std::size_t nextLineEnd = text.find('\n', lineStart);
+                rangeEnd = nextLineEnd == std::string::npos ? text.size() : nextLineEnd;
+                nextLineStart = nextLineEnd == std::string::npos ? text.size() : nextLineEnd + 1;
+            }
+            ranges.push_back({cursor, rangeEnd});
+            lineStart = nextLineStart;
+            continue;
+        }
+        if (lineEnd == std::string::npos) {
+            break;
+        }
+        lineStart = lineEnd + 1;
+    }
+    return ranges;
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> enumRewriteProtectedRanges(const std::string& text)
+{
+    std::vector<std::pair<std::size_t, std::size_t>> ranges = protectedSourceRanges(text);
+    std::vector<std::pair<std::size_t, std::size_t>> preprocessorRanges = preprocessorLogicalLineRanges(text);
+    ranges.insert(ranges.end(), preprocessorRanges.begin(), preprocessorRanges.end());
+    return ranges;
+}
+
+std::string maskProtectedSource(const std::string& text)
+{
+    std::string masked = text;
+    for (const auto& range : protectedSourceRanges(text)) {
+        for (std::size_t index = range.first; index < range.second && index < masked.size(); ++index) {
+            if (masked[index] != '\n') {
+                masked[index] = ' ';
+            }
+        }
+    }
+    return masked;
+}
+
+bool isIdentifierStart(char character)
+{
+    return std::isalpha(static_cast<unsigned char>(character)) || character == '_';
+}
+
+bool isIdentifierCharacter(char character)
+{
+    return std::isalnum(static_cast<unsigned char>(character)) || character == '_';
+}
+
+std::size_t previousNonSpace(const std::string& text, std::size_t position)
+{
+    while (position > 0) {
+        --position;
+        if (!std::isspace(static_cast<unsigned char>(text[position]))) {
+            return position;
+        }
+    }
+    return std::string::npos;
+}
+
+std::size_t nextNonSpace(const std::string& text, std::size_t position)
+{
+    while (position < text.size()) {
+        if (!std::isspace(static_cast<unsigned char>(text[position]))) {
+            return position;
+        }
+        ++position;
+    }
+    return std::string::npos;
+}
+
+bool isAlreadyScoped(const std::string& text, std::size_t tokenStart)
+{
+    const std::size_t previous = previousNonSpace(text, tokenStart);
+    return previous != std::string::npos
+        && text[previous] == ':'
+        && previous > 0
+        && text[previous - 1] == ':';
+}
+
+bool followsMemberAccess(const std::string& text, std::size_t tokenStart)
+{
+    const std::size_t previous = previousNonSpace(text, tokenStart);
+    if (previous == std::string::npos) {
+        return false;
+    }
+    return text[previous] == '.'
+        || (text[previous] == '>' && previous > 0 && text[previous - 1] == '-');
+}
+
+bool isQualifiedPrefix(const std::string& text, std::size_t tokenEnd)
+{
+    const std::size_t next = nextNonSpace(text, tokenEnd);
+    return next != std::string::npos
+        && next + 1 < text.size()
+        && text[next] == ':'
+        && text[next + 1] == ':';
+}
+
+std::string rewriteEnumeratorReferences(std::string text,
+                                        const std::string& enumName,
+                                        const std::vector<std::string>& enumerators)
+{
+    const std::set<std::string> enumeratorSet(enumerators.begin(), enumerators.end());
+    const std::vector<std::pair<std::size_t, std::size_t>> protectedRanges = enumRewriteProtectedRanges(text);
+    std::string rewritten;
+    rewritten.reserve(text.size());
+
+    for (std::size_t index = 0; index < text.size();) {
+        if (isInsideProtectedRange(protectedRanges, index, index + 1)) {
+            rewritten.push_back(text[index]);
+            ++index;
+            continue;
+        }
+        if (!isIdentifierStart(text[index])) {
+            rewritten.push_back(text[index]);
+            ++index;
+            continue;
+        }
+
+        const std::size_t tokenStart = index;
+        while (index < text.size() && isIdentifierCharacter(text[index])) {
+            ++index;
+        }
+        const std::string token = text.substr(tokenStart, index - tokenStart);
+        if (!enumeratorSet.contains(token)
+            || isAlreadyScoped(text, tokenStart)
+            || followsMemberAccess(text, tokenStart)
+            || isQualifiedPrefix(text, index)) {
+            rewritten.append(token);
+            continue;
+        }
+
+        rewritten.append(enumName);
+        rewritten.append("::");
+        rewritten.append(token);
+    }
+    return rewritten;
+}
+
+RewriteApplicationResult replaceIndexedExpressionsWithRangeEdits(const std::string& body,
+                                                                  const std::string& indexedExpression,
+                                                                  const std::string& itemName)
+{
+    std::vector<RewriteEdit> edits;
+    const std::regex expressionPattern(indexedExpression, std::regex::ECMAScript);
+    const std::vector<std::pair<std::size_t, std::size_t>> protectedRanges = protectedSourceRanges(body);
+    for (std::sregex_iterator it(body.begin(), body.end(), expressionPattern), end; it != end; ++it) {
+        const std::size_t start = static_cast<std::size_t>(it->position());
+        const std::size_t finish = start + static_cast<std::size_t>(it->length());
+        if (isInsideProtectedRange(protectedRanges, start, finish)) {
+            continue;
+        }
+
+        SourceRange range;
+        range.start.offset = start;
+        range.start.column = start + 1;
+        range.end.offset = finish;
+        range.end.column = finish + 1;
+        range.entityKind = SourceEntityKind::Expression;
+        range.entityName = it->str();
+
+        RewriteEdit edit;
+        edit.range = std::move(range);
+        edit.replacementText = itemName;
+        edit.passName = "StructuralModernizationEngine";
+        edit.reason = "Replace index expression with the generated range-for variable.";
+        edit.affectedSymbol = itemName;
+        edits.push_back(std::move(edit));
+    }
+    return RewriteCoordinator{}.apply(body, edits);
 }
 
 std::string rangeVariableName(const std::string& collectionName, const std::string& body)
@@ -212,11 +495,6 @@ struct FunctionLikeMacroDefinition
     std::vector<std::string> parameters;
     std::string body;
 };
-
-bool isIdentifierCharacter(char character)
-{
-    return std::isalnum(static_cast<unsigned char>(character)) != 0 || character == '_';
-}
 
 std::vector<std::string> splitCommaSeparated(const std::string& text)
 {
@@ -1088,11 +1366,8 @@ std::string StructuralModernizationEngine::modernizeEnums(const std::string& cod
             + "\n{" + body + "};";
         std::string prefix = updated.substr(0, position);
         std::string suffix = updated.substr(position + static_cast<std::size_t>(match.length()));
-        for (const std::string& name : enumerators) {
-            const std::regex referencePattern("(^|[^:A-Za-z0-9_])" + escapeRegex(name) + R"(\b)");
-            prefix = std::regex_replace(prefix, referencePattern, "$1" + enumName + "::" + name);
-            suffix = std::regex_replace(suffix, referencePattern, "$1" + enumName + "::" + name);
-        }
+        prefix = rewriteEnumeratorReferences(std::move(prefix), enumName, enumerators);
+        suffix = rewriteEnumeratorReferences(std::move(suffix), enumName, enumerators);
 
         updated = prefix + replacement + suffix;
         addAppliedChange(changes,
@@ -1204,7 +1479,8 @@ std::string StructuralModernizationEngine::modernizeLoops(const std::string& cod
         const std::string collection = match[3].str();
         std::string body = match[4].str();
         const std::string indexedExpression = collection + "\\s*\\[\\s*" + escapeRegex(indexName) + "\\s*\\]";
-        const std::string bodyWithoutIndexed = std::regex_replace(body, std::regex(indexedExpression), "");
+        const std::string analysisBody = maskProtectedSource(body);
+        const std::string bodyWithoutIndexed = std::regex_replace(analysisBody, std::regex(indexedExpression), "");
         if (std::regex_search(bodyWithoutIndexed, std::regex("\\b" + escapeRegex(indexName) + "\\b"))) {
             addSuggestion(changes,
                           "Index loop to range-based for",
@@ -1216,8 +1492,8 @@ std::string StructuralModernizationEngine::modernizeLoops(const std::string& cod
         }
 
         const std::string element = rangeVariableName(collection, body);
-        const bool mutableElement = std::regex_search(body, std::regex(indexedExpression + R"(\s*=)"));
-        body = std::regex_replace(body, std::regex(indexedExpression), element);
+        const bool mutableElement = std::regex_search(analysisBody, std::regex(indexedExpression + R"(\s*=)"));
+        body = replaceIndexedExpressionsWithRangeEdits(body, indexedExpression, element).code;
         body = std::regex_replace(body, std::regex(R"(std::endl)"), "'\\n'");
         const std::string qualifier = mutableElement ? "auto& " : "const auto& ";
         const std::string replacement = indent + "for (" + qualifier + element + " : " + collection + ")\n"

@@ -789,6 +789,53 @@ void runScopedEnumOutputTests()
     require(countOccurrences(twice, "static_cast<std::underlying_type_t<Status>>(current())") == 1,
             "idempotent rewrite should leave exactly one cast around the enum expression");
 
+    const std::string repeatedLineInput =
+        "#include <iostream>\n"
+        "enum class Status { Ready, Busy };\n"
+        "void report(Status status)\n"
+        "{\n"
+        "    std::cout << status << '\\n';\n"
+        "    std::cerr << status << '\\n';\n"
+        "    std::cout << \"status\" << '\\n'; // status\n"
+        "}\n";
+    const std::string repeatedOnce = outputValidator.validateAndRepair(propagationPass.rewrite(repeatedLineInput, options, directChanges), options, directChanges);
+    const std::string repeatedTwice = outputValidator.validateAndRepair(propagationPass.rewrite(repeatedOnce, options, directChanges), options, directChanges);
+    require(repeatedOnce == repeatedTwice,
+            "range-tracked scoped enum output rewrites should remain idempotent across repeated pass runs");
+    require(countOccurrences(repeatedTwice, "static_cast<std::underlying_type_t<Status>>(status)") == 2,
+            "same enum expression in distinct output statements should be cast once per statement");
+    require(contains(repeatedTwice, "\"status\"") && contains(repeatedTwice, "// status"),
+            "scoped enum output propagation must not rewrite string literals or comments");
+
+    const ConversionResult commentStringMacroResult = converter.convert(
+        "#include <iostream>\n"
+        "#define DEFAULT_STATE Ready\n"
+        "#define PRINT_STATE(stream) stream << Ready\n"
+        "enum State { Ready, Busy };\n"
+        "void report(State state)\n"
+        "{\n"
+        "    const char* text = \"Ready\";\n"
+        "    // Ready should remain readable in comments\n"
+        "    std::cout << text << '\\n';\n"
+        "    std::cout << state << '\\n';\n"
+        "}\n",
+        enterpriseOptions());
+    require(contains(commentStringMacroResult.modernCode, "#define DEFAULT_STATE Ready"),
+            "enum usage propagation must not rewrite enum labels inside macro bodies\nOutput:\n"
+                + commentStringMacroResult.modernCode);
+    require(contains(commentStringMacroResult.modernCode, "#define PRINT_STATE(stream) stream << Ready"),
+            "enum output propagation must not rewrite stream expressions inside macro bodies\nOutput:\n"
+                + commentStringMacroResult.modernCode);
+    require(contains(commentStringMacroResult.modernCode, "\"Ready\""),
+            "enum usage propagation must not rewrite string literals\nOutput:\n"
+                + commentStringMacroResult.modernCode);
+    require(contains(commentStringMacroResult.modernCode, "// Ready should remain readable in comments"),
+            "enum usage propagation must not rewrite comments\nOutput:\n"
+                + commentStringMacroResult.modernCode);
+    require(contains(commentStringMacroResult.modernCode, "std::cout << static_cast<std::underlying_type_t<State>>(state) << '\\n';"),
+            "real scoped enum output should still be cast outside comments/strings/macros\nOutput:\n"
+                + commentStringMacroResult.modernCode);
+
     const std::string alreadyCastedInput =
         "#include <iostream>\n"
         "#include <type_traits>\n"

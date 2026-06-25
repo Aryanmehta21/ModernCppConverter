@@ -87,6 +87,12 @@ cmake --build . --config Debug
 
 The same project should build on macOS, Linux, and Windows when Qt 6 and a supported compiler are available.
 
+For Clang experimentation we could use the below cmake settings:
+```sh
+cmake -S . -B build-clang -G "Ninja Multi-Config" -DENABLE_CLANG_EXPERIMENTS=ON -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm
+cmake --build build-clang --config Debug
+ctest --test-dir build-clang -C Debug --output-on-failure
+```
 ## Running the App
 
 After building, run the generated `ModernCppConverter` executable from the build tree.

@@ -30,10 +30,84 @@ std::vector<std::string> splitLines(const std::string& code)
 std::size_t findMatchingBrace(const std::string& code, std::size_t openBrace)
 {
     int depth = 1;
+    bool inString = false;
+    bool inCharacter = false;
+    bool inLineComment = false;
+    bool inBlockComment = false;
+    bool inPreprocessorLine = false;
+    bool escaped = false;
+    bool atLineStart = false;
     for (std::size_t position = openBrace + 1; position < code.size(); ++position) {
-        if (code[position] == '{') {
+        const char current = code[position];
+        const char next = position + 1 < code.size() ? code[position + 1] : '\0';
+
+        if (inPreprocessorLine) {
+            if (current == '\n') {
+                inPreprocessorLine = false;
+                atLineStart = true;
+            }
+            continue;
+        }
+        if (inLineComment) {
+            if (current == '\n') {
+                inLineComment = false;
+                atLineStart = true;
+            }
+            continue;
+        }
+        if (inBlockComment) {
+            if (current == '*' && next == '/') {
+                inBlockComment = false;
+                ++position;
+            }
+            continue;
+        }
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (current == '\\' && (inString || inCharacter)) {
+            escaped = true;
+            continue;
+        }
+        if (current == '\n') {
+            atLineStart = true;
+            continue;
+        }
+        if (atLineStart && std::isspace(static_cast<unsigned char>(current)) != 0) {
+            continue;
+        }
+        if (atLineStart && current == '#') {
+            inPreprocessorLine = true;
+            continue;
+        }
+        atLineStart = false;
+
+        if (!inString && !inCharacter && current == '/' && next == '/') {
+            inLineComment = true;
+            ++position;
+            continue;
+        }
+        if (!inString && !inCharacter && current == '/' && next == '*') {
+            inBlockComment = true;
+            ++position;
+            continue;
+        }
+        if (!inCharacter && current == '"') {
+            inString = !inString;
+            continue;
+        }
+        if (!inString && current == '\'') {
+            inCharacter = !inCharacter;
+            continue;
+        }
+        if (inString || inCharacter) {
+            continue;
+        }
+
+        if (current == '{') {
             ++depth;
-        } else if (code[position] == '}') {
+        } else if (current == '}') {
             --depth;
             if (depth == 0) {
                 return position;

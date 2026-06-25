@@ -1,6 +1,7 @@
 #include "converter/ScopedEnumOutputPropagationPass.h"
 
 #include "converter/IncludeManager.h"
+#include "converter/RewriteCoordinator.h"
 #include "converter/SafeReplacementEngine.h"
 
 #include <algorithm>
@@ -25,32 +26,6 @@ struct ExpressionCandidate
 {
     std::string pattern;
     std::string enumName;
-};
-
-struct ScopedEnumCastRewriteState
-{
-    std::set<std::pair<std::string, std::string>> processedExpressions;
-
-    [[nodiscard]] bool wasProcessed(const std::string& enumName, const std::string& expression) const
-    {
-        return processedExpressions.contains({enumName, trimCopy(expression)});
-    }
-
-    void markProcessed(const std::string& enumName, const std::string& expression)
-    {
-        processedExpressions.insert({enumName, trimCopy(expression)});
-    }
-
-private:
-    [[nodiscard]] static std::string trimCopy(std::string value)
-    {
-        const auto first = value.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos) {
-            return {};
-        }
-        const auto last = value.find_last_not_of(" \t\r\n");
-        return value.substr(first, last - first + 1);
-    }
 };
 
 std::string trim(std::string value)
@@ -89,6 +64,18 @@ void addAppliedChange(std::vector<ConversionChange>& changes,
         std::move(reason),
         true,
         false,
+    });
+}
+
+void addSkippedEditChange(std::vector<ConversionChange>& changes, const SkippedRewriteEdit& skipped)
+{
+    changes.push_back(ConversionChange{
+        "Rewrite edit skipped",
+        skipped.edit.affectedSymbol,
+        {},
+        "Skipped source-range edit from " + skipped.edit.passName + ": " + skipped.reason,
+        false,
+        true,
     });
 }
 
@@ -410,28 +397,22 @@ std::vector<ExpressionCandidate> buildCandidates(const std::string& code,
     return candidates;
 }
 
-std::string replaceCandidate(const std::string& codePart,
-                             const ExpressionCandidate& candidate,
-                             const EnumInfo& enumInfo,
-                             ScopedEnumCastRewriteState& rewriteState,
-                             bool& lineChanged,
-                             bool& needsTypeTraits)
+void collectCandidateEdits(const std::string& codePart,
+                           const ExpressionCandidate& candidate,
+                           const EnumInfo& enumInfo,
+                           std::vector<RewriteEdit>& edits)
 {
     const std::regex pattern(candidate.pattern, std::regex::ECMAScript);
-    std::string result;
-    std::size_t searchStart = 0;
 
     for (std::sregex_iterator it(codePart.begin(), codePart.end(), pattern), end; it != end; ++it) {
         const std::size_t position = static_cast<std::size_t>(it->position());
         const std::size_t length = static_cast<std::size_t>(it->length());
         const std::string expression = it->str();
 
-        if (position < searchStart
-            || isInsideQuotedText(codePart, position)
+        if (isInsideQuotedText(codePart, position)
             || isInsideSwitchCaseLabel(codePart, position)
             || followsMemberAccessOperator(codePart, position)
-            || isInsideOutputSafeWrapper(codePart, position, length)
-            || rewriteState.wasProcessed(candidate.enumName, expression)) {
+            || isInsideOutputSafeWrapper(codePart, position, length)) {
             continue;
         }
 
@@ -442,24 +423,23 @@ std::string replaceCandidate(const std::string& codePart,
             continue;
         }
 
-        result.append(codePart.substr(searchStart, position - searchStart));
-        result.append("static_cast<");
-        result.append(castTypeFor(enumInfo));
-        result.append(">(");
-        result.append(expression);
-        result.push_back(')');
-        searchStart = position + length;
-        lineChanged = true;
-        rewriteState.markProcessed(candidate.enumName, expression);
-        needsTypeTraits = needsTypeTraits || usesUnderlyingTypeTrait(enumInfo);
-    }
+        SourceRange range;
+        range.start.offset = position;
+        range.start.column = position + 1;
+        range.end.offset = position + length;
+        range.end.column = position + length + 1;
+        range.entityKind = SourceEntityKind::Expression;
+        range.entityName = expression;
 
-    if (searchStart == 0) {
-        return codePart;
+        RewriteEdit edit;
+        edit.range = std::move(range);
+        edit.replacementText = "static_cast<" + castTypeFor(enumInfo) + ">(" + expression + ")";
+        edit.passName = "ScopedEnumOutputPropagationPass";
+        edit.reason = "Cast scoped enum output expression to an output-safe underlying value.";
+        edit.affectedSymbol = candidate.enumName;
+        edit.priority = static_cast<int>(length);
+        edits.push_back(std::move(edit));
     }
-
-    result.append(codePart.substr(searchStart));
-    return result;
 }
 } // namespace
 
@@ -479,7 +459,6 @@ std::string ScopedEnumOutputPropagationPass::rewrite(const std::string& code,
 
     bool changed = false;
     bool needsTypeTraits = false;
-    ScopedEnumCastRewriteState rewriteState;
     const SafeReplacementEngine safeReplacement;
     std::string updated = safeReplacement.rewriteCodeLines(code, [&](const std::string& line) {
         std::string trailingComment;
@@ -489,16 +468,26 @@ std::string ScopedEnumOutputPropagationPass::rewrite(const std::string& code,
         }
 
         const std::string beforeLine = codePart;
-        bool lineChanged = false;
+        std::vector<RewriteEdit> edits;
         for (const ExpressionCandidate& candidate : candidates) {
             const auto enumIt = enums.find(candidate.enumName);
             if (enumIt == enums.end()) {
                 continue;
             }
-            codePart = replaceCandidate(codePart, candidate, enumIt->second, rewriteState, lineChanged, needsTypeTraits);
+            collectCandidateEdits(codePart, candidate, enumIt->second, edits);
         }
 
-        if (lineChanged) {
+        const RewriteApplicationResult editResult = RewriteCoordinator{}.apply(codePart, edits);
+        for (const RewriteEdit& appliedEdit : editResult.appliedEdits) {
+            const auto enumIt = enums.find(appliedEdit.affectedSymbol);
+            needsTypeTraits = needsTypeTraits || (enumIt != enums.end() && usesUnderlyingTypeTrait(enumIt->second));
+        }
+        for (const SkippedRewriteEdit& skippedEdit : editResult.skippedEdits) {
+            addSkippedEditChange(changes, skippedEdit);
+        }
+
+        if (!editResult.appliedEdits.empty()) {
+            codePart = editResult.code;
             changed = true;
             addAppliedChange(changes,
                              "Scoped enum output propagation",

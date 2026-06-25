@@ -31,6 +31,7 @@
 #include "converter/PassByValueToConstRefPass.h"
 #include "converter/PolymorphicContractPolishPass.h"
 #include "converter/PolymorphicSafetyPass.h"
+#include "converter/PostConversionFormatter.h"
 #include "converter/PrintfModernizationPass.h"
 #include "converter/QualityModernizationPass.h"
 #include "converter/ReturnTypePropagationPass.h"
@@ -44,18 +45,22 @@
 #include "converter/SemanticConsistencyValidator.h"
 #include "converter/SemanticModernizationValidator.h"
 #include "converter/SemanticTypeValidationPass.h"
+#include "converter/SemanticValidationAndRepairPass.h"
 #include "converter/SmartPointerCollectionPropagationPass.h"
 #include "converter/SmartPointerTypePropagationPass.h"
+#include "converter/StructuralAnalyzers.h"
 #include "converter/StructuralModernizationEngine.h"
 #include "converter/StringViewPolishPass.h"
 #include "converter/StructuredBindingPass.h"
 #include "converter/TransformationContext.h"
 #include "converter/VectorParadigmRewritePass.h"
+#include "frontend/FrontendFactory.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <memory>
 #include <regex>
 #include <sstream>
 #include <string_view>
@@ -137,6 +142,13 @@ struct SkippedRiskDiagnostic
     bool codeLeftUnchanged = true;
 };
 
+struct ClassBoundaryValidationResult
+{
+    bool valid = true;
+    std::string reason;
+    std::string entity = "translation-unit";
+};
+
 std::string diagnosticField(std::string value)
 {
     value.erase(std::remove(value.begin(), value.end(), '\n'), value.end());
@@ -173,6 +185,142 @@ std::string affectedEntityFromChange(const ConversionChange& change)
 std::string boolText(const bool value)
 {
     return value ? "true" : "false";
+}
+
+ClassBoundaryValidationResult validateClassBoundaries(const std::string& code)
+{
+    const ClassResourceAnalyzer classAnalyzer;
+    for (const ClassBlock& block : classAnalyzer.analyzeClasses(code)) {
+        std::size_t position = block.closeBrace + 1;
+        while (position < code.size() && std::isspace(static_cast<unsigned char>(code[position])) != 0) {
+            ++position;
+        }
+        if (position >= code.size() || code[position] != ';') {
+            return ClassBoundaryValidationResult{
+                false,
+                "missing semicolon after class/struct body",
+                block.name,
+            };
+        }
+    }
+
+    int braceDepth = 0;
+    bool inString = false;
+    bool inCharacter = false;
+    bool inLineComment = false;
+    bool inBlockComment = false;
+    bool inPreprocessorLine = false;
+    bool escaped = false;
+    bool atLineStart = true;
+    for (std::size_t index = 0; index < code.size();) {
+        const char current = code[index];
+        const char next = index + 1 < code.size() ? code[index + 1] : '\0';
+
+        if (inPreprocessorLine) {
+            if (current == '\n') {
+                inPreprocessorLine = false;
+                atLineStart = true;
+            }
+            ++index;
+            continue;
+        }
+        if (inLineComment) {
+            if (current == '\n') {
+                inLineComment = false;
+                atLineStart = true;
+            }
+            ++index;
+            continue;
+        }
+        if (inBlockComment) {
+            if (current == '*' && next == '/') {
+                index += 2;
+                inBlockComment = false;
+            } else {
+                ++index;
+            }
+            continue;
+        }
+        if (escaped) {
+            escaped = false;
+            ++index;
+            continue;
+        }
+        if (current == '\\' && (inString || inCharacter)) {
+            escaped = true;
+            ++index;
+            continue;
+        }
+        if (inString || inCharacter) {
+            if (inString && current == '"') {
+                inString = false;
+            } else if (inCharacter && current == '\'') {
+                inCharacter = false;
+            }
+            ++index;
+            continue;
+        }
+        if (current == '\n') {
+            atLineStart = true;
+            ++index;
+            continue;
+        }
+        if (atLineStart && std::isspace(static_cast<unsigned char>(current)) != 0) {
+            ++index;
+            continue;
+        }
+        if (atLineStart && current == '#') {
+            inPreprocessorLine = true;
+            ++index;
+            continue;
+        }
+        if (current == '/' && next == '/') {
+            inLineComment = true;
+            index += 2;
+            continue;
+        }
+        if (current == '/' && next == '*') {
+            inBlockComment = true;
+            index += 2;
+            continue;
+        }
+        if (current == '"') {
+            inString = true;
+            atLineStart = false;
+            ++index;
+            continue;
+        }
+        if (current == '\'') {
+            inCharacter = true;
+            atLineStart = false;
+            ++index;
+            continue;
+        }
+
+        if (current == '{') {
+            ++braceDepth;
+        } else if (current == '}' && braceDepth > 0) {
+            --braceDepth;
+        }
+
+        if (atLineStart && braceDepth == 0) {
+            const std::string_view remaining(code.data() + index, code.size() - index);
+            for (const std::string_view access : {"public:", "private:", "protected:"}) {
+                if (remaining.starts_with(access)) {
+                    return ClassBoundaryValidationResult{
+                        false,
+                        "orphan access section outside class/struct body",
+                        std::string(access.substr(0, access.size() - 1)),
+                    };
+                }
+            }
+        }
+
+        atLineStart = false;
+        ++index;
+    }
+
+    return {};
 }
 
 RollbackDiagnostic classifyRollback(const ConversionChange& change, const std::string& passName)
@@ -917,6 +1065,12 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                                         + " structural_passes=" + (shouldRunStructuralPass(options) ? "enabled" : "disabled")
                                         + " ownership_consistency=" + (shouldRunOwnershipConsistencyPass(options) ? "enabled" : "disabled")
                                         + " compile_verification=" + (options.compileVerificationEnabled ? "requested" : "pipeline-default"));
+    if (const std::unique_ptr<IModernizationFrontend> frontend = createDefaultModernizationFrontend()) {
+        const ModernizationFrontendResult frontendResult = frontend->analyze(normalizedCode);
+        result.diagnosticMessages.insert(result.diagnosticMessages.end(),
+                                         frontendResult.diagnostics.begin(),
+                                         frontendResult.diagnostics.end());
+    }
     if (!shouldRunStructuralPass(options)) {
         result.diagnosticMessages.push_back("SKIPPED PASS GROUP Structural modernization reason=offline modernization level is Conservative");
     }
@@ -1048,16 +1202,38 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         std::string candidate = transform(before);
         const auto finished = std::chrono::steady_clock::now();
         const auto elapsedMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(finished - started).count();
+        std::string statusOverride;
+        if (candidate != before) {
+            const ClassBoundaryValidationResult beforeClassBoundaries = validateClassBoundaries(before);
+            const ClassBoundaryValidationResult candidateClassBoundaries = validateClassBoundaries(candidate);
+            if (beforeClassBoundaries.valid && !candidateClassBoundaries.valid) {
+                changes.resize(changeCountBefore);
+                changes.push_back(ConversionChange{
+                    passName,
+                    candidateClassBoundaries.entity,
+                    {},
+                    "Semantic validator failure: class boundary validation failed ("
+                        + candidateClassBoundaries.reason
+                        + "); rolled back this pass to preserve member function scope.",
+                    false,
+                    true,
+                });
+                candidate = before;
+                statusOverride = "rolled-back-class-boundary-validation";
+            }
+        }
 
         const std::uint64_t hashAfter = stableHash(candidate);
-        if (candidate == before) {
+        if (candidate == before && statusOverride.empty()) {
             removeNoOpAppliedChanges(changes, changeCountBefore);
         }
 
         const std::size_t rewriteOperations = countAppliedChangesSince(changes, changeCountBefore)
             + ((candidate != before && countAppliedChangesSince(changes, changeCountBefore) == 0U) ? 1U : 0U);
         const std::size_t nodesModified = candidate == before ? 0U : countChangedLines(before, candidate);
-        const std::string status = candidate == before ? "converged-no-change" : "changed";
+        const std::string status = !statusOverride.empty()
+            ? statusOverride
+            : (candidate == before ? "converged-no-change" : "changed");
         const auto changesBegin = changes.begin() + static_cast<std::ptrdiff_t>(changeCountBefore);
         const std::size_t appliedCount = static_cast<std::size_t>(std::count_if(changesBegin, changes.end(), [](const ConversionChange& change) {
             return change.applied;
@@ -1107,6 +1283,17 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                                                                elapsedMilliseconds,
                                                                status));
         result.modernCode = std::move(candidate);
+    };
+
+    auto runSemanticValidationAndRepairPass = [&]() {
+        runTracedPass("SemanticValidationAndRepairPass", [&](const std::string& input) {
+            const SemanticValidationAndRepairPass pass;
+            SemanticValidationAndRepairResult repairResult = pass.validateAndRepair(input, options, transformationContext, changes);
+            result.diagnosticMessages.insert(result.diagnosticMessages.end(),
+                                             repairResult.diagnostics.begin(),
+                                             repairResult.diagnostics.end());
+            return repairResult.code;
+        });
     };
 
     if (shouldRunStructuralPass(options)) {
@@ -1378,6 +1565,8 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         });
     }
 
+    runSemanticValidationAndRepairPass();
+
     if (options.compileVerificationEnabled || aggressiveAiLike || shouldRunStructuralPass(options)) {
         result.diagnosticMessages.push_back("COMPILE VERIFICATION status=started stage=initial");
         const auto compileStarted = std::chrono::steady_clock::now();
@@ -1524,6 +1713,7 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                 const SemanticTypeValidationPass pass;
                 return pass.validateAndRepair(input, options, changes);
             });
+            runSemanticValidationAndRepairPass();
 
             if (result.modernCode != beforeCleanup) {
                 result.compileVerificationAutoFixAttempted = true;
@@ -1592,6 +1782,57 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     } else {
         result.diagnosticMessages.push_back("SKIPPED PASS CompileVerification reason=compile verification disabled for selected options/profile");
     }
+
+    auto runPostConversionFormatting = [&]() {
+        if (!options.enablePostConversionFormatting) {
+            result.diagnosticMessages.push_back("POST FORMAT formatting skipped: disabled");
+            return;
+        }
+        if (!result.compileVerificationEnabled || !result.compileVerificationPassed) {
+            result.diagnosticMessages.push_back("POST FORMAT formatting skipped: compile failed");
+            return;
+        }
+
+        const std::string beforeFormatting = result.modernCode;
+        const PostConversionFormatter formatter;
+        const PostConversionFormattingResult formattingResult = formatter.format(beforeFormatting);
+        result.diagnosticMessages.push_back("POST FORMAT " + formattingResult.diagnostic);
+        if (!formattingResult.applied || formattingResult.code == beforeFormatting) {
+            return;
+        }
+
+        result.diagnosticMessages.push_back("COMPILE VERIFICATION status=started stage=post-format");
+        const auto formatVerificationStarted = std::chrono::steady_clock::now();
+        const CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(formattingResult.code, options.targetStandard);
+        const auto formatVerificationFinished = std::chrono::steady_clock::now();
+        const auto formatVerificationElapsedMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+            formatVerificationFinished - formatVerificationStarted).count();
+        result.diagnosticMessages.push_back("COMPILE VERIFICATION status="
+                                            + std::string(verification.passed ? "passed" : "failed/skipped")
+                                            + " stage=post-format compiler="
+                                            + (verification.compilerUsed.empty() ? "not-found" : verification.compilerUsed)
+                                            + " time_ms=" + std::to_string(formatVerificationElapsedMilliseconds));
+        if (!verification.compilerFound || !verification.passed) {
+            result.diagnosticMessages.push_back("POST FORMAT formatting skipped: compile failed after formatting");
+            return;
+        }
+
+        result.modernCode = formattingResult.code;
+        result.compilerUsed = verification.compilerUsed;
+        result.compilerOutput = verification.output;
+        result.compileVerificationPassed = true;
+        changes.push_back(ConversionChange{
+            "Post-conversion formatting",
+            "unformatted converted code",
+            "formatted converted code",
+            "Applied optional final formatting after semantic validation and compile verification passed using "
+                + formattingResult.formatterName + ".",
+            true,
+            false,
+        });
+    };
+
+    runPostConversionFormatting();
 
     result.diagnosticMessages.push_back(skippedRiskSummaryMessage(skippedRiskDiagnostics));
     result.diagnosticMessages.push_back(rollbackSummaryMessage(rollbackDiagnostics));

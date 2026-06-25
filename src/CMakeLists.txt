@@ -16,6 +16,7 @@ target_link_libraries(ModernCppConverterCore
 
 include(${CMAKE_CURRENT_LIST_DIR}/services/CMakeLists.txt)
 include(${CMAKE_CURRENT_LIST_DIR}/parser/CMakeLists.txt)
+include(${CMAKE_CURRENT_LIST_DIR}/frontend/CMakeLists.txt)
 include(${CMAKE_CURRENT_LIST_DIR}/modernization/CMakeLists.txt)
 include(${CMAKE_CURRENT_LIST_DIR}/pipeline/CMakeLists.txt)
 include(${CMAKE_CURRENT_LIST_DIR}/editor/CMakeLists.txt)

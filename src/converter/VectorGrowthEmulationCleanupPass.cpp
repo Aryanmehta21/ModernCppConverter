@@ -5,6 +5,7 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -116,12 +117,20 @@ std::string ensureReserveAfterCapacityAssignment(const std::string& line,
     return codePart + trailingComment + "\n" + match[1].str() + vectorName + ".reserve(" + target + ");";
 }
 
-std::string makeAppendObjectName(const std::string& code)
+std::string makeAppendObjectName(const std::string& code, const std::set<std::string>& usedNames)
 {
-    if (code.find("appendedItem") == std::string::npos) {
-        return "appendedItem";
+    std::vector<std::string> candidates{"appendedItem", "modernizedItem"};
+    for (int suffix = 2; suffix < 100; ++suffix) {
+        candidates.push_back("appendedItem" + std::to_string(suffix));
     }
-    return "modernizedItem";
+
+    for (const std::string& candidate : candidates) {
+        if (!usedNames.contains(candidate)
+            && !std::regex_search(code, std::regex(R"(\b)" + escapeRegex(candidate) + R"(\b)"))) {
+            return candidate;
+        }
+    }
+    return "appendedItem" + std::to_string(usedNames.size() + 1);
 }
 
 bool lineMentionsAny(const std::string& line, const std::set<std::string>& symbols)
@@ -296,6 +305,132 @@ std::string removeManualGrowthIfBlocks(std::string code,
     return code;
 }
 
+bool isStandaloneCountIncrement(const std::string& codePart, const std::string& countName)
+{
+    const std::regex incrementPattern("^[ \\t]*(?:\\+\\+" + escapeRegex(countName) + "|" + escapeRegex(countName) + "\\+\\+)\\s*;\\s*$");
+    return std::regex_match(codePart, incrementPattern);
+}
+
+bool containsUnsafeControlTransfer(const std::string& codePart)
+{
+    return std::regex_search(codePart, std::regex(R"(\b(?:return|break|continue|throw|goto)\b)"));
+}
+
+std::string replaceIndexedMemberAccessOutsideLiterals(const std::string& codePart,
+                                                      const std::string& targetExpression,
+                                                      const std::string& countName,
+                                                      const std::string& objectName,
+                                                      bool& replaced)
+{
+    const std::regex accessPattern("^" + targetExpression
+                                   + R"(\s*\[\s*)" + escapeRegex(countName)
+                                   + R"(\s*\]\s*\.)");
+    std::string output;
+    output.reserve(codePart.size());
+
+    bool inString = false;
+    bool inCharacter = false;
+    bool escaped = false;
+    for (std::size_t index = 0; index < codePart.size();) {
+        const char current = codePart[index];
+        if (escaped) {
+            output.push_back(current);
+            escaped = false;
+            ++index;
+            continue;
+        }
+        if (current == '\\' && (inString || inCharacter)) {
+            output.push_back(current);
+            escaped = true;
+            ++index;
+            continue;
+        }
+        if (!inCharacter && current == '"') {
+            inString = !inString;
+            output.push_back(current);
+            ++index;
+            continue;
+        }
+        if (!inString && current == '\'') {
+            inCharacter = !inCharacter;
+            output.push_back(current);
+            ++index;
+            continue;
+        }
+
+        if (!inString && !inCharacter) {
+            std::smatch match;
+            const std::string suffix = codePart.substr(index);
+            if (std::regex_search(suffix, match, accessPattern)) {
+                output += objectName + ".";
+                index += static_cast<std::size_t>(match.length());
+                replaced = true;
+                continue;
+            }
+        }
+
+        output.push_back(current);
+        ++index;
+    }
+
+    return output;
+}
+
+bool indexedAccessesAreOnlyForCount(const std::vector<std::string>& lines,
+                                    std::size_t first,
+                                    std::size_t last,
+                                    const std::string& targetExpression,
+                                    const std::string& countName)
+{
+    const std::regex indexedAccessPattern(targetExpression + R"(\s*\[\s*([^\]\n]+)\s*\])");
+    for (std::size_t lineIndex = first; lineIndex <= last && lineIndex < lines.size(); ++lineIndex) {
+        std::string trailingComment;
+        const std::string codePart = SafeReplacementEngine::splitTrailingLineComment(lines[lineIndex], trailingComment);
+        for (std::sregex_iterator iterator(codePart.begin(), codePart.end(), indexedAccessPattern), end; iterator != end; ++iterator) {
+            if (trim((*iterator)[1].str()) != countName) {
+                return false;
+            }
+
+            const std::size_t afterBracket = static_cast<std::size_t>(iterator->position() + iterator->length());
+            std::size_t cursor = afterBracket;
+            while (cursor < codePart.size() && std::isspace(static_cast<unsigned char>(codePart[cursor])) != 0) {
+                ++cursor;
+            }
+            if (cursor >= codePart.size() || codePart[cursor] != '.') {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool spanMutatesCountBeforeIncrement(const std::vector<std::string>& lines,
+                                     std::size_t first,
+                                     std::size_t incrementLine,
+                                     const std::string& countName)
+{
+    const std::string escapedCount = escapeRegex(countName);
+    const std::vector<std::regex> mutationPatterns{
+        std::regex(R"(\b)" + escapedCount + R"(\s*(?:=|\+=|-=|\*=|/=|%=))"),
+        std::regex(R"((?:\+\+|--)\s*)" + escapedCount + R"(\b)"),
+        std::regex(R"(\b)" + escapedCount + R"(\s*(?:\+\+|--))"),
+    };
+
+    for (std::size_t lineIndex = first + 1; lineIndex < incrementLine && lineIndex < lines.size(); ++lineIndex) {
+        std::string trailingComment;
+        const std::string codePart = SafeReplacementEngine::splitTrailingLineComment(lines[lineIndex], trailingComment);
+        if (containsUnsafeControlTransfer(codePart)) {
+            return true;
+        }
+        for (const std::regex& pattern : mutationPatterns) {
+            if (std::regex_search(codePart, pattern)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 std::string rewriteFieldAppendSequences(const std::string& code,
                                         const TypeChangeRecord& record,
                                         const std::string& elementType,
@@ -309,6 +444,7 @@ std::string rewriteFieldAppendSequences(const std::string& code,
 
     const std::regex fieldAssignmentPattern("^([ \\t]*)" + targetExpression
                                                 + "\\s*\\[\\s*([A-Za-z_]\\w*)\\s*\\]\\s*\\.\\s*([A-Za-z_]\\w*)\\s*=\\s*([^;]+)\\s*;\\s*$");
+    std::set<std::string> usedAppendObjectNames;
 
     for (std::size_t index = 0; index < lines.size(); ++index) {
         std::smatch firstMatch;
@@ -321,10 +457,80 @@ std::string rewriteFieldAppendSequences(const std::string& code,
 
         const std::string baseIndent = firstMatch[1].str();
         const std::string countName = firstMatch[2].str();
+        const std::string objectName = makeAppendObjectName(code, usedAppendObjectNames);
+
+        std::size_t incrementLine = std::string::npos;
+        constexpr std::size_t maxAppendSpanLines = 80;
+        for (std::size_t scan = index + 1; scan < lines.size() && scan <= index + maxAppendSpanLines; ++scan) {
+            std::string incrementTrailingComment;
+            const std::string incrementCodePart = SafeReplacementEngine::splitTrailingLineComment(lines[scan], incrementTrailingComment);
+            if (isStandaloneCountIncrement(incrementCodePart, countName)) {
+                incrementLine = scan;
+                break;
+            }
+        }
+
+        if (incrementLine != std::string::npos
+            && indexedAccessesAreOnlyForCount(lines, index, incrementLine - 1, targetExpression, countName)
+            && !spanMutatesCountBeforeIncrement(lines, index, incrementLine, countName)) {
+            std::vector<std::string> originalLines;
+            std::vector<std::string> modernLines;
+            bool replacedAny = false;
+            for (std::size_t lineIndex = index; lineIndex < incrementLine; ++lineIndex) {
+                originalLines.push_back(lines[lineIndex]);
+                std::string trailingComment;
+                const std::string codePart = SafeReplacementEngine::splitTrailingLineComment(lines[lineIndex], trailingComment);
+                bool lineReplaced = false;
+                std::string modernCodePart = replaceIndexedMemberAccessOutsideLiterals(codePart,
+                                                                                       targetExpression,
+                                                                                       countName,
+                                                                                       objectName,
+                                                                                       lineReplaced);
+                replacedAny = replacedAny || lineReplaced;
+                modernLines.push_back(modernCodePart + trailingComment);
+            }
+
+            std::string incrementTrailingComment;
+            const std::string incrementCodePart = SafeReplacementEngine::splitTrailingLineComment(lines[incrementLine], incrementTrailingComment);
+            originalLines.push_back(lines[incrementLine]);
+            if (!replacedAny || !isStandaloneCountIncrement(incrementCodePart, countName)) {
+                rewrittenLines.push_back(lines[index]);
+                continue;
+            }
+
+            std::ostringstream before;
+            for (const std::string& originalLine : originalLines) {
+                if (before.tellp() > 0) {
+                    before << '\n';
+                }
+                before << originalLine;
+            }
+
+            rewrittenLines.push_back(baseIndent + elementType + " " + objectName + "{};");
+            rewrittenLines.insert(rewrittenLines.end(), modernLines.begin(), modernLines.end());
+            rewrittenLines.push_back(baseIndent + record.symbolName + ".push_back(" + objectName + ");" + incrementTrailingComment);
+
+            std::ostringstream after;
+            after << baseIndent << elementType << " " << objectName << "{};";
+            for (const std::string& modernLine : modernLines) {
+                after << '\n' << modernLine;
+            }
+            after << '\n' << baseIndent << record.symbolName << ".push_back(" << objectName << ");";
+
+            addAppliedChange(changes,
+                             "Indexed append to vector push_back",
+                             trim(before.str()),
+                             trim(after.str()),
+                             "Grouped field-by-field indexed aggregate append into one local value and one std::vector::push_back().");
+            usedAppendObjectNames.insert(objectName);
+            changed = true;
+            index = incrementLine;
+            continue;
+        }
+
         std::vector<std::string> originalAssignmentLines;
         std::vector<std::string> modernAssignmentLines;
         std::size_t scan = index;
-        const std::string objectName = makeAppendObjectName(code);
 
         for (; scan < lines.size(); ++scan) {
             std::string trailingComment;
@@ -384,6 +590,7 @@ std::string rewriteFieldAppendSequences(const std::string& code,
                          hasCountIncrement
                              ? "Replaced field-by-field indexed append plus count increment with construction of a local value and std::vector::push_back()."
                              : "Replaced field-by-field indexed append whose old count increment had already been removed with construction of a local value and std::vector::push_back().");
+        usedAppendObjectNames.insert(objectName);
         changed = true;
         index = hasCountIncrement ? scan : scan - 1;
     }

@@ -14,7 +14,22 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
+option(ENABLE_CLANG_EXPERIMENTS "Build optional Clang-backed analysis experiments" OFF)
+
 find_package(Qt6 REQUIRED COMPONENTS Widgets Network Concurrent)
+
+if(ENABLE_CLANG_EXPERIMENTS)
+    enable_language(C)
+    find_package(LLVM CONFIG QUIET)
+    if(NOT LLVM_FOUND)
+        message(FATAL_ERROR "ENABLE_CLANG_EXPERIMENTS=ON requires LLVM development CMake packages. Install LLVM/Clang or set LLVM_DIR/CMAKE_PREFIX_PATH, or configure with ENABLE_CLANG_EXPERIMENTS=OFF.")
+    endif()
+    find_package(Clang CONFIG QUIET)
+    if(NOT Clang_FOUND)
+        message(FATAL_ERROR "ENABLE_CLANG_EXPERIMENTS=ON requires Clang development CMake packages. Install Clang tooling or set Clang_DIR/CMAKE_PREFIX_PATH, or configure with ENABLE_CLANG_EXPERIMENTS=OFF.")
+    endif()
+    message(STATUS "Clang experiments enabled with LLVM ${LLVM_PACKAGE_VERSION}")
+endif()
 
 get_property(MODERN_CPP_CONVERTER_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(NOT MODERN_CPP_CONVERTER_IS_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)

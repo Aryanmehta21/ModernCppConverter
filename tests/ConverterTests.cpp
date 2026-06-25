@@ -13,10 +13,12 @@
 #include "converter/OfflineModernizationPipeline.h"
 #include "converter/OwnershipGraphAnalyzer.h"
 #include "converter/OwnershipSanityScanner.h"
+#include "converter/PostConversionFormatter.h"
 #include "converter/ReturnTypePropagationPass.h"
 #include "converter/ScopeAwareSymbolTable.h"
 #include "converter/ScopeLeakValidationPass.h"
 #include "converter/SemanticTypeValidationPass.h"
+#include "converter/SemanticValidationAndRepairPass.h"
 #include "converter/SmartPointerCollectionPropagationPass.h"
 #include "converter/SmartPointerSinkPropagationPass.h"
 #include "converter/AstRepresentation.h"
@@ -80,6 +82,17 @@ bool containsTrimmedLine(const std::string& text, const std::string& expected)
         }
         if (line.substr(first) == expected) {
             return true;
+        }
+    }
+    return false;
+}
+
+bool classBodyContains(const std::string& code, const std::string& className, const std::string& needle)
+{
+    const ClassResourceAnalyzer analyzer;
+    for (const ClassBlock& block : analyzer.analyzeClasses(code)) {
+        if (block.name == className) {
+            return block.text.find(needle) != std::string::npos;
         }
     }
     return false;
@@ -636,6 +649,26 @@ void testCodeRepresentations()
     require(ast.astSummary() == "translation-unit placeholder", "AST representation should expose placeholder metadata");
     ast.replaceSourceText("long value;");
     require(ast.astSummary().empty(), "AST representation should clear stale AST metadata after source replacement");
+}
+
+void testOfflinePipelineReportsFrontendDiagnostics()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = false;
+
+    const ConversionResult result = converter.convert(
+        "enum class Mode { Ready };\n"
+        "class Item { int value; };\n"
+        "int run() { return 0; }\n",
+        options);
+
+    require(diagnosticsContain(result, "FRONTEND used=LightweightFrontend"),
+            "offline conversion diagnostics should report the frontend used");
+    require(diagnosticsContain(result, "clang_experiment=disabled"),
+            "default offline conversion diagnostics should report Clang experiment disabled");
+    require(diagnosticsContain(result, "classes=1"),
+            "frontend diagnostics should include entity counts");
 }
 
 void testDependencyValidation()
@@ -2799,6 +2832,43 @@ void testStructuralIteratorAndIndexLoopsModernize()
     require(hasAppliedRule(result, "Index loop to range-based for"), "index loop conversion should be tracked");
 }
 
+void testIndexLoopRangeRewriteUsesSourceRanges()
+{
+    const RuleBasedConverterEngine converter;
+    const ConversionResult result = converter.convert(
+        "#include <iostream>\n"
+        "#include <vector>\n"
+        "void print(const std::vector<int>& records)\n"
+        "{\n"
+        "    for (std::size_t i = 0; i < records.size(); ++i)\n"
+        "    {\n"
+        "        if (records[i] > 0)\n"
+        "        {\n"
+        "            std::cout << records[i] << '\\n';\n"
+        "        }\n"
+        "        std::cout << \"records[i]\" << '\\n';\n"
+        "        // records[i] should stay readable in comments\n"
+        "    }\n"
+        "}\n",
+        structuralOptions());
+
+    require(contains(result.modernCode, "for (const auto& record : records)")
+                || contains(result.modernCode, "for (const auto& item : records)")
+                || contains(result.modernCode, "for (const auto& element : records)"),
+            "index loop should still modernize to range-for\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "if (record > 0)")
+                || contains(result.modernCode, "if (item > 0)")
+                || contains(result.modernCode, "if (element > 0)"),
+            "indexed expressions inside nested blocks should be replaced with the range variable\nOutput:\n"
+                + result.modernCode);
+    require(contains(result.modernCode, "\"records[i]\""),
+            "source-range replacement must not rewrite string literal text\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "// records[i] should stay readable in comments"),
+            "source-range replacement must not rewrite comments\nOutput:\n" + result.modernCode);
+    require(hasAppliedRule(result, "Index loop to range-based for"),
+            "source-range backed index loop conversion should be tracked");
+}
+
 void testLoopModernizationSafetyBoundaries()
 {
     const RuleBasedConverterEngine converter;
@@ -3103,6 +3173,9 @@ void testConversionDiagnosticsIncludeRoadmapDetails()
             "pass summaries should expose applied/skipped/warning/rollback counts");
     require(diagnosticsContain(result, "COMPILE VERIFICATION status="),
             "conversion diagnostics should include compile verification status");
+    require(diagnosticsContain(result, "SEMANTIC REPAIR section=started")
+                && diagnosticsContain(result, "SEMANTIC REPAIR section=summary"),
+            "conversion diagnostics should include final semantic repair details");
     require(diagnosticsContain(result, "FINAL RESULT status="),
             "conversion diagnostics should include final result status");
     require(diagnosticsContain(result, "ROLLBACK SUMMARY")
@@ -3679,6 +3752,163 @@ void testCompilerDiagnosticCleanupFixesKnownLeftovers()
     require(contains(fixed, "entries[0].label = input;"), "diagnostic cleanup should rewrite nested string strncpy");
     require(!contains(fixed, "std::strncpy"), "diagnostic cleanup should remove string write API");
     require(hasAppliedRule(changes, "Compiler diagnostic cleanup"), "compiler diagnostic cleanup should be tracked");
+}
+
+void testSemanticValidationAndRepairPassFixesCombinedArtifacts()
+{
+    ModernizationOptions options = structuralOptions();
+    options.targetStandard = CppStandard::Cpp20;
+
+    TransformationContext context;
+    context.registerTypeChange(TypeChangeRecord{
+        "values",
+        "int*",
+        "std::vector<int>",
+        "Builder",
+        true,
+        "Raw dynamic array to std::vector",
+        {"normalize resize/push_back artifacts"},
+        {},
+        false,
+    });
+
+    const std::string code =
+        "#include <cstring>\n"
+        "#include <fstream>\n"
+        "#include <iostream>\n"
+        "#include <map>\n"
+        "#include <memory>\n"
+        "#include <string>\n"
+        "#include <vector>\n"
+        "struct Item { int id; };\n"
+        "const Item* getItem();\n"
+        "void inspect(Item* item);\n"
+        "enum class State { Ready, Busy };\n"
+        "struct Record { std::string name; };\n"
+        "void printMap(const std::map<int, int>& values)\n"
+        "{\n"
+        "    for (auto it = values.begin(); it != values.end(); ++it)\n"
+        "    {\n"
+        "        std::cout << *it << '\\n';\n"
+        "    }\n"
+        "}\n"
+        "void repairAll(State state, const Record& record, const std::string& other, int limit)\n"
+        "{\n"
+        "    Item* item = getItem();\n"
+        "    std::vector<const Item*> observers;\n"
+        "    std::vector<Item*>::iterator it = observers.begin();\n"
+        "    Item* observed = *it;\n"
+        "    auto owner = std::make_unique<Item>();\n"
+        "    Item* alias = owner;\n"
+        "    inspect(owner);\n"
+        "    std::cout << state << '\\n';\n"
+        "    bool same = std::strcmp(record.name, other.c_str()) == 0;\n"
+        "    std::ofstream file(\"out.txt\");\n"
+        "    if (file != nullptr) { file << same << '\\n'; }\n"
+        "    fclose(file);\n"
+        "    std::vector<int> values;\n"
+        "    values.resize(limit);\n"
+        "    values.push_back(1);\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const SemanticValidationAndRepairPass pass;
+    const SemanticValidationAndRepairResult result = pass.validateAndRepair(code, options, context, changes);
+
+    require(contains(result.code, "const Item* item = getItem();"),
+            "const pointer return should propagate into direct receiver\nOutput:\n" + result.code);
+    require(contains(result.code, "auto it = observers.begin();")
+                || contains(result.code, "std::vector<const Item*>::iterator it = observers.begin();"),
+            "vector<const T*> iterator should not remain as vector<T*>::iterator\nOutput:\n" + result.code);
+    require(!contains(result.code, "std::vector<Item*>::iterator it = observers.begin();"),
+            "stale mutable pointer iterator should be repaired\nOutput:\n" + result.code);
+    require(contains(result.code, "const Item* observed = *it;"),
+            "dereferenced iterator from vector<const T*> should assign to const pointer\nOutput:\n" + result.code);
+    require(contains(result.code, "Item* alias = owner.get();"),
+            "observer alias from smart pointer should use .get()\nOutput:\n" + result.code);
+    require(contains(result.code, "inspect(owner.get());"),
+            "smart pointer raw sink call should use .get()\nOutput:\n" + result.code);
+    require(contains(result.code, "static_cast<std::underlying_type_t<State>>(state)"),
+            "enum class stream output should be cast once\nOutput:\n" + result.code);
+    require(countOccurrences(result.code, "static_cast<std::underlying_type_t<State>>(state)") == 1,
+            "enum stream repair should not create nested/duplicate casts\nOutput:\n" + result.code);
+    require(contains(result.code, "bool same = record.name == other;"),
+            "strcmp on std::string field should become string comparison\nOutput:\n" + result.code);
+    require(contains(result.code, "if (file)"),
+            "ofstream nullptr comparison should become stream state check\nOutput:\n" + result.code);
+    require(!contains(result.code, "fclose(file)"), "fclose on stream object should be removed\nOutput:\n" + result.code);
+    require(!contains(result.code, "std::cout << *it"),
+            "map iterator loop should not stream std::pair directly\nOutput:\n" + result.code);
+    require(contains(result.code, "ModernCppConverterPairLike")
+                || contains(result.code, "it->first")
+                || contains(result.code, "[key, value]")
+                || contains(result.code, "[key, mapped]"),
+            "pair streaming should be repaired by formatting first/second or pair-aware helper\nOutput:\n"
+                + result.code);
+    require(contains(result.code, "values.reserve(limit);"),
+            "resize followed by push_back should become reserve\nOutput:\n" + result.code);
+    require(result.issuesDetected > 0, "semantic repair report should count detected issues");
+    require(result.issuesRepaired > 0, "semantic repair report should count repaired issues");
+    require(std::any_of(result.diagnostics.begin(), result.diagnostics.end(), [](const std::string& diagnostic) {
+                return contains(diagnostic, "SEMANTIC REPAIR section=summary");
+            }),
+            "semantic repair diagnostics should include a summary");
+    require(hasAppliedRule(changes, "Semantic validation and repair"),
+            "semantic validation and repair should be tracked as a change");
+}
+
+void testSemanticValidationRepairsConstPointerRangeLocal()
+{
+    ModernizationOptions options = structuralOptions();
+    options.targetStandard = CppStandard::Cpp20;
+
+    const std::string code =
+        "#include <vector>\n"
+        "struct Task { int id; };\n"
+        "void inspect(const std::vector<const Task*>& tasks)\n"
+        "{\n"
+        "    for (const auto& ptr : tasks)\n"
+        "    {\n"
+        "        Task* local = ptr;\n"
+        "        auto* inferred = ptr;\n"
+        "        const auto* alreadyConst = ptr;\n"
+        "        (void)local;\n"
+        "        (void)inferred;\n"
+        "        (void)alreadyConst;\n"
+        "    }\n"
+        "    Task* direct = tasks[0];\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const SemanticValidationAndRepairPass pass;
+    const TransformationContext context;
+    const SemanticValidationAndRepairResult result = pass.validateAndRepair(code, options, context, changes);
+
+    require(contains(result.code, "const Task* local = ptr;"),
+            "range variable over vector<const T*> should force mutable local pointer to const pointer\nOutput:\n"
+                + result.code);
+    require(contains(result.code, "const Task* direct = tasks[0];"),
+            "indexed access into vector<const T*> should force mutable local pointer to const pointer\nOutput:\n"
+                + result.code);
+    require(!containsTrimmedLine(result.code, "Task* local = ptr;"),
+            "stale mutable local pointer from const range variable should not remain\nOutput:\n"
+                + result.code);
+    require(!containsTrimmedLine(result.code, "Task* direct = tasks[0];"),
+            "stale mutable local pointer from const container element should not remain\nOutput:\n"
+                + result.code);
+    require(contains(result.code, "auto* inferred = ptr;"),
+            "auto* observer should be preserved because it deduces const pointer semantics\nOutput:\n"
+                + result.code);
+    require(contains(result.code, "const auto* alreadyConst = ptr;"),
+            "already const auto* observer should be preserved\nOutput:\n"
+                + result.code);
+    require(hasAppliedRule(changes, "Semantic validation and repair"),
+            "semantic validation and repair should report the const pointer local repair");
+
+    const CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(result.code, options.targetStandard);
+    require(verification.compilerUsed.empty() || verification.passed,
+            "const pointer local repair should pass syntax verification\nCompiler output:\n"
+                + verification.output + "\nConverted code:\n" + result.code);
 }
 
 void testValueTypePointerOperationScannerRemovesPointerLeftovers()
@@ -4824,6 +5054,177 @@ void testVectorEmulationEliminatesFieldAppendGrowth()
     }
 }
 
+void testVectorAppendGroupsAggregateAssignmentsIntoSinglePush()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult flatResult = converter.convert(
+        "#include <cstddef>\n"
+        "struct Record\n"
+        "{\n"
+        "    int id;\n"
+        "    int value;\n"
+        "    bool active;\n"
+        "};\n\n"
+        "class RecordStore\n"
+        "{\n"
+        "public:\n"
+        "    RecordStore()\n"
+        "        : records(nullptr), count(0), capacity(2)\n"
+        "    {\n"
+        "        records = new Record[capacity];\n"
+        "    }\n"
+        "    void add(int id, int value)\n"
+        "    {\n"
+        "        records[count].id = id;\n"
+        "        records[count].value = value;\n"
+        "        records[count].active = true;\n"
+        "        count++;\n"
+        "    }\n"
+        "    ~RecordStore()\n"
+        "    {\n"
+        "        delete[] records;\n"
+        "    }\n"
+        "private:\n"
+        "    Record* records;\n"
+        "    int count;\n"
+        "    int capacity;\n"
+        "};\n",
+        options);
+
+    require(contains(flatResult.modernCode, "std::vector<Record> records;"),
+            "aggregate append storage should become vector\nConverted code:\n" + flatResult.modernCode);
+    require(countOccurrences(flatResult.modernCode, "Record appendedItem{};") == 1,
+            "one logical aggregate append should create exactly one temporary object\nConverted code:\n"
+                + flatResult.modernCode);
+    require(contains(flatResult.modernCode, "appendedItem.id = id;")
+                && contains(flatResult.modernCode, "appendedItem.value = value;")
+                && contains(flatResult.modernCode, "appendedItem.active = true;"),
+            "all aggregate member assignments should target the same temporary object\nConverted code:\n"
+                + flatResult.modernCode);
+    require(countOccurrences(flatResult.modernCode, "records.push_back(appendedItem);") == 1,
+            "one logical aggregate append should emit exactly one push_back\nConverted code:\n"
+                + flatResult.modernCode);
+    require(!contains(flatResult.modernCode, "records[count]"),
+            "append-style indexed aggregate writes should not remain\nConverted code:\n" + flatResult.modernCode);
+    if (!flatResult.compilerUsed.empty()) {
+        require(flatResult.compileVerificationPassed,
+                "flat aggregate append grouping should pass syntax verification\nCompiler output:\n"
+                    + flatResult.compilerOutput + "\nConverted code:\n" + flatResult.modernCode);
+    }
+
+    const ConversionResult conditionalResult = converter.convert(
+        "#include <cstddef>\n"
+        "struct Record\n"
+        "{\n"
+        "    int id;\n"
+        "    int value;\n"
+        "    bool active;\n"
+        "};\n\n"
+        "class ConditionalStore\n"
+        "{\n"
+        "public:\n"
+        "    ConditionalStore()\n"
+        "        : records(nullptr), count(0), capacity(2)\n"
+        "    {\n"
+        "        records = new Record[capacity];\n"
+        "    }\n"
+        "    void add(int id, int value, bool enabled)\n"
+        "    {\n"
+        "        records[count].id = id;\n"
+        "        if (enabled)\n"
+        "        {\n"
+        "            records[count].value = value;\n"
+        "        }\n"
+        "        records[count].active = enabled;\n"
+        "        ++count;\n"
+        "    }\n"
+        "    ~ConditionalStore()\n"
+        "    {\n"
+        "        delete[] records;\n"
+        "    }\n"
+        "private:\n"
+        "    Record* records;\n"
+        "    int count;\n"
+        "    int capacity;\n"
+        "};\n",
+        options);
+
+    require(countOccurrences(conditionalResult.modernCode, "Record appendedItem{};") == 1,
+            "conditional aggregate append should still create exactly one temporary object\nConverted code:\n"
+                + conditionalResult.modernCode);
+    require(contains(conditionalResult.modernCode, "appendedItem.id = id;")
+                && contains(conditionalResult.modernCode, "appendedItem.value = value;")
+                && contains(conditionalResult.modernCode, "appendedItem.active = enabled;"),
+            "conditional member assignments should be preserved on the same aggregate temporary\nConverted code:\n"
+                + conditionalResult.modernCode);
+    require(countOccurrences(conditionalResult.modernCode, "records.push_back(appendedItem);") == 1,
+            "conditional aggregate append should emit one push_back after the append span\nConverted code:\n"
+                + conditionalResult.modernCode);
+    require(!contains(conditionalResult.modernCode, "records[count]"),
+            "conditional append-style indexed writes should not remain\nConverted code:\n"
+                + conditionalResult.modernCode);
+    if (!conditionalResult.compilerUsed.empty()) {
+        require(conditionalResult.compileVerificationPassed,
+                "conditional aggregate append grouping should pass syntax verification\nCompiler output:\n"
+                    + conditionalResult.compilerOutput + "\nConverted code:\n" + conditionalResult.modernCode);
+    }
+
+    const ConversionResult repeatedResult = converter.convert(
+        "#include <cstddef>\n"
+        "struct Record\n"
+        "{\n"
+        "    int id;\n"
+        "    int value;\n"
+        "};\n\n"
+        "class RepeatedStore\n"
+        "{\n"
+        "public:\n"
+        "    RepeatedStore()\n"
+        "        : records(nullptr), count(0), capacity(4)\n"
+        "    {\n"
+        "        records = new Record[capacity];\n"
+        "    }\n"
+        "    void addPair(int first, int second)\n"
+        "    {\n"
+        "        records[count].id = first;\n"
+        "        records[count].value = 1;\n"
+        "        count++;\n"
+        "        records[count].id = second;\n"
+        "        records[count].value = 2;\n"
+        "        count++;\n"
+        "    }\n"
+        "    ~RepeatedStore()\n"
+        "    {\n"
+        "        delete[] records;\n"
+        "    }\n"
+        "private:\n"
+        "    Record* records;\n"
+        "    int count;\n"
+        "    int capacity;\n"
+        "};\n",
+        options);
+
+    require(countOccurrences(repeatedResult.modernCode, "records.push_back(") == 2,
+            "two logical aggregate appends should emit exactly two push_back calls\nConverted code:\n"
+                + repeatedResult.modernCode);
+    require(contains(repeatedResult.modernCode, "Record appendedItem{};")
+                && (contains(repeatedResult.modernCode, "Record modernizedItem{};")
+                    || contains(repeatedResult.modernCode, "Record appendedItem2{};")),
+            "multiple logical appends should use distinct temporary object names\nConverted code:\n"
+                + repeatedResult.modernCode);
+    require(!contains(repeatedResult.modernCode, "records[count]"),
+            "multiple aggregate appends should not leave indexed vector writes\nConverted code:\n"
+                + repeatedResult.modernCode);
+    if (!repeatedResult.compilerUsed.empty()) {
+        require(repeatedResult.compileVerificationPassed,
+                "repeated aggregate append grouping should pass syntax verification\nCompiler output:\n"
+                    + repeatedResult.compilerOutput + "\nConverted code:\n" + repeatedResult.modernCode);
+    }
+}
+
 void testContainerModernizationCleanupRemovesGenericGrowthSystem()
 {
     const RuleBasedConverterEngine converter;
@@ -4915,6 +5316,106 @@ void testContainerModernizationCleanupRemovesGenericGrowthSystem()
     if (!result.compilerUsed.empty()) {
         require(result.compileVerificationPassed,
                 "container modernization cleanup consistency sample should pass syntax verification\nCompiler output:\n"
+                    + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+    }
+}
+
+void testSourceRangeRewritesPreserveClassBoundaries()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <cstring>\n"
+        "#include <iostream>\n"
+        "#define INITIAL_CAPACITY 2\n"
+        "struct SensorRecord\n"
+        "{\n"
+        "    int id;\n"
+        "    char label[16];\n"
+        "};\n\n"
+        "class SensorLog\n"
+        "{\n"
+        "private:\n"
+        "    SensorRecord* records;\n"
+        "    int count;\n"
+        "    int capacity;\n\n"
+        "public:\n"
+        "    SensorLog()\n"
+        "    {\n"
+        "        const char* note = \"not a class close }; public:\";\n"
+        "        (void)note;\n"
+        "        count = 0;\n"
+        "        capacity = INITIAL_CAPACITY;\n"
+        "        records = new SensorRecord[capacity];\n"
+        "    }\n\n"
+        "    SensorLog(const SensorLog& other)\n"
+        "    {\n"
+        "        count = other.count;\n"
+        "        capacity = other.capacity;\n"
+        "        records = new SensorRecord[capacity];\n"
+        "        for (int index = 0; index < count; ++index)\n"
+        "        {\n"
+        "            records[index] = other.records[index];\n"
+        "        }\n"
+        "    }\n\n"
+        "    ~SensorLog()\n"
+        "    {\n"
+        "        if (records != NULL)\n"
+        "        {\n"
+        "            delete[] records;\n"
+        "            records = NULL;\n"
+        "        }\n"
+        "    }\n\n"
+        "    bool add(int id, const char* label)\n"
+        "    {\n"
+        "        // This misleading brace must not close the class: };\n"
+        "        if (count >= capacity)\n"
+        "        {\n"
+        "            int newCapacity = capacity * 2;\n"
+        "            SensorRecord* temp = new SensorRecord[newCapacity];\n"
+        "            for (int index = 0; index < count; ++index)\n"
+        "            {\n"
+        "                temp[index] = records[index];\n"
+        "            }\n"
+        "            delete[] records;\n"
+        "            records = temp;\n"
+        "            capacity = newCapacity;\n"
+        "        }\n"
+        "        records[count].id = id;\n"
+        "        std::strncpy(records[count].label, label, 15);\n"
+        "        records[count].label[15] = '\\0';\n"
+        "        ++count;\n"
+        "        return true;\n"
+        "    }\n\n"
+        "    int getCount() const\n"
+        "    {\n"
+        "        return count;\n"
+        "    }\n\n"
+        "    SensorRecord* getRecord(int index)\n"
+        "    {\n"
+        "        return &records[index];\n"
+        "    }\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<SensorRecord> records;"),
+            "raw array member should still become vector\nConverted code:\n" + result.modernCode);
+    require(classBodyContains(result.modernCode, "SensorLog", "bool add("),
+            "add method must remain inside SensorLog after constructor/destructor cleanup\nConverted code:\n"
+                + result.modernCode);
+    require(classBodyContains(result.modernCode, "SensorLog", "getCount"),
+            "count getter must remain inside SensorLog after vector cleanup\nConverted code:\n" + result.modernCode);
+    require(classBodyContains(result.modernCode, "SensorLog", "getRecord"),
+            "index getter must remain inside SensorLog after vector cleanup\nConverted code:\n" + result.modernCode);
+    require(!contains(result.modernCode, "~SensorLog()"),
+            "cleanup-only destructor should be removed after vector modernization");
+    require(!contains(result.modernCode, "temp[index] = records[index]"),
+            "manual growth copy loop should be removed");
+    if (!result.compilerUsed.empty()) {
+        require(result.compileVerificationPassed,
+                "source-range class-boundary vector modernization should compile\nCompiler output:\n"
                     + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
     }
 }
@@ -5251,6 +5752,209 @@ void testFinalFormatterCleansTransformedBlocks()
     require(contains(formatted, "            return;"), "formatter should indent statements inside nested blocks\nOutput:\n" + formatted);
     require(!contains(formatted, "override{"), "formatter should not leave override glued to brace\nOutput:\n" + formatted);
     require(hasAppliedRule(changes, "Final transformation formatting cleanup"), "formatting cleanup should be tracked");
+}
+
+void testPostConversionFormattingDisabledByDefault()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert("int main(){return 0;}\n", options);
+
+    require(contains(result.modernCode, "int main(){return 0;}"),
+            "post-conversion formatting should be disabled by default\nOutput:\n" + result.modernCode);
+    require(diagnosticsContain(result, "POST FORMAT formatting skipped: disabled"),
+            "diagnostics should explain that final formatting was disabled");
+}
+
+void testPostConversionFormattingRunsAfterSuccessfulCompile()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    options.enablePostConversionFormatting = true;
+
+    const ConversionResult result = converter.convert(
+        "struct Fixture{\n"
+        "void run(){\n"
+        "if (true){\n"
+        "return;\n"
+        "}\n"
+        "}\n"
+        "};\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "formatted conversion should keep compile verification passing\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "struct Fixture {"),
+            "post-conversion formatter should clean class brace spacing\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "if (true) {"),
+            "post-conversion formatter should clean control-flow brace spacing\nOutput:\n" + result.modernCode);
+    require(diagnosticsContain(result, "POST FORMAT formatting applied:"),
+            "diagnostics should report that final formatting was applied");
+    require(hasAppliedRule(result, "Post-conversion formatting"),
+            "post-conversion formatting should be tracked as an applied change");
+}
+
+void testPostConversionFormattingSkipsAfterCompileFailure()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    options.enablePostConversionFormatting = true;
+
+    const ConversionResult result = converter.convert("int main(){return missing_symbol;}\n", options);
+
+    require(!result.compileVerificationPassed,
+            "invalid code sample should fail compile verification for formatting gate test");
+    require(contains(result.modernCode, "int main(){return missing_symbol;}"),
+            "formatting should not run after compile verification fails\nOutput:\n" + result.modernCode);
+    require(diagnosticsContain(result, "POST FORMAT formatting skipped: compile failed"),
+            "diagnostics should explain that formatting was skipped because compile verification failed");
+    require(!hasAppliedRule(result, "Post-conversion formatting"),
+            "post-conversion formatting should not be recorded as applied after compile failure");
+}
+
+void testPostConversionFormatterFallsBackWhenClangFormatUnavailable()
+{
+    PostConversionFormatterConfig config;
+    config.clangFormatPathOverride = "/definitely/not/a/real/clang-format";
+    config.allowLightweightFallback = true;
+    const PostConversionFormatter formatter(config);
+
+    const PostConversionFormattingResult result = formatter.format(
+        "struct Fixture{\n"
+        "void run(){\n"
+        "if (true){\n"
+        "return;\n"
+        "}\n"
+        "}\n"
+        "};\n");
+
+    require(result.applied, "lightweight fallback should format the intentionally messy sample");
+    require(result.formatterName == "lightweight formatter",
+            "invalid clang-format path should select lightweight fallback");
+    require(contains(result.diagnostic, "formatting applied: lightweight formatter"),
+            "fallback result should explain that lightweight formatting was applied");
+    require(contains(result.code, "struct Fixture {"),
+            "lightweight fallback should clean class brace spacing\nOutput:\n" + result.code);
+}
+
+void testPostConversionFormatterUnavailableDiagnostic()
+{
+    PostConversionFormatterConfig config;
+    config.clangFormatPathOverride = "/definitely/not/a/real/clang-format";
+    config.allowLightweightFallback = false;
+    const PostConversionFormatter formatter(config);
+
+    const PostConversionFormattingResult result = formatter.format("int main(){return 0;}\n");
+
+    require(!result.applied, "formatter should not apply when clang-format and fallback are unavailable");
+    require(contains(result.diagnostic, "formatting skipped: formatter unavailable"),
+            "formatter should report unavailable formatter when no implementation can run");
+}
+
+void testPostConversionFormatterPreservesCommentsStringsAndMacros()
+{
+    PostConversionFormatterConfig config;
+    config.clangFormatPathOverride = "/definitely/not/a/real/clang-format";
+    config.allowLightweightFallback = true;
+    const PostConversionFormatter formatter(config);
+
+    const std::string code =
+        "#define KEEP(x) ((x) + 1)\n"
+        "const char* text = \"if(true){\";\n"
+        "// if(true){ should remain comment text\n"
+        "struct Fixture{\n"
+        "void run(){\n"
+        "if (true){\n"
+        "return;\n"
+        "}\n"
+        "}\n"
+        "};\n";
+
+    const PostConversionFormattingResult result = formatter.format(code);
+
+    require(contains(result.code, "#define KEEP(x) ((x) + 1)"),
+            "formatter should preserve macro directives\nOutput:\n" + result.code);
+    require(contains(result.code, "\"if(true){\""),
+            "formatter should preserve string literal contents\nOutput:\n" + result.code);
+    require(contains(result.code, "// if(true){ should remain comment text"),
+            "formatter should preserve comment contents\nOutput:\n" + result.code);
+}
+
+void testPostConversionFormatterNormalizesIncludesAndSpacing()
+{
+    PostConversionFormatterConfig config;
+    config.clangFormatPathOverride = "/definitely/not/a/real/clang-format";
+    config.allowLightweightFallback = true;
+    const PostConversionFormatter formatter(config);
+
+    const PostConversionFormattingResult result = formatter.format(
+        "#include<vector>\n"
+        "#include<iostream>\n"
+        "#include <vector>\n"
+        "#include \"widget.h\"\n"
+        "#include \"widget.h\"\n"
+        "int add(int a,int b){\n"
+        "int total=a+b;\n"
+        "std::cout<<total<<'\\n';\n"
+        "return total;\n"
+        "}\n");
+
+    require(contains(result.code, "#include <iostream>"),
+            "formatter should normalize system include spacing\nOutput:\n" + result.code);
+    require(contains(result.code, "#include <vector>"),
+            "formatter should retain normalized vector include\nOutput:\n" + result.code);
+    require(countOccurrences(result.code, "#include <vector>") == 1,
+            "formatter should remove duplicate system includes\nOutput:\n" + result.code);
+    require(countOccurrences(result.code, "#include \"widget.h\"") == 1,
+            "formatter should remove duplicate local includes\nOutput:\n" + result.code);
+    require(result.code.find("#include <iostream>") < result.code.find("#include <vector>"),
+            "formatter should sort system includes consistently\nOutput:\n" + result.code);
+    require(result.code.find("#include <vector>") < result.code.find("#include \"widget.h\""),
+            "formatter should group system includes before local includes\nOutput:\n" + result.code);
+    require(contains(result.code, "int add(int a, int b)"),
+            "formatter should add spaces after commas\nOutput:\n" + result.code);
+    require(contains(result.code, "int total = a+b;"),
+            "formatter should add spaces around assignment without inventing broader rewrites\nOutput:\n"
+                + result.code);
+    require(contains(result.code, "std::cout << total << '\\n';"),
+            "formatter should normalize stream insertion spacing\nOutput:\n" + result.code);
+}
+
+void testPostConversionFormatterCleansUniquePtrNewConstruction()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    options.enablePostConversionFormatting = true;
+
+    const ConversionResult result = converter.convert(
+        "#include<memory>\n"
+        "struct Item { int value; };\n"
+        "int main()\n"
+        "{\n"
+        "    std::unique_ptr<Item> item(new Item());\n"
+        "    return item ? 0 : 1;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "make_unique cleanup should preserve compile correctness\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <memory>"),
+            "formatter should normalize memory include spacing\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "auto item = std::make_unique<Item>();"),
+            "post-conversion formatter should prefer make_unique for direct unique_ptr new construction\nOutput:\n"
+                + result.modernCode);
+    require(!contains(result.modernCode, "std::unique_ptr<Item> item(new Item())"),
+            "old unique_ptr raw-new construction should not remain after formatting cleanup\nOutput:\n"
+                + result.modernCode);
+    require(diagnosticsContain(result, "POST FORMAT formatting applied:"),
+            "diagnostics should report that post-conversion formatting was applied");
 }
 
 void testConstReturnPropagationUpdatesDirectReceivers()
@@ -7379,6 +8083,7 @@ int main(int argc, char** argv)
     testDefaultSafeOptionsWork();
     testExplanationReflectsSelectedOptions();
     testCodeRepresentations();
+    testOfflinePipelineReportsFrontendDiagnostics();
     testDependencyValidation();
     testNullMacroRemoval();
     testNullptrMacroWorkaroundRemoval();
@@ -7447,6 +8152,7 @@ int main(int argc, char** argv)
     testStructuralRawDynamicArrayModernizesToVector();
     testStructuralLocalDynamicArrayModernizesToVector();
     testStructuralIteratorAndIndexLoopsModernize();
+    testIndexLoopRangeRewriteUsesSourceRanges();
     testLoopModernizationSafetyBoundaries();
     testManualGrowthPipelineConverges();
     testCanBufferManualGrowthReproTerminates();
@@ -7463,6 +8169,8 @@ int main(int argc, char** argv)
     testStringCapiCleanupHandlesStringFieldCStrComparisons();
     testStringCapiCompilerDiagnosticCleanupRunsWithoutTypeContext();
     testCompilerDiagnosticCleanupFixesKnownLeftovers();
+    testSemanticValidationAndRepairPassFixesCombinedArtifacts();
+    testSemanticValidationRepairsConstPointerRangeLocal();
     testValueTypePointerOperationScannerRemovesPointerLeftovers();
     testValueTypeNullptrEqualityBecomesValueStateCheck();
     testEmptyCleanupBlockAfterValueTypeModernizationIsRemoved();
@@ -7494,13 +8202,23 @@ int main(int argc, char** argv)
     testLocalRawArrayAppendUsesReserveAndPushBack();
     testVectorGrowthPassFlagsAmbiguousRawAssignment();
     testVectorEmulationEliminatesFieldAppendGrowth();
+    testVectorAppendGroupsAggregateAssignmentsIntoSinglePush();
     testContainerModernizationCleanupRemovesGenericGrowthSystem();
+    testSourceRangeRewritesPreserveClassBoundaries();
     testContainerModernizationCleanupRemovesSameLineGrowthFragments();
     testContainerModernizationCleanupPolishesVectorBackedClass();
     testPostVectorCleanupRemovesUnusedCapacityWithoutReserve();
     testSizeReturningGetterUpdatesSignedLoopIndex();
     testCrossScopePropagationAdaptsVectorToRawArrayCallsite();
     testFinalFormatterCleansTransformedBlocks();
+    testPostConversionFormattingDisabledByDefault();
+    testPostConversionFormattingRunsAfterSuccessfulCompile();
+    testPostConversionFormattingSkipsAfterCompileFailure();
+    testPostConversionFormatterFallsBackWhenClangFormatUnavailable();
+    testPostConversionFormatterUnavailableDiagnostic();
+    testPostConversionFormatterPreservesCommentsStringsAndMacros();
+    testPostConversionFormatterNormalizesIncludesAndSpacing();
+    testPostConversionFormatterCleansUniquePtrNewConstruction();
     testConstReturnPropagationUpdatesDirectReceivers();
     testConstReturnPropagationHandlesReferencesAndSmartPointerRefs();
     testConstReturnPropagationUpdatesObserverContainersAndPredicates();
