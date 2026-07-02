@@ -186,6 +186,8 @@ std::vector<std::string> detectRequiredStandardIncludes(const std::string& code)
         {"<array>", R"(\bstd::array\b)"},
         {"<optional>", R"(\bstd::optional\b)"},
         {"<mutex>", R"(\bstd::(?:lock_guard|mutex)\b)"},
+        {"<thread>", R"(\bstd::this_thread::sleep_for\b)"},
+        {"<chrono>", R"(\bstd::chrono::(?:seconds|microseconds|milliseconds|duration)\b)"},
     };
 
     std::vector<std::string> includes;

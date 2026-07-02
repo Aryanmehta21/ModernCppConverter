@@ -11,6 +11,7 @@
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
 #include "converter/ConcurrencyRaiiModernizationPass.h"
+#include "converter/ConstPointerParameterModernizationPass.h"
 #include "converter/ContainerModernizationCleanupPass.h"
 #include "converter/ContainerPolishPass.h"
 #include "converter/CrossFunctionTypePropagationPass.h"
@@ -25,6 +26,7 @@
 #include "converter/IncludeCleanupPass.h"
 #include "converter/IteratorModernizationPass.h"
 #include "converter/MallocFreeModernizationPass.h"
+#include "converter/MakeUniqueModernizationPass.h"
 #include "converter/MemberApiCascadePass.h"
 #include "converter/ModernizationPolishPass.h"
 #include "converter/ModernizationPolishValidator.h"
@@ -50,6 +52,7 @@
 #include "converter/SemanticModernizationValidator.h"
 #include "converter/SemanticTypeValidationPass.h"
 #include "converter/SemanticValidationAndRepairPass.h"
+#include "converter/SleepModernizationPass.h"
 #include "converter/SmartPointerCollectionPropagationPass.h"
 #include "converter/SmartPointerTypePropagationPass.h"
 #include "converter/StructuralAnalyzers.h"
@@ -1923,6 +1926,18 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         });
     }
 
+    runTracedPass("MakeUniqueModernizationPass", [&](const std::string& input) {
+        const MakeUniqueModernizationPass pass;
+        return pass.rewrite(input, changes);
+    });
+    runTracedPass("SleepModernizationPass", [&](const std::string& input) {
+        const SleepModernizationPass pass;
+        return pass.rewrite(input, changes);
+    });
+    runTracedPass("ConstPointerParameterModernizationPass", [&](const std::string& input) {
+        const ConstPointerParameterModernizationPass pass;
+        return pass.rewrite(input, changes);
+    });
     runSemanticValidationAndRepairPass();
     runIncludeCleanupPass();
 

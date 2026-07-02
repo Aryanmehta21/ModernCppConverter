@@ -12,6 +12,7 @@ target_sources(ModernCppConverterCore
         ${PROJECT_SOURCE_DIR}/src/converter/ClangSemanticValidationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/CompilerDiagnosticCleanupPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ConcurrencyRaiiModernizationPass.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/ConstPointerParameterModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ContainerModernizationCleanupPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ContainerPolishPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/CrossFunctionTypePropagationPass.cpp
@@ -31,6 +32,7 @@ target_sources(ModernCppConverterCore
         ${PROJECT_SOURCE_DIR}/src/converter/IndexLoopModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/IteratorModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/MallocFreeModernizationPass.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/MakeUniqueModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/MemberApiCascadePass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ModernizationPolishPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ModernizationPolishValidator.cpp
@@ -63,6 +65,7 @@ target_sources(ModernCppConverterCore
         ${PROJECT_SOURCE_DIR}/src/converter/SemanticModernizationValidator.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SemanticTypeValidationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SemanticValidationAndRepairPass.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/SleepModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SmartPointerCollectionPropagationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SmartPointerSinkPropagationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/SmartPointerTypePropagationPass.cpp

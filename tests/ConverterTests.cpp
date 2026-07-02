@@ -6,6 +6,7 @@
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
 #include "converter/ContainerModernizationCleanupPass.h"
+#include "converter/ConstPointerParameterModernizationPass.h"
 #include "converter/CrossScopeTypePropagationPass.h"
 #include "converter/ImpactCascadingCleanupPass.h"
 #include "converter/IncludeCleanupPass.h"
@@ -22,6 +23,7 @@
 #include "converter/ScopeLeakValidationPass.h"
 #include "converter/SemanticTypeValidationPass.h"
 #include "converter/SemanticValidationAndRepairPass.h"
+#include "converter/SleepModernizationPass.h"
 #include "converter/SmartPointerCollectionPropagationPass.h"
 #include "converter/SmartPointerSinkPropagationPass.h"
 #include "converter/AstRepresentation.h"
@@ -7142,6 +7144,642 @@ void testPostConversionFormatterCleansUniquePtrNewConstruction()
             "diagnostics should report that post-conversion formatting was applied");
 }
 
+void testUniquePtrNewDefaultConstructorBecomesMakeUnique()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    options.enablePostConversionFormatting = false;
+
+    const ConversionResult result = converter.convert(
+        "struct Record {};\n"
+        "int main()\n"
+        "{\n"
+        "    std::unique_ptr<Record> owned(new Record());\n"
+        "    return owned ? 0 : 1;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "unique_ptr raw-new cleanup should compile after include cleanup\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <memory>"),
+            "make_unique modernization should add missing memory include\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "auto owned = std::make_unique<Record>();"),
+            "default unique_ptr(new T()) construction should become make_unique\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::unique_ptr<Record> owned(new Record())"),
+            "direct unique_ptr raw-new construction should not remain\nOutput:\n" + result.modernCode);
+    require(hasAppliedRule(result, "unique_ptr raw-new construction to make_unique"),
+            "make_unique modernization should be recorded as an applied change");
+}
+
+void testUniquePtrNewConstructorArgumentsBecomeMakeUnique()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    options.enablePostConversionFormatting = false;
+
+    const ConversionResult result = converter.convert(
+        "struct Record\n"
+        "{\n"
+        "    Record(int, const char*) {}\n"
+        "};\n"
+        "int main()\n"
+        "{\n"
+        "    std::unique_ptr<Record> owned(new Record(1, \"Engine\"));\n"
+        "    return owned ? 0 : 1;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "make_unique with constructor arguments should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "auto owned = std::make_unique<Record>(1, \"Engine\");"),
+            "constructor arguments should be preserved in make_unique\nOutput:\n" + result.modernCode);
+}
+
+void testUniquePtrNewNamespaceTypeBecomesMakeUnique()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    options.enablePostConversionFormatting = false;
+
+    const ConversionResult result = converter.convert(
+        "namespace telemetry\n"
+        "{\n"
+        "struct Record {};\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    std::unique_ptr<telemetry::Record> owned(new telemetry::Record());\n"
+        "    return owned ? 0 : 1;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "make_unique for namespace-qualified types should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "auto owned = std::make_unique<telemetry::Record>();"),
+            "namespace-qualified unique_ptr(new T()) should become make_unique\nOutput:\n" + result.modernCode);
+}
+
+void testUniquePtrAlreadyMakeUniqueUnchanged()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    options.enablePostConversionFormatting = false;
+
+    const ConversionResult result = converter.convert(
+        "#include <memory>\n"
+        "struct Record {};\n"
+        "int main()\n"
+        "{\n"
+        "    auto owned = std::make_unique<Record>();\n"
+        "    return owned ? 0 : 1;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "already-modern make_unique code should still compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(countOccurrences(result.modernCode, "std::make_unique<Record>()") == 1,
+            "already make_unique construction should not be duplicated\nOutput:\n" + result.modernCode);
+    require(!hasAppliedRule(result, "unique_ptr raw-new construction to make_unique"),
+            "already make_unique code should not record a raw-new cleanup change");
+}
+
+void testUniquePtrNewCustomDeleterSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    options.enablePostConversionFormatting = false;
+
+    const ConversionResult result = converter.convert(
+        "#include <memory>\n"
+        "struct Record {};\n"
+        "struct DestroyRecord\n"
+        "{\n"
+        "    void operator()(Record* record) const { delete record; }\n"
+        "};\n"
+        "int main()\n"
+        "{\n"
+        "    std::unique_ptr<Record, DestroyRecord> owned(new Record());\n"
+        "    return owned ? 0 : 1;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "custom-deleter unique_ptr code should remain compile-safe\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::unique_ptr<Record, DestroyRecord> owned(new Record());"),
+            "custom-deleter unique_ptr construction should be skipped\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::make_unique<Record>()"),
+            "custom-deleter unique_ptr construction should not become make_unique\nOutput:\n" + result.modernCode);
+}
+
+void testUniquePtrArrayNewSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+    options.enablePostConversionFormatting = false;
+
+    const ConversionResult result = converter.convert(
+        "#include <memory>\n"
+        "int main()\n"
+        "{\n"
+        "    std::unique_ptr<int[]> values(new int[3]);\n"
+        "    values[0] = 1;\n"
+        "    return values[0];\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "unique_ptr array construction should remain compile-safe\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::unique_ptr<int[]> values(new int[3]);"),
+            "unique_ptr<T[]> raw array construction should be skipped for this task\nOutput:\n"
+                + result.modernCode);
+    require(!contains(result.modernCode, "std::make_unique<int[]>"),
+            "unique_ptr array construction should not be rewritten yet\nOutput:\n" + result.modernCode);
+}
+
+void testSleepLiteralModernizesToSleepFor()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <unistd.h>\n"
+        "int main()\n"
+        "{\n"
+        "    sleep(1); // wait briefly\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "sleep literal modernization should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <thread>"),
+            "sleep modernization should add thread include\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <chrono>"),
+            "sleep modernization should add chrono include\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "#include <unistd.h>"),
+            "unistd.h should be removed when no POSIX symbols remain\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::this_thread::sleep_for(std::chrono::seconds(1)); // wait briefly"),
+            "sleep literal should become std::this_thread::sleep_for with seconds and preserve comment\nOutput:\n"
+                + result.modernCode);
+    require(hasAppliedRule(result, "POSIX sleep to std::this_thread::sleep_for"),
+            "sleep modernization should be tracked as an applied change");
+}
+
+void testSleepVariableModernizesToSleepFor()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <unistd.h>\n"
+        "int main()\n"
+        "{\n"
+        "    int delay = 2;\n"
+        "    sleep(delay);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "sleep variable modernization should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::this_thread::sleep_for(std::chrono::seconds(delay));"),
+            "sleep variable should become std::chrono::seconds(variable)\nOutput:\n" + result.modernCode);
+}
+
+void testGlobalQualifiedSleepLiteralModernizesToSleepFor()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <unistd.h>\n"
+        "int main()\n"
+        "{\n"
+        "    ::sleep(1);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "global-qualified sleep literal modernization should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::this_thread::sleep_for(std::chrono::seconds(1));"),
+            "::sleep literal should become std::this_thread::sleep_for with seconds\nOutput:\n"
+                + result.modernCode);
+    require(!contains(result.modernCode, "::std::this_thread"),
+            "global-qualified sleep rewrite should replace the full ::sleep call range\nOutput:\n"
+                + result.modernCode);
+}
+
+void testGlobalQualifiedSleepVariableModernizesToSleepFor()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <unistd.h>\n"
+        "int main()\n"
+        "{\n"
+        "    int seconds = 2;\n"
+        "    ::sleep(seconds);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "global-qualified sleep variable modernization should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::this_thread::sleep_for(std::chrono::seconds(seconds));"),
+            "::sleep variable should become std::chrono::seconds(variable)\nOutput:\n"
+                + result.modernCode);
+    require(!contains(result.modernCode, "::sleep(seconds)"),
+            "global-qualified POSIX sleep call should not remain after conversion\nOutput:\n" + result.modernCode);
+}
+
+void testGlobalQualifiedSleepModernizesDespiteUserDefinedUnqualifiedSleep()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "void sleep(int value) {}\n"
+        "#define WAIT() sleep(1)\n"
+        "int main()\n"
+        "{\n"
+        "    int seconds = 2;\n"
+        "    ::sleep(1);\n"
+        "    ::sleep(seconds);\n"
+        "    sleep(5);\n"
+        "    WAIT();\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "global-qualified sleep should compile after conversion even when unqualified sleep is user-defined\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::this_thread::sleep_for(std::chrono::seconds(1));"),
+            "::sleep(1) should become std::this_thread::sleep_for\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::this_thread::sleep_for(std::chrono::seconds(seconds));"),
+            "::sleep(seconds) should become std::this_thread::sleep_for\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "sleep(5);"),
+            "unqualified user-defined sleep call should remain unchanged\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#define WAIT() sleep(1)"),
+            "macro sleep usage should remain unchanged\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "WAIT();"),
+            "macro invocation should remain unchanged\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "::sleep(1);")
+                && !contains(result.modernCode, "::sleep(seconds);"),
+            "global-qualified POSIX sleep calls should not remain\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <thread>")
+                && contains(result.modernCode, "#include <chrono>"),
+            "global-qualified sleep conversion should add thread and chrono includes\nOutput:\n" + result.modernCode);
+}
+
+void testUsleepLiteralModernizesToSleepFor()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <unistd.h>\n"
+        "int main()\n"
+        "{\n"
+        "    usleep(500000);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "usleep literal modernization should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::this_thread::sleep_for(std::chrono::microseconds(500000));"),
+            "usleep literal should become std::chrono::microseconds\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "#include <unistd.h>"),
+            "unistd.h should be removed after usleep conversion when no POSIX symbols remain\nOutput:\n"
+                + result.modernCode);
+}
+
+void testUsleepVariableModernizesToSleepFor()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <unistd.h>\n"
+        "int main()\n"
+        "{\n"
+        "    int delayMicros = 500000;\n"
+        "    usleep(delayMicros);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "usleep variable modernization should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::this_thread::sleep_for(std::chrono::microseconds(delayMicros));"),
+            "usleep variable should become std::chrono::microseconds(variable)\nOutput:\n"
+                + result.modernCode);
+}
+
+void testUserDefinedSleepFunctionIsSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "void sleep(int) {}\n"
+        "int main()\n"
+        "{\n"
+        "    sleep(1);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "user-defined sleep function should remain compile-safe\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "void sleep(int)"),
+            "user-defined sleep declaration should remain unchanged\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "sleep(1);"),
+            "call to user-defined sleep should be skipped\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::this_thread::sleep_for"),
+            "user-defined sleep should not become std::this_thread::sleep_for\nOutput:\n" + result.modernCode);
+}
+
+void testSleepInsideMacroIsSkipped()
+{
+    std::vector<ConversionChange> changes;
+    const SleepModernizationPass pass;
+    const std::string code =
+        "#define WAIT_ONCE() sleep(1)\n"
+        "void run()\n"
+        "{\n"
+        "    WAIT_ONCE();\n"
+        "}\n";
+
+    const std::string result = pass.rewrite(code, changes);
+
+    require(result == code,
+            "sleep calls inside macro definitions should be skipped\nOutput:\n" + result);
+    require(changes.empty(),
+            "macro-body sleep skip should not be reported as a source transformation");
+}
+
+void testSleepModernizationKeepsUnistdForOtherPosixSymbols()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <unistd.h>\n"
+        "int main()\n"
+        "{\n"
+        "    int fd = -1;\n"
+        "    sleep(1);\n"
+        "    close(fd);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "sleep modernization should compile while preserving other POSIX calls\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <unistd.h>"),
+            "unistd.h should be kept while close remains\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::this_thread::sleep_for(std::chrono::seconds(1));"),
+            "sleep should still modernize when unrelated POSIX symbols keep unistd.h\nOutput:\n"
+                + result.modernCode);
+    require(contains(result.modernCode, "close(fd);"),
+            "unrelated POSIX call should be preserved\nOutput:\n" + result.modernCode);
+}
+
+void testReadOnlyRawPointerParameterBecomesConstPointer()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <iostream>\n"
+        "struct Record\n"
+        "{\n"
+        "    int id;\n"
+        "};\n"
+        "void printRecord(Record* record)\n"
+        "{\n"
+        "    if (record != nullptr)\n"
+        "    {\n"
+        "        std::cout << record->id << '\\n';\n"
+        "    }\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    Record record{7};\n"
+        "    printRecord(&record);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "read-only raw pointer parameter const modernization should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "void printRecord(const Record* record)"),
+            "read-only struct pointer parameter should become const pointer\nOutput:\n" + result.modernCode);
+    require(hasAppliedRule(result, "Const pointer parameter modernization"),
+            "const pointer parameter modernization should be tracked as applied");
+}
+
+void testMutatingRawPointerParameterIsSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "struct Record\n"
+        "{\n"
+        "    int id;\n"
+        "};\n"
+        "void updateRecord(Record* record)\n"
+        "{\n"
+        "    record->id = 9;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    Record record{7};\n"
+        "    updateRecord(&record);\n"
+        "    return record.id;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "mutating raw pointer parameter should remain compile-safe\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "void updateRecord(Record* record)"),
+            "mutating pointer parameter should not become const pointer\nOutput:\n" + result.modernCode);
+    require(hasSkippedRule(result.changes, "Const pointer parameter modernization skipped"),
+            "mutating pointer parameter skip should be tracked");
+}
+
+void testNonConstMethodRawPointerParameterIsSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "struct Record\n"
+        "{\n"
+        "    void refresh() {}\n"
+        "};\n"
+        "void refreshRecord(Record* record)\n"
+        "{\n"
+        "    record->refresh();\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    Record record;\n"
+        "    refreshRecord(&record);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "non-const method call skip should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "void refreshRecord(Record* record)"),
+            "pointer used for non-const method call should be skipped\nOutput:\n" + result.modernCode);
+}
+
+void testConstMethodRawPointerParameterBecomesConstPointer()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "struct Record\n"
+        "{\n"
+        "    int identifier() const { return 7; }\n"
+        "};\n"
+        "int readRecord(Record* record)\n"
+        "{\n"
+        "    return record->identifier();\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    Record record;\n"
+        "    return readRecord(&record);\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "const method read-only pointer modernization should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "int readRecord(const Record* record)"),
+            "pointer used only for const method calls should become const pointer\nOutput:\n" + result.modernCode);
+}
+
+void testDeleteRawPointerParameterIsSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "struct Record {};\n"
+        "void destroyRecord(Record* record)\n"
+        "{\n"
+        "    delete record;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "delete pointer parameter skip should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "void destroyRecord(Record* record)"),
+            "ownership/deletion pointer parameter should be skipped\nOutput:\n" + result.modernCode);
+}
+
+void testOutputRawPointerParameterIsSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "struct Record\n"
+        "{\n"
+        "    int id;\n"
+        "};\n"
+        "void fillRecord(Record* record)\n"
+        "{\n"
+        "    *record = Record{11};\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    Record record{0};\n"
+        "    fillRecord(&record);\n"
+        "    return record.id;\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "output pointer parameter skip should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "void fillRecord(Record* record)"),
+            "output pointer parameter should not become const pointer\nOutput:\n" + result.modernCode);
+}
+
+void testCharPointerParameterIsSkippedForConstModernizationTask()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <iostream>\n"
+        "void printText(char* text)\n"
+        "{\n"
+        "    if (text != nullptr)\n"
+        "    {\n"
+        "        std::cout << text << '\\n';\n"
+        "    }\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "char pointer skip should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "void printText(char* text)"),
+            "char* parameters are excluded from this const pointer task\nOutput:\n" + result.modernCode);
+}
+
 void testConstReturnPropagationUpdatesDirectReceivers()
 {
     const RuleBasedConverterEngine converter;
@@ -9437,6 +10075,29 @@ int main(int argc, char** argv)
     testPostConversionFormatterPreservesCommentsStringsAndMacros();
     testPostConversionFormatterNormalizesIncludesAndSpacing();
     testPostConversionFormatterCleansUniquePtrNewConstruction();
+    testUniquePtrNewDefaultConstructorBecomesMakeUnique();
+    testUniquePtrNewConstructorArgumentsBecomeMakeUnique();
+    testUniquePtrNewNamespaceTypeBecomesMakeUnique();
+    testUniquePtrAlreadyMakeUniqueUnchanged();
+    testUniquePtrNewCustomDeleterSkipped();
+    testUniquePtrArrayNewSkipped();
+    testSleepLiteralModernizesToSleepFor();
+    testSleepVariableModernizesToSleepFor();
+    testGlobalQualifiedSleepLiteralModernizesToSleepFor();
+    testGlobalQualifiedSleepVariableModernizesToSleepFor();
+    testGlobalQualifiedSleepModernizesDespiteUserDefinedUnqualifiedSleep();
+    testUsleepLiteralModernizesToSleepFor();
+    testUsleepVariableModernizesToSleepFor();
+    testUserDefinedSleepFunctionIsSkipped();
+    testSleepInsideMacroIsSkipped();
+    testSleepModernizationKeepsUnistdForOtherPosixSymbols();
+    testReadOnlyRawPointerParameterBecomesConstPointer();
+    testMutatingRawPointerParameterIsSkipped();
+    testNonConstMethodRawPointerParameterIsSkipped();
+    testConstMethodRawPointerParameterBecomesConstPointer();
+    testDeleteRawPointerParameterIsSkipped();
+    testOutputRawPointerParameterIsSkipped();
+    testCharPointerParameterIsSkippedForConstModernizationTask();
     testConstReturnPropagationUpdatesDirectReceivers();
     testConstReturnPropagationHandlesReferencesAndSmartPointerRefs();
     testConstReturnPropagationUpdatesObserverContainersAndPredicates();
