@@ -13,7 +13,7 @@ FrontendEntityCounts entityCountsFor(const ParsedDocument& document)
         document.aggregates.size(),
         document.functions.size(),
         document.enums.size(),
-        document.memberVariables.size() + document.localVariables.size(),
+        document.memberVariables.size() + document.globalVariables.size() + document.localVariables.size(),
     };
 }
 
@@ -28,6 +28,15 @@ std::string frontendSummaryMessage(const ModernizationFrontendResult& result)
            << " enums=" << result.entityCounts.enums
            << " variables=" << result.entityCounts.variables;
     return output.str();
+}
+
+std::string clangExperimentStateMessage()
+{
+#if defined(MODERNCPP_ENABLE_CLANG_EXPERIMENTS)
+    return "FRONTEND clang_experiment=enabled default=LightweightFrontend";
+#else
+    return "FRONTEND clang_experiment=disabled default=LightweightFrontend";
+#endif
 }
 } // namespace
 
@@ -56,6 +65,6 @@ ModernizationFrontendResult LightweightFrontend::analyze(const std::string& sour
     result.parseSucceeded = result.document.parseSucceeded;
     result.diagnostics = result.document.warnings;
     result.diagnostics.insert(result.diagnostics.begin(), frontendSummaryMessage(result));
-    result.diagnostics.insert(result.diagnostics.begin(), "FRONTEND clang_experiment=disabled default=LightweightFrontend");
+    result.diagnostics.insert(result.diagnostics.begin(), clangExperimentStateMessage());
     return result;
 }

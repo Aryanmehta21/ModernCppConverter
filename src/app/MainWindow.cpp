@@ -4,13 +4,17 @@
 #include "backend/BackendConfig.h"
 #include "converter/CompileVerifier.h"
 #include "converter/RuleBasedConverterEngine.h"
+#include "utils/AppVersion.h"
+#include "utils/CrashBreadcrumb.h"
 #include "editor/CppCodeEditor.h"
 #include "repository/RepositoryCloneService.h"
 #include "repository/RepositoryModernizationService.h"
 
 #include <algorithm>
 #include <exception>
+#include <numeric>
 #include <stdexcept>
+#include <vector>
 
 #include <QApplication>
 #include <QClipboard>
@@ -111,6 +115,32 @@ OfflineModernizationLevel levelFromIndex(int index)
     }
 }
 
+ModernizationFrontendSelection frontendSelectionFromIndex(int index)
+{
+    switch (index) {
+    case 1:
+        return ModernizationFrontendSelection::ClangExperimental;
+    case 2:
+        return ModernizationFrontendSelection::Auto;
+    default:
+        return ModernizationFrontendSelection::Lightweight;
+    }
+}
+
+DiagnosticVerbosity diagnosticVerbosityFromIndex(int index)
+{
+    switch (index) {
+    case 0:
+        return DiagnosticVerbosity::Summary;
+    case 2:
+        return DiagnosticVerbosity::Verbose;
+    case 3:
+        return DiagnosticVerbosity::Debug;
+    default:
+        return DiagnosticVerbosity::Normal;
+    }
+}
+
 QString defaultRepositoryWorkspace()
 {
     return QDir::home().filePath("ModernCppConverterWorkspaces");
@@ -143,7 +173,7 @@ MainWindow::MainWindow(std::unique_ptr<IConverterEngine> converterEngine, QWidge
 
 void MainWindow::buildUi()
 {
-    setWindowTitle("Modern C++ Converter");
+    setWindowTitle(QString::fromStdString(AppVersion::windowTitle()));
 
     auto* toolbar = addToolBar("Conversion Controls");
     toolbar->setMovable(false);
@@ -305,11 +335,25 @@ QWidget* MainWindow::createOptionsPanel()
     offlineRewriteStyleComboBox_ = new QComboBox;
     offlineRewriteStyleComboBox_->addItem("Safe Modernization");
     offlineRewriteStyleComboBox_->addItem("Aggressive AI-like Rewrite");
+    analysisFrontendComboBox_ = new QComboBox;
+    analysisFrontendComboBox_->addItem("Lightweight");
+    analysisFrontendComboBox_->addItem("Clang Experimental");
+    analysisFrontendComboBox_->addItem("Auto");
+    diagnosticVerbosityComboBox_ = new QComboBox;
+    diagnosticVerbosityComboBox_->addItem("Summary");
+    diagnosticVerbosityComboBox_->addItem("Normal");
+    diagnosticVerbosityComboBox_->addItem("Verbose");
+    diagnosticVerbosityComboBox_->addItem("Debug");
+    diagnosticVerbosityComboBox_->setCurrentIndex(1);
     automaticCompileVerificationCheckBox_ = addOption(advancedLayout, "Automatically verify converted code");
     customInstructionEdit_ = new QLineEdit;
     customInstructionEdit_->setPlaceholderText("Prefer std::vector over raw arrays where possible.");
     advancedLayout->addWidget(new QLabel("Offline rewrite style"));
     advancedLayout->addWidget(offlineRewriteStyleComboBox_);
+    advancedLayout->addWidget(new QLabel("Analysis frontend"));
+    advancedLayout->addWidget(analysisFrontendComboBox_);
+    advancedLayout->addWidget(new QLabel("Conversion details"));
+    advancedLayout->addWidget(diagnosticVerbosityComboBox_);
     advancedLayout->addWidget(new QLabel("Custom modernization instruction"));
     advancedLayout->addWidget(customInstructionEdit_);
     contentLayout->addWidget(advancedGroup);
@@ -474,6 +518,7 @@ QWidget* MainWindow::createDiagnosticsPanel()
 
 void MainWindow::convertCode()
 {
+    CrashBreadcrumb::ScopedStage stage("GUI convert button handler");
     if (activeConversionWatcher_ != nullptr && activeConversionWatcher_->isRunning()) {
         appendConversionDiagnostic("Convert clicked while conversion is already running. Use Clear to cancel the active conversion.");
         statusBar()->showMessage("Conversion is already running");
@@ -509,9 +554,11 @@ void MainWindow::convertCode()
 
     appendConversionDiagnostic(QString("Worker thread started. conversion_id=%1").arg(static_cast<qulonglong>(conversionId)));
     activeConversionWatcher_->setFuture(QtConcurrent::run([this, input, options, mode]() {
+        CrashBreadcrumb::ScopedStage workerStage("GUI worker conversion");
         try {
             return conversionCoordinator_->convert(input, options, mode);
         } catch (const std::exception& exception) {
+            CrashBreadcrumb::fail("GUI worker conversion", exception.what());
             CoordinatedConversionResult failure;
             failure.result.modernCode = input;
             failure.result.conversionSource = "Conversion Error";
@@ -520,6 +567,7 @@ void MainWindow::convertCode()
             failure.result.diagnosticMessages.push_back(std::string("conversion exception: ") + exception.what());
             return failure;
         } catch (...) {
+            CrashBreadcrumb::fail("GUI worker conversion", "unknown exception");
             CoordinatedConversionResult failure;
             failure.result.modernCode = input;
             failure.result.conversionSource = "Conversion Error";
@@ -535,6 +583,7 @@ void MainWindow::convertCode()
 void MainWindow::handleConversionFinished(QFutureWatcher<CoordinatedConversionResult>* watcher,
                                           std::uint64_t conversionId)
 {
+    CrashBreadcrumb::ScopedStage stage("GUI worker finished handler");
     if (watcher == nullptr) {
         return;
     }
@@ -567,7 +616,31 @@ void MainWindow::handleConversionFinished(QFutureWatcher<CoordinatedConversionRe
     }
 
     appendConversionDiagnostic("Result rendering started.");
-    displayResult(conversion.result);
+    try {
+        displayResult(conversion.result);
+    } catch (const std::exception& exception) {
+        CrashBreadcrumb::fail("GUI result rendering", exception.what());
+        ConversionResult failure = conversion.result;
+        failure.conversionSource = "Conversion Details Rendering Error";
+        failure.backendStatus = "Failed";
+        failure.explanation = std::string("Conversion completed, but rendering failed: ") + exception.what();
+        failure.diagnosticMessages.push_back(std::string("diagnostics rendering exception: ") + exception.what());
+        outputEditor_->setPlainText(QString::fromStdString(failure.modernCode));
+        detailsEditor_->setPlainText(QString::fromStdString(failure.explanation));
+        explanationEditor_->setPlainText(QString::fromStdString(failure.explanation));
+        compileVerificationEditor_->setPlainText(formatCompileVerification(failure));
+    } catch (...) {
+        CrashBreadcrumb::fail("GUI result rendering", "unknown exception");
+        ConversionResult failure = conversion.result;
+        failure.conversionSource = "Conversion Details Rendering Error";
+        failure.backendStatus = "Failed";
+        failure.explanation = "Conversion completed, but rendering failed with an unknown exception.";
+        failure.diagnosticMessages.push_back("diagnostics rendering exception: unknown");
+        outputEditor_->setPlainText(QString::fromStdString(failure.modernCode));
+        detailsEditor_->setPlainText(QString::fromStdString(failure.explanation));
+        explanationEditor_->setPlainText(QString::fromStdString(failure.explanation));
+        compileVerificationEditor_->setPlainText(formatCompileVerification(failure));
+    }
     updateModeStatus(conversion.effectiveMode, conversion.backendUnavailable);
     updateStatusBarMetadata(conversion.result);
     appendConversionDiagnostic("Result rendering finished.");
@@ -810,6 +883,8 @@ ModernizationOptions MainWindow::readModernizationOptions() const
     options.useSpaceshipOperator = spaceshipOperatorCheckBox_->isChecked();
     options.useStdFormatForStreams = stdFormatCheckBox_->isChecked();
     options.compileVerificationEnabled = automaticCompileVerificationCheckBox_->isChecked();
+    options.frontendSelection = frontendSelectionFromIndex(analysisFrontendComboBox_ == nullptr ? 0 : analysisFrontendComboBox_->currentIndex());
+    options.diagnosticVerbosity = diagnosticVerbosityFromIndex(diagnosticVerbosityComboBox_ == nullptr ? 1 : diagnosticVerbosityComboBox_->currentIndex());
     options.offlineModernizationLevel = levelFromIndex(offlineModernizationLevelComboBox_->currentIndex());
     options.offlineRewriteStyle = offlineRewriteStyleComboBox_->currentIndex() == 1
         ? OfflineRewriteStyle::AggressiveAiLikeRewrite
@@ -871,6 +946,7 @@ void MainWindow::copyOutputToClipboard()
 
 void MainWindow::displayResult(const ConversionResult& result)
 {
+    CrashBreadcrumb::ScopedStage stage("GUI result rendering");
     outputEditor_->setPlainText(QString::fromStdString(result.modernCode));
     detailsEditor_->setPlainText(formatChanges(result));
     explanationEditor_->setPlainText(QString::fromStdString(result.explanation));
@@ -1010,7 +1086,11 @@ void MainWindow::openReportFolder()
 
 QString MainWindow::formatChanges(const ConversionResult& result) const
 {
+    CrashBreadcrumb::ScopedStage stage("GUI conversion details formatting");
     QString details;
+    details += "Release Metadata:\n";
+    details += QString::fromStdString(AppVersion::diagnosticLine());
+    details += "\n\n";
     details += "Conversion Source:\n";
     details += QString::fromStdString(result.conversionSource.empty() ? "Unknown" : result.conversionSource);
     details += "\n\nBackend Status:\n";
@@ -1028,38 +1108,224 @@ QString MainWindow::formatChanges(const ConversionResult& result) const
     details += QString::fromStdString(result.rewriteLevel.empty() ? "Standard Rule-Based" : result.rewriteLevel);
     details += "\n\n";
 
+    const DiagnosticVerbosity verbosity = result.diagnosticVerbosity;
     if (!result.diagnosticMessages.empty()) {
+        const bool showVerbosePasses = verbosity == DiagnosticVerbosity::Verbose;
+        const bool showRawDiagnostics = verbosity == DiagnosticVerbosity::Debug
+            && result.debugRawDiagnosticsEnabled;
         QStringList modeAndOptions;
+        QStringList frontendDiagnostics;
+        QStringList frontendDetails;
         QStringList passSummaries;
         QStringList skippedPasses;
         QStringList skippedRisks;
         QStringList rollbacks;
         QStringList warnings;
         QStringList compileDiagnostics;
-        QStringList timings;
+        QStringList semanticRepairDiagnostics;
+        QStringList clangValidationDiagnostics;
+        QStringList formattingDiagnostics;
         QStringList finalStatuses;
-        QStringList otherDiagnostics;
+        QStringList debugDetails;
+        int passesExecuted = 0;
+        int passesModified = 0;
+        int passesNoOp = 0;
+        int passFailures = 0;
+        long long compileVerificationTimeMs = 0;
+        long long reportedTotalElapsedMs = -1;
+
+        struct PassTimingRecord
+        {
+            QString passName;
+            int applied = 0;
+            int skipped = 0;
+            int warnings = 0;
+            int rollbacks = 0;
+            int modified = 0;
+            long long timeMs = 0;
+            QString status;
+        };
+        std::vector<PassTimingRecord> passTimingRecords;
+
+        auto valueAfter = [](const QString& diagnostic, const QString& key) {
+            const int begin = diagnostic.indexOf(key);
+            if (begin < 0) {
+                return QString{};
+            }
+            int valueBegin = begin + key.size();
+            int valueEnd = valueBegin;
+            while (valueEnd < diagnostic.size() && !diagnostic[valueEnd].isSpace()) {
+                ++valueEnd;
+            }
+            return diagnostic.mid(valueBegin, valueEnd - valueBegin);
+        };
+
+        auto isLowLevelPassTrace = [](const QString& diagnostic) {
+            return diagnostic.startsWith("START PASS", Qt::CaseInsensitive)
+                || diagnostic.startsWith("END PASS", Qt::CaseInsensitive)
+                || diagnostic.contains("hash_before=", Qt::CaseInsensitive)
+                || diagnostic.contains("hash_after=", Qt::CaseInsensitive);
+        };
+
+        auto fieldValue = [](const QString& diagnostic, const QString& key) {
+            const QString marker = key + "=";
+            const int begin = diagnostic.indexOf(marker, 0, Qt::CaseInsensitive);
+            if (begin < 0) {
+                return QString{};
+            }
+            int valueBegin = begin + marker.size();
+            if (valueBegin < diagnostic.size() && diagnostic[valueBegin] == '"') {
+                ++valueBegin;
+                const int valueEnd = diagnostic.indexOf('"', valueBegin);
+                return valueEnd < 0 ? diagnostic.mid(valueBegin) : diagnostic.mid(valueBegin, valueEnd - valueBegin);
+            }
+            int valueEnd = valueBegin;
+            while (valueEnd < diagnostic.size() && !diagnostic[valueEnd].isSpace()) {
+                ++valueEnd;
+            }
+            return diagnostic.mid(valueBegin, valueEnd - valueBegin);
+        };
+
+        auto intFieldValue = [&fieldValue](const QString& diagnostic, const QString& key) {
+            bool ok = false;
+            const int value = fieldValue(diagnostic, key).toInt(&ok);
+            return ok ? value : 0;
+        };
+
+        auto longLongFieldValue = [&fieldValue](const QString& diagnostic, const QString& key) {
+            bool ok = false;
+            const long long value = fieldValue(diagnostic, key).toLongLong(&ok);
+            return ok ? value : 0LL;
+        };
+
+        auto concisePassSummary = [](const PassTimingRecord& record) {
+            return QString("%1: applied=%2 skipped=%3 warnings=%4 rollbacks=%5 modified=%6 time_ms=%7 status=%8")
+                .arg(record.passName.isEmpty() ? QStringLiteral("<unknown>") : record.passName)
+                .arg(record.applied)
+                .arg(record.skipped)
+                .arg(record.warnings)
+                .arg(record.rollbacks)
+                .arg(record.modified)
+                .arg(record.timeMs)
+                .arg(record.status.isEmpty() ? QStringLiteral("unknown") : record.status);
+        };
+
+        const bool finalCompilePassed = result.compileVerificationEnabled && result.compileVerificationPassed;
+        auto recoveredRollbackLine = [&fieldValue](const QString& diagnostic) {
+            const QString category = fieldValue(diagnostic, "category");
+            const QString reason = fieldValue(diagnostic, "reason");
+            const QString pass = fieldValue(diagnostic, "pass");
+            const QString entity = fieldValue(diagnostic, "entity");
+            QString line = "Recovery: rollback applied successfully";
+            if (!category.isEmpty()) {
+                line += " category=" + category;
+            }
+            if (!reason.isEmpty()) {
+                line += " reason=\"" + reason + "\"";
+            }
+            if (!pass.isEmpty()) {
+                line += " pass=\"" + pass + "\"";
+            }
+            if (!entity.isEmpty()) {
+                line += " entity=\"" + entity + "\"";
+            }
+            line += " severity=Warning/Recovered";
+            return line;
+        };
 
         for (const std::string& message : result.diagnosticMessages) {
             const QString diagnostic = QString::fromStdString(message);
             const QString lowered = diagnostic.toLower();
-            if (diagnostic.startsWith("selected mode:", Qt::CaseInsensitive)
+            if (diagnostic.startsWith("PASS SUMMARY", Qt::CaseInsensitive)) {
+                ++passesExecuted;
+                PassTimingRecord record;
+                record.passName = fieldValue(diagnostic, "pass");
+                record.applied = intFieldValue(diagnostic, "applied");
+                record.skipped = intFieldValue(diagnostic, "skipped");
+                record.warnings = intFieldValue(diagnostic, "warnings");
+                record.rollbacks = intFieldValue(diagnostic, "rollbacks");
+                record.modified = intFieldValue(diagnostic, "modified");
+                record.timeMs = longLongFieldValue(diagnostic, "time_ms");
+                record.status = fieldValue(diagnostic, "status");
+                passTimingRecords.push_back(record);
+
+                const QString modifiedValue = valueAfter(diagnostic, "modified=");
+                const QString rollbacksValue = valueAfter(diagnostic, "rollbacks=");
+                const QString statusValue = valueAfter(diagnostic, "status=");
+                bool ok = false;
+                const int modified = modifiedValue.toInt(&ok);
+                if (ok && modified > 0) {
+                    ++passesModified;
+                } else {
+                    ++passesNoOp;
+                }
+                ok = false;
+                const int rollbacks = rollbacksValue.toInt(&ok);
+                if ((ok && rollbacks > 0)
+                    || statusValue.contains("failed", Qt::CaseInsensitive)
+                    || statusValue.contains("limit", Qt::CaseInsensitive)
+                    || statusValue.contains("rolled", Qt::CaseInsensitive)) {
+                    ++passFailures;
+                }
+                if (showVerbosePasses) {
+                    passSummaries.push_back(concisePassSummary(record));
+                }
+            } else if (diagnostic.startsWith("FRONTEND", Qt::CaseInsensitive)) {
+                if (diagnostic.startsWith("FRONTEND requested=", Qt::CaseInsensitive)) {
+                    frontendDiagnostics.clear();
+                    frontendDiagnostics.push_back(diagnostic);
+                } else if (verbosity == DiagnosticVerbosity::Verbose) {
+                    frontendDetails.push_back(diagnostic);
+                }
+            } else if (diagnostic.startsWith("CLANG ATTEMPT", Qt::CaseInsensitive)) {
+                if (verbosity == DiagnosticVerbosity::Verbose
+                    && (diagnostic.contains("overall=", Qt::CaseInsensitive)
+                        || diagnostic.contains("fallback_used=", Qt::CaseInsensitive))) {
+                    frontendDetails.push_back(diagnostic);
+                }
+            } else if (diagnostic.startsWith("selected mode:", Qt::CaseInsensitive)
                 || diagnostic.startsWith("selected modernization options", Qt::CaseInsensitive)
                 || diagnostic.startsWith("MODERNIZATION PROFILE", Qt::CaseInsensitive)) {
                 modeAndOptions.push_back(diagnostic);
-            } else if (diagnostic.startsWith("PASS SUMMARY", Qt::CaseInsensitive)) {
-                passSummaries.push_back(diagnostic);
             } else if (diagnostic.startsWith("SKIPPED RISK", Qt::CaseInsensitive)) {
                 skippedRisks.push_back(diagnostic);
             } else if (diagnostic.startsWith("SKIPPED PASS", Qt::CaseInsensitive)) {
                 skippedPasses.push_back(diagnostic);
-            } else if (diagnostic.startsWith("ROLLBACK/REPAIR", Qt::CaseInsensitive)
-                       || lowered.contains("rollback")) {
-                rollbacks.push_back(diagnostic);
+            } else if (diagnostic.startsWith("ROLLBACK DETAIL", Qt::CaseInsensitive)
+                       || diagnostic.startsWith("ROLLBACK/REPAIR", Qt::CaseInsensitive)) {
+                rollbacks.push_back(finalCompilePassed ? recoveredRollbackLine(diagnostic) : diagnostic);
+            } else if (diagnostic.startsWith("ROLLBACK SUMMARY", Qt::CaseInsensitive)) {
+                if (!finalCompilePassed || verbosity == DiagnosticVerbosity::Verbose || showRawDiagnostics) {
+                    rollbacks.push_back(diagnostic);
+                }
+            } else if (lowered.contains("rollback")) {
+                rollbacks.push_back(finalCompilePassed ? recoveredRollbackLine(diagnostic) : diagnostic);
             } else if (diagnostic.startsWith("COMPILE VERIFICATION", Qt::CaseInsensitive)) {
+                compileVerificationTimeMs += longLongFieldValue(diagnostic, "time_ms");
                 compileDiagnostics.push_back(diagnostic);
+            } else if (diagnostic.startsWith("SEMANTIC REPAIR", Qt::CaseInsensitive)) {
+                if (verbosity == DiagnosticVerbosity::Verbose
+                    || diagnostic.contains("summary", Qt::CaseInsensitive)
+                    || diagnostic.contains("issues=", Qt::CaseInsensitive)
+                    || diagnostic.contains("repairs=", Qt::CaseInsensitive)
+                    || diagnostic.contains("skipped=", Qt::CaseInsensitive)) {
+                    semanticRepairDiagnostics.push_back(diagnostic);
+                }
+            } else if (diagnostic.startsWith("CLANG VALIDATION", Qt::CaseInsensitive)) {
+                if (verbosity == DiagnosticVerbosity::Verbose
+                    || diagnostic.contains("enabled=", Qt::CaseInsensitive)
+                    || diagnostic.contains("skipped", Qt::CaseInsensitive)
+                    || diagnostic.contains("summary", Qt::CaseInsensitive)
+                    || diagnostic.contains("warning", Qt::CaseInsensitive)) {
+                    clangValidationDiagnostics.push_back(diagnostic);
+                }
+            } else if (diagnostic.startsWith("POST FORMAT", Qt::CaseInsensitive)
+                       || diagnostic.startsWith("INCLUDE CLEANUP", Qt::CaseInsensitive)) {
+                formattingDiagnostics.push_back(diagnostic);
             } else if (diagnostic.startsWith("FINAL RESULT", Qt::CaseInsensitive)) {
                 finalStatuses.push_back(diagnostic);
+            } else if (isLowLevelPassTrace(diagnostic)) {
+                // Raw pass traces are displayed only in the Debug-only Raw Diagnostics section.
             } else if (lowered.contains("warning")
                        || lowered.contains("unsafe")
                        || lowered.contains("risk")
@@ -1070,12 +1336,18 @@ QString MainWindow::formatChanges(const ConversionResult& result) const
                        || lowered.contains("cancel")) {
                 warnings.push_back(diagnostic);
             } else {
-                otherDiagnostics.push_back(diagnostic);
+                if (verbosity == DiagnosticVerbosity::Verbose) {
+                    debugDetails.push_back(diagnostic);
+                }
             }
 
-            if (diagnostic.contains("elapsed_ms=", Qt::CaseInsensitive)
-                || diagnostic.contains("time_ms=", Qt::CaseInsensitive)) {
-                timings.push_back(diagnostic);
+            const QString elapsedText = fieldValue(diagnostic, "elapsed_ms");
+            if (!elapsedText.isEmpty()) {
+                bool ok = false;
+                const long long elapsed = elapsedText.toLongLong(&ok);
+                if (ok && elapsed > reportedTotalElapsedMs) {
+                    reportedTotalElapsedMs = elapsed;
+                }
             }
         }
 
@@ -1097,27 +1369,83 @@ QString MainWindow::formatChanges(const ConversionResult& result) const
         };
 
         appendListSection("Selected Mode And Options", modeAndOptions);
-        appendListSection("Pass Execution Summary", passSummaries);
-        appendListSection("Skipped Passes", skippedPasses);
+        appendListSection("Frontend Summary", frontendDiagnostics);
+        if (verbosity == DiagnosticVerbosity::Verbose) {
+            appendListSection("Frontend Details", frontendDetails);
+        }
+        QStringList passAggregate;
+        passAggregate.push_back(QString("%1 passes executed").arg(passesExecuted));
+        passAggregate.push_back(QString("%1 passes modified code").arg(passesModified));
+        passAggregate.push_back(QString("%1 passes no-op").arg(passesNoOp));
+        passAggregate.push_back(QString("%1 pass failures").arg(passFailures));
+        appendListSection("Pass Summary", passAggregate);
+        if (showVerbosePasses) {
+            appendListSection("Pass Execution Summary", passSummaries);
+        }
+        if (verbosity != DiagnosticVerbosity::Summary) {
+            appendListSection("Skipped Passes", skippedPasses);
+        }
         appendListSection("Skipped Risky Transformations", skippedRisks);
         appendListSection("Rollback And Repair Details", rollbacks);
         appendListSection("Warnings", warnings);
+        appendListSection("Semantic Repairs", semanticRepairDiagnostics);
+        appendListSection("Clang Validation", clangValidationDiagnostics);
         appendListSection("Compile Verification Diagnostics", compileDiagnostics);
-        appendListSection("Elapsed Time By Stage", timings);
+        appendListSection("Formatting And Include Cleanup", formattingDiagnostics);
+
+        QStringList elapsedSummary;
+        const long long totalPassTimeMs = std::accumulate(passTimingRecords.begin(),
+                                                          passTimingRecords.end(),
+                                                          0LL,
+                                                          [](const long long total, const PassTimingRecord& record) {
+                                                              return total + record.timeMs;
+                                                          });
+        const long long displayedTotalElapsedMs = reportedTotalElapsedMs >= 0
+            ? reportedTotalElapsedMs
+            : totalPassTimeMs + compileVerificationTimeMs;
+        elapsedSummary.push_back(QString("total_elapsed_ms=%1").arg(displayedTotalElapsedMs));
+        elapsedSummary.push_back(QString("compile_verification_time_ms=%1").arg(compileVerificationTimeMs));
+        std::vector<PassTimingRecord> slowestPasses = passTimingRecords;
+        slowestPasses.erase(std::remove_if(slowestPasses.begin(), slowestPasses.end(), [](const PassTimingRecord& record) {
+                                return record.timeMs <= 0
+                                    && record.applied == 0
+                                    && record.warnings == 0
+                                    && record.rollbacks == 0
+                                    && record.modified == 0;
+                            }),
+                            slowestPasses.end());
+        std::sort(slowestPasses.begin(), slowestPasses.end(), [](const PassTimingRecord& lhs, const PassTimingRecord& rhs) {
+            return lhs.timeMs > rhs.timeMs;
+        });
+        const int slowestCount = std::min<int>(5, static_cast<int>(slowestPasses.size()));
+        if (slowestCount == 0) {
+            elapsedSummary.push_back("top_passes=None");
+        }
+        for (int index = 0; index < slowestCount; ++index) {
+            const PassTimingRecord& record = slowestPasses[static_cast<std::size_t>(index)];
+            elapsedSummary.push_back(QString("top_pass_%1=%2 time_ms=%3 status=%4")
+                                         .arg(index + 1)
+                                         .arg(record.passName.isEmpty() ? QStringLiteral("<unknown>") : record.passName)
+                                         .arg(record.timeMs)
+                                         .arg(record.status.isEmpty() ? QStringLiteral("unknown") : record.status));
+        }
+        appendListSection("Elapsed Time Summary", elapsedSummary);
         appendListSection("Final Result Status", finalStatuses);
 
-        if (!otherDiagnostics.empty()) {
-            appendListSection("Other Diagnostics", otherDiagnostics);
+        if (verbosity == DiagnosticVerbosity::Verbose && !debugDetails.empty()) {
+            appendListSection("Debug Details", debugDetails);
         }
 
-        details += "Raw Diagnostics\n";
-        details += "===============\n\n";
-        for (const std::string& message : result.diagnosticMessages) {
-            details += "- ";
-            details += QString::fromStdString(message);
+        if (showRawDiagnostics) {
+            details += "Raw Diagnostics\n";
+            details += "===============\n\n";
+            for (const std::string& message : result.diagnosticMessages) {
+                details += "- ";
+                details += QString::fromStdString(message);
+                details += "\n";
+            }
             details += "\n";
         }
-        details += "\n";
     }
 
     details += "Compile Verification:\n";
@@ -1161,7 +1489,39 @@ QString MainWindow::formatChanges(const ConversionResult& result) const
         details += "\n\n---\n\n";
     };
 
-    auto appendSection = [&result, &details, &appendChange](const QString& title, bool applied, bool skipped) {
+    auto isNoOpDiagnosticChange = [](const ConversionChange& change) {
+        const QString rule = QString::fromStdString(change.ruleName).toLower();
+        const QString before = QString::fromStdString(change.before).toLower();
+        const QString reason = QString::fromStdString(change.reason).toLower();
+        return rule.contains("diagnostics")
+            && (before.contains("pass started")
+                || reason.contains("candidates found: 0")
+                || reason.contains("candidates converted: 0"));
+    };
+
+    auto isMeaningfulSkippedChange = [](const ConversionChange& change) {
+        const QString combined = QString::fromStdString(change.ruleName + " " + change.reason).toLower();
+        return combined.contains("unsafe")
+            || combined.contains("risk")
+            || combined.contains("rollback")
+            || combined.contains("repair")
+            || combined.contains("compile")
+            || combined.contains("error")
+            || combined.contains("warning")
+            || combined.contains("ambigu")
+            || combined.contains("scope")
+            || combined.contains("lifetime")
+            || combined.contains("ownership")
+            || combined.contains("unsupported")
+            || combined.contains("unclear");
+    };
+
+    auto appendSection = [&result,
+                          &details,
+                          &appendChange,
+                          verbosity,
+                          &isNoOpDiagnosticChange,
+                          &isMeaningfulSkippedChange](const QString& title, bool applied, bool skipped) {
         details += title;
         details += "\n";
         details += QString(title.size(), QChar('='));
@@ -1170,6 +1530,10 @@ QString MainWindow::formatChanges(const ConversionResult& result) const
         int index = 1;
         for (const ConversionChange& change : result.changes) {
             if (change.applied == applied && change.skipped == skipped) {
+                if ((verbosity == DiagnosticVerbosity::Summary || verbosity == DiagnosticVerbosity::Normal) && skipped
+                    && (isNoOpDiagnosticChange(change) || !isMeaningfulSkippedChange(change))) {
+                    continue;
+                }
                 appendChange(change, index);
                 ++index;
             }

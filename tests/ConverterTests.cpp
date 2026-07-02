@@ -1,11 +1,14 @@
 #include "app/ConversionCoordinator.h"
 #include "backend/BackendClient.h"
 #include "backend/IBackendClient.h"
+#include "converter/AtomicCounterModernizationPass.h"
+#include "converter/ClangSemanticValidationPass.h"
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
 #include "converter/ContainerModernizationCleanupPass.h"
 #include "converter/CrossScopeTypePropagationPass.h"
 #include "converter/ImpactCascadingCleanupPass.h"
+#include "converter/IncludeCleanupPass.h"
 #include "converter/IConverterEngine.h"
 #include "converter/ModernCppExplanationGenerator.h"
 #include "converter/OrphanedGrowthSymbolCleanupPass.h"
@@ -33,6 +36,7 @@
 #include "converter/VectorEmulationEliminationPass.h"
 #include "converter/VectorGrowthEmulationCleanupPass.h"
 #include "converter/VectorParadigmRewritePass.h"
+#include "frontend/FrontendFactory.h"
 #include "repository/RepositoryBackupService.h"
 #include "repository/RepositoryCloneService.h"
 #include "repository/RepositoryModernizationService.h"
@@ -105,6 +109,24 @@ bool diagnosticsContain(const ConversionResult& result, const std::string& needl
                        [&needle](const std::string& diagnostic) {
                            return contains(diagnostic, needle);
                        });
+}
+
+bool diagnosticsContain(const std::vector<std::string>& diagnostics, const std::string& needle)
+{
+    return std::any_of(diagnostics.begin(),
+                       diagnostics.end(),
+                       [&needle](const std::string& diagnostic) {
+                           return contains(diagnostic, needle);
+                       });
+}
+
+std::size_t diagnosticCount(const ConversionResult& result, const std::string& needle)
+{
+    return static_cast<std::size_t>(std::count_if(result.diagnosticMessages.begin(),
+                                                 result.diagnosticMessages.end(),
+                                                 [&needle](const std::string& diagnostic) {
+                                                     return contains(diagnostic, needle);
+                                                 }));
 }
 
 std::string readTextFile(const std::filesystem::path& path)
@@ -191,6 +213,13 @@ bool hasAppliedRule(const std::vector<ConversionChange>& changes, const std::str
     });
 }
 
+bool hasSkippedRule(const std::vector<ConversionChange>& changes, const std::string& ruleName)
+{
+    return std::any_of(changes.begin(), changes.end(), [&ruleName](const ConversionChange& change) {
+        return change.skipped && contains(change.ruleName, ruleName);
+    });
+}
+
 bool hasSuggestionRule(const ConversionResult& result, const std::string& ruleName)
 {
     return std::any_of(result.changes.begin(), result.changes.end(), [&ruleName](const ConversionChange& change) {
@@ -199,6 +228,7 @@ bool hasSuggestionRule(const ConversionResult& result, const std::string& ruleNa
 }
 
 ModernizationOptions structuralOptions();
+ModernizationOptions aiStyleOptions(CppStandard standard = CppStandard::Cpp20);
 
 void testNullConversion()
 {
@@ -663,12 +693,576 @@ void testOfflinePipelineReportsFrontendDiagnostics()
         "int run() { return 0; }\n",
         options);
 
-    require(diagnosticsContain(result, "FRONTEND used=LightweightFrontend"),
-            "offline conversion diagnostics should report the frontend used");
-    require(diagnosticsContain(result, "clang_experiment=disabled"),
-            "default offline conversion diagnostics should report Clang experiment disabled");
+    require(diagnosticsContain(result, "FRONTEND requested=Lightweight"),
+            "offline conversion diagnostics should report requested frontend");
+    require(diagnosticsContain(result, "selected=LightweightFrontend"),
+            "offline conversion diagnostics should report selected frontend");
+    require(diagnosticsContain(result, clangExperimentsEnabled() ? "clang_enabled=true" : "clang_enabled=false"),
+            "offline conversion diagnostics should report Clang compile support");
     require(diagnosticsContain(result, "classes=1"),
             "frontend diagnostics should include entity counts");
+}
+
+void testOfflinePipelineHonorsFrontendSelection()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = false;
+
+    options.frontendSelection = ModernizationFrontendSelection::Lightweight;
+    const ConversionResult lightweightResult = converter.convert(
+        "class Item { int value; };\n"
+        "int run() { return 0; }\n",
+        options);
+    require(diagnosticsContain(lightweightResult, "FRONTEND requested=Lightweight"),
+            "lightweight mode should report requested frontend");
+    require(diagnosticsContain(lightweightResult, "selected=LightweightFrontend"),
+            "lightweight mode should always select LightweightFrontend");
+    require(diagnosticsContain(lightweightResult, "fallback=false"),
+            "lightweight mode should not report fallback");
+
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    const ConversionResult clangRequestedResult = converter.convert(
+        "enum class Mode { Ready };\n"
+        "class Item { int value; };\n"
+        "int run() { return 0; }\n",
+        options);
+    require(diagnosticsContain(clangRequestedResult, "FRONTEND requested=ClangExperimental"),
+            "Clang mode should report requested frontend");
+    if (clangExperimentsEnabled()) {
+        require(diagnosticsContain(clangRequestedResult, "clang_enabled=true"),
+                "Clang-enabled build should report compiled Clang support");
+        require(diagnosticsContain(clangRequestedResult, "clang_available=true"),
+                "Clang-enabled build should report Clang availability");
+        require(diagnosticsContain(clangRequestedResult, "selected=ClangExperimentalFrontend"),
+                "Clang-enabled build should select ClangExperimentalFrontend");
+        require(diagnosticsContain(clangRequestedResult, "fallback=false"),
+                "valid Clang parse should not fallback");
+    } else {
+        require(diagnosticsContain(clangRequestedResult, "clang_enabled=false"),
+                "default build should report missing Clang support");
+        require(diagnosticsContain(clangRequestedResult, "clang_available=false"),
+                "default build should report Clang unavailable");
+        require(diagnosticsContain(clangRequestedResult, "selected=LightweightFrontend"),
+                "default build should fallback to LightweightFrontend");
+        require(diagnosticsContain(clangRequestedResult, "fallback=true"),
+                "default build should report fallback when Clang is requested");
+        require(diagnosticsContain(clangRequestedResult, "reason=\"Clang support not compiled\""),
+                "default build should explain Clang fallback reason");
+    }
+}
+
+void testClangValidationSkipReasonWhenUnavailable()
+{
+    const ClangSemanticValidationPass pass;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+
+    const std::vector<std::string> diagnostics = pass.validate(
+        "int run() { return 0; }\n",
+        "int run() { return 0; }\n",
+        options,
+        {},
+        true,
+        true);
+
+    if (clangExperimentsEnabled()) {
+        require(diagnosticsContain(diagnostics, "CLANG VALIDATION enabled=true"),
+                "Clang-enabled build should run validation when Clang frontend is requested");
+    } else {
+        require(diagnosticsContain(diagnostics, "CLANG VALIDATION enabled=false"),
+                "default build should emit an explicit Clang validation skip diagnostic");
+        require(diagnosticsContain(diagnostics, "reason=\"Clang support not compiled\""),
+                "default build should explain why Clang validation was skipped");
+    }
+}
+
+void testClangValidationUnchangedModernCode()
+{
+    const ClangSemanticValidationPass pass;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    const std::string code =
+        "struct Engine { int speed() const { return 42; } };\n"
+        "int run() { Engine engine; return engine.speed(); }\n";
+
+    const std::vector<std::string> diagnostics = pass.validate(code, code, options, {}, true, true);
+    if (!clangExperimentsEnabled()) {
+        require(diagnosticsContain(diagnostics, "reason=\"Clang support not compiled\""),
+                "default build should skip unchanged-code Clang validation with reason");
+        return;
+    }
+
+    require(diagnosticsContain(diagnostics, "original_parse=success converted_parse=success"),
+            "unchanged modern code should parse successfully before and after Clang validation");
+    require(diagnosticsContain(diagnostics, "suspicious_losses=0"),
+            "unchanged modern code should not report suspicious semantic losses");
+}
+
+void testClangValidationEnumConstantsPreserved()
+{
+    const ClangSemanticValidationPass pass;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    const std::string original =
+        "enum State { Ready, Running, Stopped };\n"
+        "State state() { return Ready; }\n";
+    const std::string converted =
+        "enum class State { Ready, Running, Stopped };\n"
+        "State state() { return State::Ready; }\n";
+    std::vector<ConversionChange> changes;
+    changes.push_back(ConversionChange{
+        "enum -> enum class",
+        original,
+        converted,
+        "Converted unscoped enum to scoped enum class and propagated enum labels.",
+        true,
+        false,
+    });
+
+    const std::vector<std::string> diagnostics = pass.validate(original, converted, options, changes, true, true);
+    if (!clangExperimentsEnabled()) {
+        require(diagnosticsContain(diagnostics, "reason=\"Clang support not compiled\""),
+                "default build should skip enum Clang validation with reason");
+        return;
+    }
+
+    require(diagnosticsContain(diagnostics, "enum_constants_preserved=3"),
+            "enum class conversion should preserve all enum constants in Clang validation");
+    require(diagnosticsContain(diagnostics, "suspicious_losses=0"),
+            "enum class conversion with preserved constants should not report suspicious losses");
+}
+
+void testClangValidationMethodCountPreserved()
+{
+    const ClangSemanticValidationPass pass;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    const std::string code =
+        "class Store {\n"
+        "public:\n"
+        "    void add(int value) { total += value; }\n"
+        "    int count() const { return total; }\n"
+        "private:\n"
+        "    int total = 0;\n"
+        "};\n";
+
+    const std::vector<std::string> diagnostics = pass.validate(code, code, options, {}, true, true);
+    if (!clangExperimentsEnabled()) {
+        require(diagnosticsContain(diagnostics, "reason=\"Clang support not compiled\""),
+                "default build should skip method-count Clang validation with reason");
+        return;
+    }
+
+    require(diagnosticsContain(diagnostics, "methods_before=2 methods_after=2"),
+            "Clang validation should report preserved class method count");
+    require(diagnosticsContain(diagnostics, "suspicious_losses=0"),
+            "preserved class methods should not report suspicious losses");
+}
+
+void testClangValidationAcceptsIntentionalRuleOfZeroDestructorRemoval()
+{
+    const ClangSemanticValidationPass pass;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    const std::string original =
+        "class Owner {\n"
+        "public:\n"
+        "    ~Owner() {}\n"
+        "    int value() const { return 1; }\n"
+        "};\n";
+    const std::string converted =
+        "class Owner {\n"
+        "public:\n"
+        "    int value() const { return 1; }\n"
+        "};\n";
+    std::vector<ConversionChange> changes;
+    changes.push_back(ConversionChange{
+        "Rule of Zero",
+        "~Owner() {}",
+        {},
+        "Removed cleanup-only destructor after resource ownership became automatic.",
+        true,
+        false,
+    });
+
+    const std::vector<std::string> diagnostics = pass.validate(original, converted, options, changes, true, true);
+    if (!clangExperimentsEnabled()) {
+        require(diagnosticsContain(diagnostics, "reason=\"Clang support not compiled\""),
+                "default build should skip Rule-of-Zero Clang validation with reason");
+        return;
+    }
+
+    require(diagnosticsContain(diagnostics, "accepted intentional_change=\"method removal\""),
+            "Clang validation should accept recorded Rule-of-Zero destructor removal");
+    require(diagnosticsContain(diagnostics, "accepted_intentional=1"),
+            "Clang validation summary should count intentional destructor removal");
+}
+
+void testClangValidationReportsInvalidConvertedSource()
+{
+    const ClangSemanticValidationPass pass;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    const std::string original = "int run() { return 0; }\n";
+    const std::string converted = "int run( { return 0; }\n";
+
+    const std::vector<std::string> diagnostics = pass.validate(original, converted, options, {}, true, false);
+    if (!clangExperimentsEnabled()) {
+        require(diagnosticsContain(diagnostics, "reason=\"Clang support not compiled\""),
+                "default build should skip invalid-converted Clang validation with reason");
+        return;
+    }
+
+    require(diagnosticsContain(diagnostics, "converted_parse=failure"),
+            "Clang validation should report converted-source parse failure");
+    require(diagnosticsContain(diagnostics, "severity=Error"),
+            "Clang validation should use Error severity when compile verification also failed");
+}
+
+void testPipelineReportsClangValidationDiagnostics()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    options.compileVerificationEnabled = true;
+    options.enableClangValidation = true;
+
+    const ConversionResult result = converter.convert(
+        "struct Item { int value; };\n"
+        "int run() { Item item{1}; return item.value; }\n",
+        options);
+
+    require(diagnosticsContain(result, "CLANG VALIDATION"),
+            "pipeline should report Clang validation diagnostics or explicit skip reason");
+    if (clangExperimentsEnabled()) {
+        require(diagnosticsContain(result, "CLANG VALIDATION enabled=true"),
+                "Clang-enabled pipeline should run Clang validation");
+        require(diagnosticsContain(result, "original_parse=success"),
+                "Clang-enabled pipeline should report original parse success");
+    } else {
+        require(diagnosticsContain(result, "reason=\"Clang support not compiled\""),
+                "default pipeline should report explicit Clang validation skip reason");
+    }
+}
+
+void testClangPipelineSuccessReusesSelectedFrontend()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    options.compileVerificationEnabled = true;
+    options.enableClangValidation = true;
+    options.enableSharedAstReuse = true;
+
+    const ConversionResult result = converter.convert(
+        "class Engine {\n"
+        "public:\n"
+        "    int rpm() const { return 750; }\n"
+        "};\n"
+        "int run() { Engine engine; return engine.rpm(); }\n",
+        options);
+
+    require(diagnosticCount(result, "FRONTEND requested=") == 1,
+            "pipeline should emit exactly one authoritative frontend summary line");
+    if (!clangExperimentsEnabled()) {
+        require(diagnosticsContain(result, "selected=LightweightFrontend"),
+                "default build should select Lightweight when Clang is unavailable");
+        require(diagnosticsContain(result, "reason=\"Clang support not compiled\""),
+                "default build should explain Clang unavailability");
+        return;
+    }
+
+    require(diagnosticsContain(result, "FRONTEND requested=ClangExperimental selected=ClangExperimentalFrontend"),
+            "Clang success path should select ClangExperimentalFrontend");
+    require(diagnosticsContain(result, "SEMANTIC REPAIR section=started frontend=ClangExperimentalFrontend representation_reused=true"),
+            "semantic repair should consume the selected Clang-backed representation");
+    require(!diagnosticsContain(result, "SEMANTIC REPAIR section=started frontend=LightweightFrontend"),
+            "semantic repair should not report Lightweight parser use after Clang selection succeeds");
+    require(diagnosticsContain(result, "CLANG VALIDATION enabled=true"),
+            "Clang validation should run after Clang selection succeeds");
+    require(diagnosticsContain(result, "original_graph_reused=true"),
+            "Clang validation should reuse the original Clang entity graph");
+    require(diagnosticsContain(result, "converted_parse_count=1"),
+            "Clang validation should parse converted source exactly once");
+    require(!diagnosticsContain(result, "original_parse=failure"),
+            "Clang success path must not report original parse failure for the same source");
+}
+
+void testClangPipelineFailureFallsBackConsistently()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    options.compileVerificationEnabled = false;
+    options.enableClangValidation = true;
+    options.enableSharedAstReuse = true;
+
+    const ConversionResult result = converter.convert(
+        "struct Broken { void run( { int value = 0; }\n",
+        options);
+
+    require(diagnosticCount(result, "FRONTEND requested=") == 1,
+            "fallback path should still emit exactly one authoritative frontend summary line");
+    require(diagnosticsContain(result, "selected=LightweightFrontend"),
+            "Clang failure path should select LightweightFrontend");
+    require(diagnosticsContain(result, "fallback=true"),
+            "Clang failure path should report fallback");
+    if (clangExperimentsEnabled()) {
+        require(diagnosticsContain(result, "reason=\"Clang parse failed; LightweightFrontend fallback used\""),
+                "Clang failure path should report parse-failure fallback reason");
+        require(diagnosticsContain(result, "SEMANTIC REPAIR section=started frontend=LightweightFrontend representation_reused=true"),
+                "semantic repair should use the selected fallback representation");
+        require(diagnosticsContain(result, "CLANG VALIDATION enabled=false"),
+                "Clang validation should skip after frontend fallback");
+        require(diagnosticsContain(result, "Skipped because selected frontend fell back to LightweightFrontend after Clang parse failure."),
+                "Clang validation skip should explain selected frontend fallback");
+        require(!diagnosticsContain(result, "selected=ClangExperimentalFrontend"),
+                "fallback path should not also claim Clang was selected");
+        require(!diagnosticsContain(result, "FRONTEND used=ClangExperimentalFrontend"),
+                "normal diagnostics should not include raw Clang success/failure attempt lines");
+    } else {
+        require(diagnosticsContain(result, "reason=\"Clang support not compiled\""),
+                "default build should report Clang support missing");
+    }
+}
+
+void testAutoFrontendSelectionUsesClangWhenAvailable()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::Auto;
+    options.compileVerificationEnabled = false;
+
+    const ConversionResult result = converter.convert(
+        "struct Item { int value; };\n"
+        "int run() { Item item{1}; return item.value; }\n",
+        options);
+
+    require(diagnosticsContain(result, "FRONTEND requested=Auto"),
+            "Auto frontend mode should report requested Auto selection");
+    if (clangExperimentsEnabled()) {
+        require(diagnosticsContain(result, "selected=ClangExperimentalFrontend"),
+                "Auto mode should select Clang when available and parsing succeeds");
+        require(diagnosticsContain(result, "CLANG VALIDATION enabled=false"),
+                "Auto mode should keep Clang validation disabled during parse-only re-enablement");
+    } else {
+        require(diagnosticsContain(result, "selected=LightweightFrontend"),
+                "Auto mode should select Lightweight when Clang is unavailable");
+        require(diagnosticsContain(result, "fallback=true"),
+                "Auto mode should report fallback when Clang is unavailable");
+    }
+}
+
+void testDebugFrontendAttemptsAreLabeled()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    options.diagnosticVerbosity = DiagnosticVerbosity::Debug;
+    options.compileVerificationEnabled = false;
+
+    const ConversionResult result = converter.convert(
+        "struct Item { int value; };\n"
+        "int run() { Item item{1}; return item.value; }\n",
+        options);
+
+    require(diagnosticCount(result, "FRONTEND requested=") == 1,
+            "Debug mode should still have one authoritative frontend summary line");
+    if (!clangExperimentsEnabled()) {
+        require(!diagnosticsContain(result, "CLANG ATTEMPT"),
+                "default build should not emit Clang attempt diagnostics when Clang is not compiled");
+        return;
+    }
+
+    require(diagnosticsContain(result, "CLANG ATTEMPT config="),
+            "Debug mode should show structured Clang parse attempt config");
+    require(diagnosticsContain(result, "CLANG ATTEMPT initialization=success"),
+            "Debug mode should show structured Clang initialization result");
+    require(diagnosticsContain(result, "CLANG ATTEMPT parse=success"),
+            "Debug mode should show exactly one parse stage result for the attempt");
+    require(diagnosticsContain(result, "CLANG ATTEMPT overall=success"),
+            "Debug mode should show one overall Clang attempt result");
+    require(diagnosticCount(result, "CLANG ATTEMPT overall=") == 1,
+            "Debug mode should report exactly one overall Clang attempt result");
+    require(!diagnosticsContain(result, "CLANG ATTEMPT parse=failure"),
+            "Successful Clang attempts should not also report a parse failure");
+    require(!diagnosticsContain(result, "FRONTEND ATTEMPT detail"),
+            "Debug mode should not duplicate raw frontend internals as separate attempt details");
+    require(diagnosticsContain(result, "CLANG VALIDATION enabled=false"),
+            "Debug Clang parse-only path should report validation disabled explicitly");
+}
+
+void testClangAstTypedefRewriteFoundation()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    options.compileVerificationEnabled = false;
+    options.enableClangAstRewrite = true;
+
+    const ConversionResult result = converter.convert(
+        "typedef int RecordName; // user-visible alias\n"
+        "RecordName makeName();\n",
+        options);
+
+    require(contains(result.modernCode, "using RecordName = int; // user-visible alias"),
+            "typedef alias should modernize to using while preserving trailing comments");
+    if (!clangExperimentsEnabled()) {
+        require(diagnosticsContain(result, "AST REWRITE enabled=false"),
+                "default build should report AST rewrite disabled for Clang-only rewrites");
+        require(diagnosticsContain(result, "fallback_reason=\"Clang support not compiled\""),
+                "default build should explain AST rewrite fallback");
+        require(hasAppliedRule(result, "typedef to using"),
+                "rule-based typedef modernization should remain the fallback without Clang");
+        return;
+    }
+
+    require(diagnosticsContain(result, "AST REWRITE enabled=true"),
+            "Clang-enabled build should enable AST rewrite when Clang is selected");
+    require(diagnosticsContain(result, "selected_rule=\"typedef alias modernization\""),
+            "AST rewrite diagnostics should name the selected rule");
+    require(diagnosticsContain(result, "edits_proposed=1 edits_applied=1 edits_skipped=0"),
+            "AST rewrite diagnostics should report applied source-range edits");
+    require(hasAppliedRule(result, "Clang AST typedef alias modernization"),
+            "Clang AST typedef rewrite should record an applied change");
+    require(!hasAppliedRule(result, "typedef to using"),
+            "regex typedef rule should not duplicate an AST-applied typedef rewrite");
+}
+
+void testClangAstTypedefRewriteNamespaceAndPointerTypes()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    options.compileVerificationEnabled = false;
+    options.enableClangAstRewrite = true;
+
+    const ConversionResult result = converter.convert(
+        "namespace data {\n"
+        "    typedef int* CountPtr;\n"
+        "}\n"
+        "data::CountPtr makeCount();\n",
+        options);
+
+    require(contains(result.modernCode, "using CountPtr = int *;")
+                || contains(result.modernCode, "using CountPtr = int*;"),
+            "AST typedef rewrite should support simple pointer aliases inside namespaces");
+    if (clangExperimentsEnabled()) {
+        require(diagnosticsContain(result, "AST REWRITE enabled=true"),
+                "Clang-enabled namespace pointer typedef should use AST rewrite diagnostics");
+        require(diagnosticsContain(result, "edits_applied=1"),
+                "namespace pointer typedef should apply exactly one AST edit");
+    }
+}
+
+void testClangAstTypedefRewriteClassMemberAlias()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    options.compileVerificationEnabled = false;
+    options.enableClangAstRewrite = true;
+
+    const ConversionResult result = converter.convert(
+        "class Store {\n"
+        "public:\n"
+        "    typedef int MemberId;\n"
+        "    MemberId id;\n"
+        "};\n",
+        options);
+
+    require(contains(result.modernCode, "using MemberId = int;"),
+            "AST typedef rewrite should support class member typedef aliases");
+    if (clangExperimentsEnabled()) {
+        require(diagnosticsContain(result, "AST REWRITE enabled=true"),
+                "Clang-enabled class member typedef should use AST rewrite diagnostics");
+        require(diagnosticsContain(result, "edits_applied=1"),
+                "class member typedef should apply exactly one AST edit");
+    }
+}
+
+void testClangAstTypedefRewriteSkipsMacroOwnedTypedefs()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    options.compileVerificationEnabled = false;
+    options.enableClangAstRewrite = true;
+
+    const ConversionResult result = converter.convert(
+        "#define MAKE_ALIAS(name) typedef int name;\n"
+        "MAKE_ALIAS(Count)\n"
+        "typedef int RealCount;\n"
+        "Count makeCount();\n",
+        options);
+
+    require(!contains(result.modernCode, "using Count = int;"),
+            "AST typedef rewrite must not rewrite typedef declarations owned by macro bodies");
+    require(contains(result.modernCode, "using RealCount = int;"),
+            "AST typedef rewrite should still handle non-macro typedefs in the same source");
+    if (!clangExperimentsEnabled()) {
+        require(diagnosticsContain(result, "fallback_reason=\"Clang support not compiled\""),
+                "default build should report AST rewrite fallback for macro typedef test");
+        return;
+    }
+
+    require(diagnosticsContain(result, "AST REWRITE enabled=true"),
+            "Clang-enabled macro typedef test should attempt AST rewrite");
+    require(diagnosticsContain(result, "reason=\"typedef inside macro body\"")
+                || diagnosticsContain(result, "edits_proposed=0"),
+            "macro-owned typedef should be skipped rather than source-range rewritten");
+    require(diagnosticsContain(result, "edits_applied=1"),
+            "macro-owned typedef should be skipped without disabling normal AST typedef edits");
+}
+
+void testConsecutiveAggressiveClangConversionsDoNotReuseStaleAstObjects()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = aiStyleOptions();
+    options.frontendSelection = ModernizationFrontendSelection::ClangExperimental;
+    options.compileVerificationEnabled = true;
+
+    const std::string legacy =
+        "#include <string>\n"
+        "#define MAKE_ALIAS(type, name) typedef type name;\n"
+        "MAKE_ALIAS(int, MacroCount)\n"
+        "namespace telemetry {\n"
+        "    typedef std::string RecordName;\n"
+        "    class Record {\n"
+        "    public:\n"
+        "        typedef int Identifier;\n"
+        "        Identifier id{};\n"
+        "        RecordName name{};\n"
+        "    };\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    telemetry::Record record{};\n"
+        "    return record.id;\n"
+        "}\n";
+
+    const ConversionResult first = converter.convert(legacy, options);
+    const ConversionResult second = converter.convert(legacy, options);
+
+    auto requireStableResult = [](const ConversionResult& result, const std::string& label) {
+        require(!result.modernCode.empty(), label + " should produce converted output");
+        require(result.compileVerificationEnabled, label + " should run compile verification");
+        if (!result.compilerUsed.empty()) {
+            require(result.compileVerificationPassed,
+                    label + " should pass syntax verification without stale AST/session state\n"
+                        + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+        }
+        if (clangExperimentsEnabled()) {
+            require(diagnosticsContain(result, "FRONTEND requested=ClangExperimental selected=ClangExperimentalFrontend"),
+                    label + " should select ClangExperimentalFrontend in a Clang-enabled build");
+            require(!diagnosticsContain(result, "fallback=true"),
+                    label + " should not fallback for valid single-file pasted C++");
+        }
+    };
+
+    requireStableResult(first, "first aggressive Clang conversion");
+    requireStableResult(second, "second aggressive Clang conversion");
 }
 
 void testDependencyValidation()
@@ -1955,6 +2549,273 @@ void testUniquePtrCollectionCountLoopBecomesCountIf()
     }
 }
 
+void testPthreadWorkerCounterModernizesToAtomic()
+{
+    const std::string code =
+        "int counter;\n"
+        "void* worker(void*)\n"
+        "{\n"
+        "    counter++;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "void run()\n"
+        "{\n"
+        "    pthread_t thread;\n"
+        "    pthread_create(&thread, nullptr, worker, nullptr);\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const AtomicCounterModernizationPass pass;
+    const std::string modernized = pass.rewrite(code, structuralOptions(), changes);
+
+    require(contains(modernized, "#include <atomic>"),
+            "atomic counter modernization should add atomic include\nOutput:\n" + modernized);
+    require(contains(modernized, "std::atomic<int> counter{0};"),
+            "pthread worker counter should become atomic with a default zero initializer\nOutput:\n"
+                + modernized);
+    require(!contains(modernized, "int counter;"),
+            "legacy integral counter declaration should be replaced\nOutput:\n" + modernized);
+    require(hasAppliedRule(changes, "Shared integral counter to std::atomic"),
+            "pthread counter modernization should be tracked");
+}
+
+void testStdThreadAndLambdaCountersModernizeToAtomic()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult functionResult = converter.convert(
+        "#include <thread>\n"
+        "int counter = 0;\n"
+        "void worker()\n"
+        "{\n"
+        "    ++counter;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    std::thread thread(worker);\n"
+        "    thread.join();\n"
+        "    return counter;\n"
+        "}\n",
+        options);
+
+    require(contains(functionResult.modernCode, "#include <atomic>"),
+            "std::thread counter modernization should add atomic include\nOutput:\n"
+                + functionResult.modernCode);
+    require(contains(functionResult.modernCode, "std::atomic<int> counter{0};"),
+            "std::thread entry counter should become atomic\nOutput:\n" + functionResult.modernCode);
+    require(hasAppliedRule(functionResult, "Shared integral counter to std::atomic"),
+            "std::thread counter modernization should be tracked");
+    require(functionResult.compileVerificationPassed,
+            "std::thread atomic counter modernization should pass syntax verification\nCompiler output:\n"
+                + functionResult.compilerOutput + "\nConverted code:\n" + functionResult.modernCode);
+
+    const ConversionResult lambdaResult = converter.convert(
+        "#include <thread>\n"
+        "int counter = 0;\n"
+        "int main()\n"
+        "{\n"
+        "    std::thread thread([]() { counter += 2; });\n"
+        "    thread.join();\n"
+        "    return counter;\n"
+        "}\n",
+        options);
+
+    require(contains(lambdaResult.modernCode, "std::atomic<int> counter{0};"),
+            "std::thread lambda counter should become atomic\nOutput:\n" + lambdaResult.modernCode);
+    require(lambdaResult.compileVerificationPassed,
+            "std::thread lambda atomic counter modernization should pass syntax verification\nCompiler output:\n"
+                + lambdaResult.compilerOutput + "\nConverted code:\n" + lambdaResult.modernCode);
+}
+
+void testAlreadyAtomicCounterIsUnchanged()
+{
+    const std::string code =
+        "#include <atomic>\n"
+        "#include <thread>\n"
+        "std::atomic<int> counter{0};\n"
+        "void worker()\n"
+        "{\n"
+        "    counter++;\n"
+        "}\n"
+        "void run()\n"
+        "{\n"
+        "    std::thread thread(worker);\n"
+        "    thread.join();\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const AtomicCounterModernizationPass pass;
+    const std::string modernized = pass.rewrite(code, structuralOptions(), changes);
+
+    require(modernized == code,
+            "already atomic shared counter should remain unchanged\nOutput:\n" + modernized);
+    require(!hasAppliedRule(changes, "Shared integral counter to std::atomic"),
+            "already atomic shared counter should not be reported as newly converted");
+}
+
+void testAtomicCounterReadContextsUseLoad()
+{
+    const std::string code =
+        "#include <format>\n"
+        "#include <iostream>\n"
+        "#include <thread>\n"
+        "int counter = 0;\n"
+        "void worker()\n"
+        "{\n"
+        "    ++counter;\n"
+        "    counter += 2;\n"
+        "}\n"
+        "void report()\n"
+        "{\n"
+        "    std::cout << counter << '\\n';\n"
+        "    auto text = std::format(\"Final counter = {}\\n\", counter);\n"
+        "    int snapshot = counter;\n"
+        "    if (counter == 5) {\n"
+        "        std::cout << snapshot << '\\n';\n"
+        "    }\n"
+        "    if (0 != counter) {\n"
+        "        std::cout << text;\n"
+        "    }\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    std::thread thread(worker);\n"
+        "    thread.join();\n"
+        "    report();\n"
+        "    return 0;\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const AtomicCounterModernizationPass pass;
+    const std::string modernized = pass.rewrite(code, structuralOptions(), changes);
+
+    require(contains(modernized, "std::atomic<int> counter{0};"),
+            "atomic read repair sample should still convert the shared counter\nOutput:\n" + modernized);
+    require(contains(modernized, "std::cout << counter.load() << '\\n';"),
+            "ostream output should read atomic counter with load()\nOutput:\n" + modernized);
+    require(contains(modernized, "std::format(\"Final counter = {}\\n\", counter.load())"),
+            "std::format argument should read atomic counter with load()\nOutput:\n" + modernized);
+    require(contains(modernized, "int snapshot = counter.load();"),
+            "copy initialization should read atomic counter with load()\nOutput:\n" + modernized);
+    require(contains(modernized, "if (counter.load() == 5)"),
+            "left-side comparison should read atomic counter with load()\nOutput:\n" + modernized);
+    require(contains(modernized, "if (0 != counter.load())"),
+            "right-side comparison should read atomic counter with load()\nOutput:\n" + modernized);
+    require(contains(modernized, "++counter;"),
+            "pre-increment mutation should not be rewritten to load()\nOutput:\n" + modernized);
+    require(contains(modernized, "counter += 2;"),
+            "compound atomic mutation should not be rewritten to load()\nOutput:\n" + modernized);
+    require(!contains(modernized, "counter.load() += 2"),
+            "atomic mutation operations must not be changed into invalid load writes\nOutput:\n" + modernized);
+    require(hasAppliedRule(changes, "Atomic value read to load"),
+            "atomic read repair should be tracked");
+}
+
+void testAtomicCounterReadRepairsCompile()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <iostream>\n"
+        "#include <thread>\n"
+        "int counter = 0;\n"
+        "void worker()\n"
+        "{\n"
+        "    counter++;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    std::thread thread(worker);\n"
+        "    thread.join();\n"
+        "    std::cout << counter << '\\n';\n"
+        "    int snapshot = counter;\n"
+        "    if (counter == 1) {\n"
+        "        return snapshot;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::atomic<int> counter{0};"),
+            "pipeline should convert shared counter to atomic\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::cout << counter.load() << '\\n';"),
+            "pipeline should repair ostream atomic reads\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "int snapshot = counter.load();"),
+            "pipeline should repair copy atomic reads\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "if (counter.load() == 1)"),
+            "pipeline should repair comparison atomic reads\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "counter++;"),
+            "pipeline should preserve atomic increment mutation\nOutput:\n" + result.modernCode);
+    require(result.compileVerificationPassed,
+            "atomic read repair pipeline sample should pass syntax verification\nCompiler output:\n"
+                + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+}
+
+void testMutexProtectedCounterIsPreserved()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <mutex>\n"
+        "#include <thread>\n"
+        "int counter = 0;\n"
+        "std::mutex counterMutex;\n"
+        "void worker()\n"
+        "{\n"
+        "    std::lock_guard<std::mutex> lock(counterMutex);\n"
+        "    counter++;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    std::thread thread(worker);\n"
+        "    thread.join();\n"
+        "    return counter;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "int counter = 0;"),
+            "mutex-protected counter should remain a plain integral variable\nOutput:\n"
+                + result.modernCode);
+    require(!contains(result.modernCode, "std::atomic<int> counter"),
+            "mutex-protected counter should not be converted to atomic\nOutput:\n" + result.modernCode);
+    require(hasSuggestionRule(result, "Atomic counter modernization skipped"),
+            "mutex-protected counter skip should be reported");
+    require(result.compileVerificationPassed,
+            "mutex-protected counter preservation should pass syntax verification\nCompiler output:\n"
+                + result.compilerOutput + "\nConverted code:\n" + result.modernCode);
+}
+
+void testNonIntegralSharedCounterIsSuggestionOnly()
+{
+    const std::string code =
+        "#include <thread>\n"
+        "double total = 0.0;\n"
+        "void worker()\n"
+        "{\n"
+        "    total += 1;\n"
+        "}\n"
+        "void run()\n"
+        "{\n"
+        "    std::thread thread(worker);\n"
+        "    thread.join();\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const AtomicCounterModernizationPass pass;
+    const std::string modernized = pass.rewrite(code, structuralOptions(), changes);
+
+    require(modernized == code,
+            "non-integral shared variable should remain unchanged\nOutput:\n" + modernized);
+    require(hasSkippedRule(changes, "Atomic counter modernization skipped"),
+            "non-integral shared variable should be reported as a skipped atomic candidate");
+}
+
 void testFilePointerWriteModernizesToOfstream()
 {
     const RuleBasedConverterEngine converter;
@@ -2381,7 +3242,7 @@ void testOfflineSampleFilesModernize()
             "sample conversions should produce applied changes");
 }
 
-ModernizationOptions aiStyleOptions(CppStandard standard = CppStandard::Cpp20)
+ModernizationOptions aiStyleOptions(CppStandard standard)
 {
     ModernizationOptions options;
     options.offlineModernizationLevel = OfflineModernizationLevel::AiStyleAggressiveRewrite;
@@ -5768,6 +6629,329 @@ void testPostConversionFormattingDisabledByDefault()
             "diagnostics should explain that final formatting was disabled");
 }
 
+void testIncludeCleanupNormalizesAndRemovesExactDuplicates()
+{
+    const std::string code =
+        "#include<vector> // used for records\n"
+        "#include<iostream>\n"
+        "#include <vector>\n"
+        "#include\"RecordStore.h\"\n"
+        "#include \"RecordStore.h\"\n"
+        "int untouched=1;\n";
+
+    std::vector<ConversionChange> changes;
+    const IncludeCleanupPass pass;
+    const IncludeCleanupResult result = pass.run(code, changes);
+
+    require(contains(result.code, "#include <vector> // used for records"),
+            "compact standard include should be normalized and keep its comment\nOutput:\n" + result.code);
+    require(contains(result.code, "#include <iostream>"),
+            "compact standard include should be normalized\nOutput:\n" + result.code);
+    require(contains(result.code, "#include \"RecordStore.h\""),
+            "compact local include should be normalized\nOutput:\n" + result.code);
+    require(countOccurrences(result.code, "#include <vector>") == 1,
+            "duplicate standard include should be removed\nOutput:\n" + result.code);
+    require(countOccurrences(result.code, "#include \"RecordStore.h\"") == 1,
+            "duplicate local include should be removed\nOutput:\n" + result.code);
+    require(result.code.find("#include <vector>") < result.code.find("#include <iostream>"),
+            "include cleanup should preserve first occurrence order instead of sorting\nOutput:\n" + result.code);
+    require(contains(result.code, "int untouched=1;"),
+            "include cleanup should not change non-include code\nOutput:\n" + result.code);
+    require(result.syntaxNormalizedCount == 3,
+            "include cleanup should report normalized include count");
+    require(result.duplicateIncludesRemovedCount == 2,
+            "include cleanup should report removed duplicate count");
+    require(result.includesPreservedCount == 3,
+            "include cleanup should report preserved include count");
+    require(hasAppliedRule(changes, "Include cleanup"),
+            "include cleanup should be tracked as an applied change");
+}
+
+void testIncludeCleanupAddsRequiredStandardIncludes()
+{
+    const std::string code =
+        "#include\"ProjectHeader.h\"\n"
+        "enum class Mode : unsigned char { Ready };\n"
+        "void use()\n"
+        "{\n"
+        "    std::vector<int> values;\n"
+        "    std::string label;\n"
+        "    std::string_view view;\n"
+        "    std::unique_ptr<int> owner;\n"
+        "    auto other = std::make_shared<int>(1);\n"
+        "    auto text = std::format(\"{}\", *other);\n"
+        "    std::underlying_type_t<Mode> raw = 0;\n"
+        "    std::size_t count = values.size();\n"
+        "    std::ofstream output;\n"
+        "    std::ifstream input;\n"
+        "    std::map<int, int> ordered;\n"
+        "    std::unordered_map<int, int> hashed;\n"
+        "    std::function<void()> callback;\n"
+        "    std::array<int, 2> fixed{};\n"
+        "    std::optional<int> maybe;\n"
+        "    std::mutex mutex;\n"
+        "    std::lock_guard<std::mutex> guard(mutex);\n"
+        "    (void)view; (void)owner; (void)text; (void)raw; (void)count; (void)ordered; (void)hashed;\n"
+        "    (void)callback; (void)fixed; (void)maybe;\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const IncludeCleanupPass pass;
+    const IncludeCleanupResult result = pass.run(code, changes);
+
+    const std::vector<std::string> expectedIncludes{
+        "#include <vector>",
+        "#include <string>",
+        "#include <string_view>",
+        "#include <memory>",
+        "#include <format>",
+        "#include <type_traits>",
+        "#include <cstddef>",
+        "#include <fstream>",
+        "#include <map>",
+        "#include <unordered_map>",
+        "#include <functional>",
+        "#include <array>",
+        "#include <optional>",
+        "#include <mutex>",
+    };
+    for (const std::string& include : expectedIncludes) {
+        require(contains(result.code, include),
+                "required include should be added when transformed code uses its feature: " + include
+                    + "\nOutput:\n" + result.code);
+    }
+
+    require(contains(result.code, "#include \"ProjectHeader.h\""),
+            "local/project include should be preserved\nOutput:\n" + result.code);
+    require(result.code.find("#include <vector>") < result.code.find("#include \"ProjectHeader.h\""),
+            "required standard includes should be inserted before the local include block when no standard block exists\nOutput:\n"
+                + result.code);
+    require(result.requiredIncludesAddedCount == expectedIncludes.size(),
+            "include cleanup should report required include additions");
+    require(result.requiredIncludeNamesAdded.size() == expectedIncludes.size(),
+            "include cleanup should report added include names");
+    require(result.requiredIncludesAlreadyPresentCount == 0,
+            "include cleanup should not report absent required includes as already present");
+    require(hasAppliedRule(changes, "Include cleanup"),
+            "required include additions should be tracked as include cleanup changes");
+}
+
+void testIncludeCleanupDoesNotScanCommentsOrStringLiterals()
+{
+    const std::string code =
+        "// std::vector<int> in documentation only\n"
+        "const char* text = \"std::string std::unique_ptr std::format\";\n"
+        "const char marker = 'x';\n";
+
+    std::vector<ConversionChange> changes;
+    const IncludeCleanupPass pass;
+    const IncludeCleanupResult result = pass.run(code, changes);
+
+    require(result.requiredIncludesAddedCount == 0,
+            "include cleanup should not add headers for features mentioned only in comments or string literals\nOutput:\n"
+                + result.code);
+    require(result.requiredIncludesAlreadyPresentCount == 0,
+            "include cleanup should not count literal mentions as required includes");
+    require(result.code == code,
+            "include cleanup should leave code unchanged when no real features are used\nOutput:\n" + result.code);
+}
+
+void testIncludeCleanupDoesNotDuplicateExistingRequiredIncludes()
+{
+    const std::string code =
+        "#include<vector>\n"
+        "#include <memory>\n"
+        "#include <vector>\n"
+        "void use()\n"
+        "{\n"
+        "    std::vector<int> values;\n"
+        "    auto value = std::make_unique<int>(1);\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const IncludeCleanupPass pass;
+    const IncludeCleanupResult result = pass.run(code, changes);
+
+    require(countOccurrences(result.code, "#include <vector>") == 1,
+            "required include detection should not duplicate an existing vector include\nOutput:\n" + result.code);
+    require(countOccurrences(result.code, "#include <memory>") == 1,
+            "required include detection should not duplicate an existing memory include\nOutput:\n" + result.code);
+    require(result.requiredIncludesAddedCount == 0,
+            "all required includes are already present and should not be added");
+    require(result.requiredIncludesAlreadyPresentCount == 2,
+            "existing required includes should be counted");
+    require(result.duplicateIncludesRemovedCount == 1,
+            "exact duplicate include should still be removed");
+}
+
+void testIncludeCleanupRemovesUnusedObsoleteStandardHeaders()
+{
+    const std::string code =
+        "#include <cstring>\n"
+        "#include <cstdio>\n"
+        "#include <cstdlib>\n"
+        "#include \"LocalConfig.h\"\n"
+        "void use()\n"
+        "{\n"
+        "    std::string name;\n"
+        "    std::vector<int> values;\n"
+        "    auto value = std::make_unique<int>(1);\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const IncludeCleanupPass pass;
+    const IncludeCleanupResult result = pass.run(code, changes);
+
+    require(!contains(result.code, "#include <cstring>"),
+            "unused cstring include should be removed after string cleanup\nOutput:\n" + result.code);
+    require(!contains(result.code, "#include <cstdio>"),
+            "unused cstdio include should be removed after stream/file cleanup\nOutput:\n" + result.code);
+    require(!contains(result.code, "#include <cstdlib>"),
+            "unused cstdlib include should be removed after malloc/free cleanup\nOutput:\n" + result.code);
+    require(contains(result.code, "#include \"LocalConfig.h\""),
+            "local/project include must be preserved while obsolete standard headers are removed\nOutput:\n"
+                + result.code);
+    require(contains(result.code, "#include <string>")
+                && contains(result.code, "#include <vector>")
+                && contains(result.code, "#include <memory>"),
+            "required modern headers should still be added while obsolete headers are removed\nOutput:\n"
+                + result.code);
+    require(result.obsoleteIncludesRemovedCount == 3,
+            "include cleanup should report removed obsolete standard headers");
+    require(result.obsoleteIncludesKeptCount == 0,
+            "no obsolete headers should be reported kept when no guarded symbols remain");
+    require(hasAppliedRule(changes, "Include cleanup"),
+            "obsolete include removal should be tracked as include cleanup");
+}
+
+void testIncludeCleanupKeepsObsoleteHeadersWhenSymbolsRemain()
+{
+    const std::string code =
+        "#include <cstring>\n"
+        "#include <cstdio>\n"
+        "#include <cstdlib>\n"
+        "#include <pthread.h>\n"
+        "#include <unistd.h>\n"
+        "void* worker(void*) { return nullptr; }\n"
+        "void use(char* target, const char* source)\n"
+        "{\n"
+        "    std::memcpy(target, source, 4);\n"
+        "    printf(\"%s\", source);\n"
+        "    void* memory = malloc(4);\n"
+        "    free(memory);\n"
+        "    pthread_t thread;\n"
+        "    pthread_create(&thread, nullptr, worker, nullptr);\n"
+        "    sleep(1);\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const IncludeCleanupPass pass;
+    const IncludeCleanupResult result = pass.run(code, changes);
+
+    require(contains(result.code, "#include <cstring>"),
+            "cstring include should be kept while memcpy remains\nOutput:\n" + result.code);
+    require(contains(result.code, "#include <cstdio>"),
+            "cstdio include should be kept while printf remains\nOutput:\n" + result.code);
+    require(contains(result.code, "#include <cstdlib>"),
+            "cstdlib include should be kept while malloc/free remain\nOutput:\n" + result.code);
+    require(contains(result.code, "#include <pthread.h>"),
+            "pthread.h include should be kept while pthread APIs remain\nOutput:\n" + result.code);
+    require(contains(result.code, "#include <unistd.h>"),
+            "unistd.h include should be kept while sleep remains\nOutput:\n" + result.code);
+    require(result.obsoleteIncludesKeptCount == 5,
+            "include cleanup should report obsolete headers kept because guarded symbols remain");
+    require(result.obsoleteIncludesRemovedCount == 0,
+            "guarded obsolete headers should not be removed while their APIs remain");
+}
+
+void testIncludeCleanupSkipsCommentedObsoleteInclude()
+{
+    const std::string code =
+        "#include <cstring> // vendor shim keeps this available\n"
+        "int main()\n"
+        "{\n"
+        "    return 0;\n"
+        "}\n";
+
+    std::vector<ConversionChange> changes;
+    const IncludeCleanupPass pass;
+    const IncludeCleanupResult result = pass.run(code, changes);
+
+    require(contains(result.code, "#include <cstring> // vendor shim keeps this available"),
+            "obsolete include with attached comment should be preserved as safety-uncertain\nOutput:\n"
+                + result.code);
+    require(result.obsoleteIncludesSkippedCount == 1,
+            "include cleanup should report safety-skipped obsolete include");
+    require(result.obsoleteIncludesRemovedCount == 0,
+            "commented obsolete include should not be removed automatically");
+}
+
+void testIncludeCleanupRunsAfterSuccessfulCompile()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include<vector>\n"
+        "#include<iostream>\n"
+        "#include <vector>\n"
+        "int main(){ std::vector<int> values; std::cout << values.size(); return 0; }\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "include-cleaned code should still compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <vector>"),
+            "pipeline include cleanup should normalize vector include\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <iostream>"),
+            "pipeline include cleanup should normalize iostream include\nOutput:\n" + result.modernCode);
+    require(countOccurrences(result.modernCode, "#include <vector>") == 1,
+            "pipeline include cleanup should remove duplicate vector include\nOutput:\n" + result.modernCode);
+    require(result.modernCode.find("#include <vector>") < result.modernCode.find("#include <iostream>"),
+            "pipeline include cleanup should preserve first occurrence order\nOutput:\n" + result.modernCode);
+    require(diagnosticsContain(result, "INCLUDE CLEANUP syntax_normalized=2 duplicates_removed=1 preserved=2"),
+            "pipeline diagnostics should include include cleanup counts");
+    require(hasAppliedRule(result, "Include cleanup"),
+            "pipeline include cleanup should be tracked as an applied change");
+}
+
+void testIncludeCleanupAddsMissingHeadersBeforeCompileVerification()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "int main()\n"
+        "{\n"
+        "    std::vector<std::string> values;\n"
+        "    values.push_back(\"one\");\n"
+        "    auto value = std::make_unique<int>(1);\n"
+        "    std::size_t count = values.size();\n"
+        "    return static_cast<int>(count + *value);\n"
+        "}\n",
+        options);
+
+    require(result.compileVerificationPassed,
+            "include cleanup should add missing standard headers before syntax verification\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <vector>"),
+            "pipeline include cleanup should add vector include\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <string>"),
+            "pipeline include cleanup should add string include\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <memory>"),
+            "pipeline include cleanup should add memory include\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <cstddef>"),
+            "pipeline include cleanup should add cstddef include for std::size_t\nOutput:\n" + result.modernCode);
+    require(diagnosticsContain(result, "INCLUDE CLEANUP"),
+            "pipeline diagnostics should report include cleanup");
+    require(diagnosticsContain(result, "required_added="),
+            "pipeline diagnostics should report required include addition counts");
+    require(diagnosticsContain(result, "required_already_present="),
+            "pipeline diagnostics should report already-present required include counts");
+}
+
 void testPostConversionFormattingRunsAfterSuccessfulCompile()
 {
     const RuleBasedConverterEngine converter;
@@ -5912,10 +7096,11 @@ void testPostConversionFormatterNormalizesIncludesAndSpacing()
             "formatter should remove duplicate system includes\nOutput:\n" + result.code);
     require(countOccurrences(result.code, "#include \"widget.h\"") == 1,
             "formatter should remove duplicate local includes\nOutput:\n" + result.code);
-    require(result.code.find("#include <iostream>") < result.code.find("#include <vector>"),
-            "formatter should sort system includes consistently\nOutput:\n" + result.code);
+    require(result.code.find("#include <vector>") < result.code.find("#include <iostream>"),
+            "formatter include cleanup should preserve first occurrence order\nOutput:\n" + result.code);
     require(result.code.find("#include <vector>") < result.code.find("#include \"widget.h\""),
-            "formatter should group system includes before local includes\nOutput:\n" + result.code);
+            "formatter include cleanup should not sort local/project includes ahead of first occurrences\nOutput:\n"
+                + result.code);
     require(contains(result.code, "int add(int a, int b)"),
             "formatter should add spaces after commas\nOutput:\n" + result.code);
     require(contains(result.code, "int total = a+b;"),
@@ -8084,6 +9269,23 @@ int main(int argc, char** argv)
     testExplanationReflectsSelectedOptions();
     testCodeRepresentations();
     testOfflinePipelineReportsFrontendDiagnostics();
+    testOfflinePipelineHonorsFrontendSelection();
+    testClangValidationSkipReasonWhenUnavailable();
+    testClangValidationUnchangedModernCode();
+    testClangValidationEnumConstantsPreserved();
+    testClangValidationMethodCountPreserved();
+    testClangValidationAcceptsIntentionalRuleOfZeroDestructorRemoval();
+    testClangValidationReportsInvalidConvertedSource();
+    testPipelineReportsClangValidationDiagnostics();
+    testClangPipelineSuccessReusesSelectedFrontend();
+    testClangPipelineFailureFallsBackConsistently();
+    testAutoFrontendSelectionUsesClangWhenAvailable();
+    testDebugFrontendAttemptsAreLabeled();
+    testClangAstTypedefRewriteFoundation();
+    testClangAstTypedefRewriteNamespaceAndPointerTypes();
+    testClangAstTypedefRewriteClassMemberAlias();
+    testClangAstTypedefRewriteSkipsMacroOwnedTypedefs();
+    testConsecutiveAggressiveClangConversionsDoNotReuseStaleAstObjects();
     testDependencyValidation();
     testNullMacroRemoval();
     testNullptrMacroWorkaroundRemoval();
@@ -8124,6 +9326,13 @@ int main(int argc, char** argv)
     testSmartPointerCompilerDiagnosticCleanupRunsWithoutTypeContext();
     testSmartPointerObserverDeclarationPreservesRawPointerType();
     testUniquePtrCollectionCountLoopBecomesCountIf();
+    testPthreadWorkerCounterModernizesToAtomic();
+    testStdThreadAndLambdaCountersModernizeToAtomic();
+    testAlreadyAtomicCounterIsUnchanged();
+    testAtomicCounterReadContextsUseLoad();
+    testAtomicCounterReadRepairsCompile();
+    testMutexProtectedCounterIsPreserved();
+    testNonIntegralSharedCounterIsSuggestionOnly();
     testFilePointerWriteModernizesToOfstream();
     testFilePointerNullConditionArtifactsBecomeStreamChecks();
     testExistingStreamArtifactsAreCleaned();
@@ -8212,6 +9421,15 @@ int main(int argc, char** argv)
     testCrossScopePropagationAdaptsVectorToRawArrayCallsite();
     testFinalFormatterCleansTransformedBlocks();
     testPostConversionFormattingDisabledByDefault();
+    testIncludeCleanupNormalizesAndRemovesExactDuplicates();
+    testIncludeCleanupAddsRequiredStandardIncludes();
+    testIncludeCleanupDoesNotScanCommentsOrStringLiterals();
+    testIncludeCleanupDoesNotDuplicateExistingRequiredIncludes();
+    testIncludeCleanupRemovesUnusedObsoleteStandardHeaders();
+    testIncludeCleanupKeepsObsoleteHeadersWhenSymbolsRemain();
+    testIncludeCleanupSkipsCommentedObsoleteInclude();
+    testIncludeCleanupRunsAfterSuccessfulCompile();
+    testIncludeCleanupAddsMissingHeadersBeforeCompileVerification();
     testPostConversionFormattingRunsAfterSuccessfulCompile();
     testPostConversionFormattingSkipsAfterCompileFailure();
     testPostConversionFormatterFallsBackWhenClangFormatUnavailable();

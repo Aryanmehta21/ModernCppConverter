@@ -196,6 +196,43 @@ Run C++ tests:
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
+### Release smoke test
+
+For quick release-candidate validation, run the lightweight embedded smoke suite:
+
+```sh
+ctest --test-dir build -C Debug -R ModernCppConverterSmokeTests --output-on-failure
+```
+
+This small suite exercises representative offline conversions without adding large corpus files.
+
+### Release check
+
+Before tagging a release candidate, run the lightweight release checklist script:
+
+```sh
+./scripts/release_check.sh
+```
+
+For CI wiring or a quick command preview, use dry-run mode:
+
+```sh
+./scripts/release_check.sh --dry-run
+```
+
+The script verifies configure/build/test commands, the smoke suite, release metadata, README presence,
+tracked-secret patterns, and warns when a `CHANGELOG` is not present.
+
+### Version and release metadata
+
+Release metadata is configured in the root `CMakeLists.txt` and exposed through `src/utils/AppVersion`.
+For the v1.2.0 final release:
+
+- change `MODERNCPP_APP_VERSION` from `1.2.0-rc1` to `1.2.0`
+- change `MODERNCPP_RELEASE_CHANNEL` from `rc` to the final channel name
+- keep the CMake `project(... VERSION 1.2.0)` value aligned with the final semantic version
+- rebuild so build type, git commit, build date, and Clang support metadata are refreshed
+
 Run backend tests when working on the Python backend:
 
 ```sh

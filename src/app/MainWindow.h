@@ -79,6 +79,8 @@ private:
     QComboBox* conversionModeComboBox_ = nullptr;
     QComboBox* offlineModernizationLevelComboBox_ = nullptr;
     QComboBox* offlineRewriteStyleComboBox_ = nullptr;
+    QComboBox* analysisFrontendComboBox_ = nullptr;
+    QComboBox* diagnosticVerbosityComboBox_ = nullptr;
     QLabel* modeStatusLabel_ = nullptr;
     QLabel* statusModeLabel_ = nullptr;
     QLabel* statusBackendLabel_ = nullptr;

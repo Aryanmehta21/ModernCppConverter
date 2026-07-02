@@ -5,6 +5,7 @@ target_sources(ModernCppConverterCore
         ${PROJECT_SOURCE_DIR}/src/converter/ClangAstStructureAnalyzer.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/CompileVerifier.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ConversionRule.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/FrontendCodeRepresentation.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/IncludeManager.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ModernCppConverter.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ModernCppExplanationGenerator.cpp

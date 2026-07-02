@@ -5,6 +5,8 @@
 #include "parser/LightweightCppParser.h"
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -45,6 +47,28 @@ const ParsedFunction* findFunction(const ParsedDocument& document, const std::st
     return nullptr;
 }
 
+const ParsedFunction* findFunction(const ParsedDocument& document,
+                                   const std::string& name,
+                                   const std::string& parentName)
+{
+    for (const ParsedFunction& function : document.functions) {
+        if (function.name == name && function.parentName == parentName) {
+            return &function;
+        }
+    }
+    return nullptr;
+}
+
+const ParsedEnum* findEnum(const ParsedDocument& document, const std::string& name)
+{
+    for (const ParsedEnum& parsedEnum : document.enums) {
+        if (parsedEnum.name == name) {
+            return &parsedEnum;
+        }
+    }
+    return nullptr;
+}
+
 const ParsedVariable* findMember(const ParsedDocument& document, const std::string& name)
 {
     for (const ParsedVariable& variable : document.memberVariables) {
@@ -63,6 +87,77 @@ const ParsedVariable* findLocal(const ParsedDocument& document, const std::strin
         }
     }
     return nullptr;
+}
+
+bool hasScope(const ParsedDocument& document, ScopeKind kind, const std::string& name)
+{
+    for (const ScopeInfo& scope : document.scopes) {
+        if (scope.kind == kind && scope.name == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const ParsedSymbol* findSymbol(const ParsedDocument& document, ParsedSymbolKind kind, const std::string& name)
+{
+    for (const ParsedSymbol& symbol : document.symbols) {
+        if (symbol.kind == kind && symbol.name == name) {
+            return &symbol;
+        }
+    }
+    return nullptr;
+}
+
+const ParsedSymbol* findChildSymbol(const ParsedDocument& document,
+                                    ParsedSymbolId parentId,
+                                    ParsedSymbolKind kind,
+                                    const std::string& name)
+{
+    for (const ParsedSymbol& symbol : document.symbols) {
+        if (symbol.kind == kind && symbol.name == name && symbol.parentId == parentId) {
+            return &symbol;
+        }
+    }
+    return nullptr;
+}
+
+std::size_t countChildSymbols(const ParsedDocument& document,
+                              ParsedSymbolId parentId,
+                              ParsedSymbolKind kind,
+                              const std::string& name)
+{
+    std::size_t count = 0;
+    for (const ParsedSymbol& symbol : document.symbols) {
+        if (symbol.kind == kind && symbol.name == name && symbol.parentId == parentId) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool hasResolvedReferenceTo(const ParsedDocument& document, ParsedSymbolId symbolId)
+{
+    for (const ParsedSymbolReference& reference : document.symbolReferences) {
+        if (reference.resolved && reference.symbolId == symbolId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasResolvedReferenceToChildNamed(const ParsedDocument& document,
+                                      ParsedSymbolId parentId,
+                                      ParsedSymbolKind kind,
+                                      const std::string& name)
+{
+    for (const ParsedSymbol& symbol : document.symbols) {
+        if (symbol.parentId == parentId && symbol.kind == kind && symbol.name == name
+            && hasResolvedReferenceTo(document, symbol.id)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool diagnosticsContain(const std::vector<std::string>& diagnostics, const std::string& needle)
@@ -272,8 +367,8 @@ void testFrontendInterfaceDefaultsToLightweight()
     require(result.entityCounts.enums == 1, "lightweight frontend should report enum count");
     require(diagnosticsContain(result.diagnostics, "FRONTEND used=LightweightFrontend"),
             "frontend diagnostics should report the frontend used");
-    require(diagnosticsContain(result.diagnostics, "clang_experiment=disabled"),
-            "default build diagnostics should report Clang experiment disabled");
+    require(diagnosticsContain(result.diagnostics, clangExperimentsEnabled() ? "clang_experiment=enabled" : "clang_experiment=disabled"),
+            "default frontend diagnostics should report the compiled Clang experiment state");
 }
 
 void testOptionalClangFrontendFactory()
@@ -301,6 +396,271 @@ void testOptionalClangFrontendFactory()
     require(result.entityCounts.classes >= 1, "Clang experimental frontend should detect a simple aggregate");
     require(result.entityCounts.functions >= 1, "Clang experimental frontend should detect a simple function");
     require(result.entityCounts.enums >= 1, "Clang experimental frontend should detect a simple enum");
+}
+
+void testClangFrontendReadOnlyEntityPopulation()
+{
+    const std::unique_ptr<IModernizationFrontend> clangFrontend = createClangExperimentalFrontend();
+    if (!clangExperimentsEnabled()) {
+        require(clangFrontend == nullptr, "Clang frontend should stay unavailable in the default build");
+        return;
+    }
+
+    const std::filesystem::path headerPath =
+        std::filesystem::temp_directory_path() / "moderncppconverter_clang_frontend_empty.h";
+    {
+        std::ofstream header(headerPath);
+        header << "// intentionally empty parser test header\n";
+    }
+
+    const std::string source =
+        "#include \"" + headerPath.generic_string() + "\"\n"
+        "#define LIMIT 4\n"
+        "namespace demo {\n"
+        "enum class Mode : unsigned short { Ready, Failed };\n"
+        "struct Widget {\n"
+        "    int value;\n"
+        "    Widget(int initial) : value(initial) {}\n"
+        "    ~Widget() {}\n"
+        "    int adjust(int delta) const {\n"
+        "        int local = value + delta;\n"
+        "        return local;\n"
+        "    }\n"
+        "};\n"
+        "int run() {\n"
+        "    Widget widget(LIMIT);\n"
+        "    return widget.adjust(2);\n"
+        "}\n"
+        "}\n";
+
+    const ModernizationFrontendResult result = clangFrontend->analyze(source);
+    require(result.parseSucceeded, "Clang frontend should parse the entity population sample");
+    require(diagnosticsContain(result.diagnostics, "clang_parse=success"), "Clang parse success should be reported");
+    require(diagnosticsContain(result.diagnostics, "FRONTEND_COMPARE"),
+            "Clang frontend should compare its entity counts with the lightweight frontend");
+
+    const ParsedDocument& document = result.document;
+    require(document.originalSource == source, "Clang document should preserve original source");
+    require(!document.tokens.empty(), "Clang frontend should preserve token metadata from the lightweight tokenizer");
+    require(!document.includes.empty() && document.includes.front().path.find("moderncppconverter_clang_frontend_empty.h") != std::string::npos,
+            "Clang frontend should collect include directives");
+    require(!document.macros.empty() && document.macros.front().name == "LIMIT",
+            "Clang frontend should collect macro directives");
+    require(hasScope(document, ScopeKind::Namespace, "demo"), "Clang frontend should collect namespace scopes");
+
+    const ParsedAggregate* widget = findAggregate(document, "Widget");
+    require(widget != nullptr, "Clang frontend should collect structs/classes");
+    require(widget->kind == ParsedAggregateKind::Struct, "Clang frontend should preserve aggregate kind");
+    require(slice(source, widget->range).find("struct Widget") == 0,
+            "Clang aggregate source range should start at the declaration");
+    require(widget->range.entityName == "Widget", "Clang aggregate range should retain the entity name");
+
+    const ParsedEnum* mode = findEnum(document, "Mode");
+    require(mode != nullptr, "Clang frontend should collect enum declarations");
+    require(mode->scoped, "Clang frontend should preserve scoped enum information");
+    require(mode->underlyingType.find("unsigned short") != std::string::npos,
+            "Clang frontend should preserve enum underlying type");
+    require(mode->enumerators.size() == 2 && mode->enumerators.front() == "Ready",
+            "Clang frontend should collect enum constants");
+
+    const ParsedFunction* constructor = findFunction(document, "Widget", "Widget");
+    require(constructor != nullptr, "Clang frontend should collect constructors");
+    require(constructor->parameters.size() == 1, "Clang constructor parameters should be collected");
+    require(constructor->parameters.front().canonicalType.find("int") != std::string::npos,
+            "Clang constructor parameter canonical type should be available");
+
+    const ParsedFunction* destructor = findFunction(document, "~Widget", "Widget");
+    require(destructor != nullptr, "Clang frontend should collect destructors");
+
+    const ParsedFunction* adjust = findFunction(document, "adjust", "Widget");
+    require(adjust != nullptr, "Clang frontend should collect methods");
+    require(adjust->isMember && adjust->isConst, "Clang frontend should preserve method constness");
+    require(adjust->returnType.find("int") != std::string::npos, "Clang method return type should be available");
+    require(adjust->canonicalReturnType.find("int") != std::string::npos,
+            "Clang method canonical return type should be available");
+
+    const ParsedVariable* value = findMember(document, "value");
+    require(value != nullptr, "Clang frontend should collect member variables");
+    require(value->canonicalType.find("int") != std::string::npos,
+            "Clang member canonical type should be available");
+
+    const ParsedVariable* local = findLocal(document, "local");
+    require(local != nullptr, "Clang frontend should collect local variables where practical");
+    require(local->parentName == "adjust", "Clang local variable should record the parent function");
+    require(local->range.isValidFor(source.size()), "Clang local source range should be valid");
+}
+
+void testClangFrontendSymbolResolutionGraph()
+{
+    const std::unique_ptr<IModernizationFrontend> clangFrontend = createClangExperimentalFrontend();
+    if (!clangExperimentsEnabled()) {
+        require(clangFrontend == nullptr, "Clang symbol graph test should stay disabled in default builds");
+        return;
+    }
+
+    const std::string source =
+        "namespace outer { namespace inner {\n"
+        "class Forward;\n"
+        "typedef int Count;\n"
+        "using Speed = Count;\n"
+        "enum class State : unsigned char { Idle, Running };\n"
+        "int globalRpm = 0;\n"
+        "template <class T>\n"
+        "struct Box { T value; };\n"
+        "class Engine {\n"
+        "public:\n"
+        "    class Controller { public: int nestedValue; };\n"
+        "    Engine();\n"
+        "    ~Engine();\n"
+        "    void start(Count targetRpm);\n"
+        "    int compute(int value);\n"
+        "    int compute(double value);\n"
+        "private:\n"
+        "    State state;\n"
+        "    Count rpm;\n"
+        "};\n"
+        "Engine::Engine() : state(State::Idle), rpm(0) {}\n"
+        "Engine::~Engine() {}\n"
+        "void Engine::start(Count targetRpm) {\n"
+        "    State localState = State::Running;\n"
+        "    Count localRpm = targetRpm;\n"
+        "    rpm = localRpm;\n"
+        "    globalRpm = rpm;\n"
+        "}\n"
+        "int Engine::compute(int value) { return value; }\n"
+        "int Engine::compute(double value) { return static_cast<int>(value); }\n"
+        "}}\n";
+
+    const ModernizationFrontendResult result = clangFrontend->analyze(source);
+    require(result.parseSucceeded, "Clang symbol graph sample should parse");
+    require(diagnosticsContain(result.diagnostics, "FRONTEND_SYMBOLS total="),
+            "Clang diagnostics should include symbol-resolution totals");
+    require(diagnosticsContain(result.diagnostics, "unresolved=0"),
+            "Clang diagnostics should report no unresolved references in the valid sample");
+
+    const ParsedDocument& document = result.document;
+    require(!document.symbols.empty(), "Clang frontend should populate symbols");
+    require(!document.symbolReferences.empty(), "Clang frontend should populate symbol references");
+
+    const ParsedSymbol* outer = findSymbol(document, ParsedSymbolKind::Namespace, "outer");
+    require(outer != nullptr, "outer namespace should have a symbol");
+    const ParsedSymbol* inner = findChildSymbol(document, outer->id, ParsedSymbolKind::Namespace, "inner");
+    require(inner != nullptr, "inner namespace should be parented to outer");
+
+    const ParsedSymbol* forward = findChildSymbol(document, inner->id, ParsedSymbolKind::Class, "Forward");
+    require(forward != nullptr, "forward declaration should have a class symbol");
+    require(!forward->isDefinition, "forward-only class symbol should be marked declaration-only");
+
+    const ParsedSymbol* count = findChildSymbol(document, inner->id, ParsedSymbolKind::Typedef, "Count");
+    require(count != nullptr, "typedef should have a symbol");
+    require(count->canonicalType.find("int") != std::string::npos, "typedef canonical type should be recorded");
+    const ParsedSymbol* speed = findChildSymbol(document, inner->id, ParsedSymbolKind::Alias, "Speed");
+    require(speed != nullptr, "using alias should have a symbol");
+    require(speed->canonicalType.find("int") != std::string::npos, "alias canonical type should resolve through typedef");
+
+    const ParsedSymbol* state = findChildSymbol(document, inner->id, ParsedSymbolKind::Enum, "State");
+    require(state != nullptr && state->isDefinition, "enum class should have a definition symbol");
+    const ParsedSymbol* running = findChildSymbol(document, state->id, ParsedSymbolKind::EnumConstant, "Running");
+    require(running != nullptr, "enum constants should be parented to the enum");
+
+    const ParsedSymbol* globalRpm = findChildSymbol(document, inner->id, ParsedSymbolKind::GlobalVariable, "globalRpm");
+    require(globalRpm != nullptr, "global variables should have symbols");
+    require(globalRpm->range.isValidFor(source.size()), "global variable source range should be valid");
+
+    const ParsedSymbol* box = findChildSymbol(document, inner->id, ParsedSymbolKind::Struct, "Box");
+    require(box != nullptr, "class templates should expose the templated aggregate symbol");
+
+    const ParsedSymbol* engine = findChildSymbol(document, inner->id, ParsedSymbolKind::Class, "Engine");
+    require(engine != nullptr && engine->isDefinition, "Engine class should have a definition symbol");
+    const ParsedSymbol* controller = findChildSymbol(document, engine->id, ParsedSymbolKind::Class, "Controller");
+    require(controller != nullptr, "nested class should be parented to containing class");
+    require(findChildSymbol(document, controller->id, ParsedSymbolKind::Field, "nestedValue") != nullptr,
+            "nested class field should be parented to nested class");
+
+    const ParsedSymbol* constructor = findChildSymbol(document, engine->id, ParsedSymbolKind::Constructor, "Engine");
+    require(constructor != nullptr && constructor->isDefinition, "constructor symbol should be marked as a definition");
+    const ParsedSymbol* destructor = findChildSymbol(document, engine->id, ParsedSymbolKind::Destructor, "~Engine");
+    require(destructor != nullptr && destructor->isDefinition, "destructor symbol should be marked as a definition");
+    require(countChildSymbols(document, engine->id, ParsedSymbolKind::Method, "compute") == 2,
+            "overloaded methods should receive distinct symbols");
+
+    const ParsedSymbol* start = findChildSymbol(document, engine->id, ParsedSymbolKind::Method, "start");
+    require(start != nullptr && start->isDefinition, "method definition should be represented as a symbol");
+    const ParsedSymbol* targetRpm = findChildSymbol(document, start->id, ParsedSymbolKind::Parameter, "targetRpm");
+    require(targetRpm != nullptr, "method parameter should be parented to the method");
+    const ParsedSymbol* localRpm = findChildSymbol(document, start->id, ParsedSymbolKind::LocalVariable, "localRpm");
+    require(localRpm != nullptr, "local variable should be parented to the method");
+    require(localRpm->canonicalType.find("int") != std::string::npos,
+            "local variable canonical type should be recorded");
+    require(findChildSymbol(document, start->id, ParsedSymbolKind::LocalVariable, "localState") != nullptr,
+            "enum-typed local variable should have a symbol");
+
+    require(hasResolvedReferenceToChildNamed(document, start->id, ParsedSymbolKind::Parameter, "targetRpm"),
+            "parameter references should resolve to parameter symbols");
+    require(hasResolvedReferenceTo(document, globalRpm->id), "global variable references should resolve to global symbols");
+
+    for (const ParsedSymbol& symbol : document.symbols) {
+        require(symbol.id != 0, "symbol ids should be non-zero");
+        require(symbol.range.isValidFor(source.size()), "symbol source ranges should be valid");
+    }
+}
+
+void testClangFrontendParsesPastedSingleFileWithHeadersAndMacroTypedef()
+{
+    const std::unique_ptr<IModernizationFrontend> clangFrontend = createClangExperimentalFrontend();
+    if (!clangExperimentsEnabled()) {
+        require(clangFrontend == nullptr, "single-file pasted Clang parser test should stay disabled in default builds");
+        return;
+    }
+
+    const std::string source =
+        "#include <string>\n"
+        "#include <vector>\n"
+        "#define MAKE_TYPEDEF(T) typedef T MacroAlias;\n"
+        "MAKE_TYPEDEF(int)\n"
+        "namespace demo {\n"
+        "typedef std::string RecordName;\n"
+        "class Store {\n"
+        "public:\n"
+        "    typedef int MemberId;\n"
+        "    std::vector<MemberId> ids;\n"
+        "};\n"
+        "}\n";
+
+    const ModernizationFrontendResult result = clangFrontend->analyze(source);
+    require(result.parseSucceeded,
+            "Clang frontend should parse valid pasted single-file code with standard headers and macro typedefs");
+    require(diagnosticsContain(result.diagnostics, "clang_parse=success"),
+            "Clang frontend should report parse success for the pasted-code sample");
+    require(diagnosticsContain(result.diagnostics, "virtual_file=input.cpp"),
+            "Clang parse config diagnostics should report the stable pasted-code virtual filename");
+    require(diagnosticsContain(result.diagnostics, "include_paths="),
+            "Clang parse config diagnostics should report include path discovery");
+    require(!diagnosticsContain(result.diagnostics, "CLANG DIAGNOSTIC severity=error"),
+            "valid pasted-code sample should not emit Clang error diagnostics");
+
+    const ParsedSymbol* recordName = findSymbol(result.document, ParsedSymbolKind::Typedef, "RecordName");
+    require(recordName != nullptr, "namespace typedef should be represented as a symbol");
+    const ParsedSymbol* memberId = findSymbol(result.document, ParsedSymbolKind::Typedef, "MemberId");
+    require(memberId != nullptr, "class member typedef should be represented as a symbol");
+    const ParsedSymbol* macroAlias = findSymbol(result.document, ParsedSymbolKind::Typedef, "MacroAlias");
+    require(macroAlias != nullptr, "macro-generated typedef should not fail parsing");
+}
+
+void testClangFrontendFallbackOnInvalidSource()
+{
+    const std::unique_ptr<IModernizationFrontend> clangFrontend = createClangExperimentalFrontend();
+    if (!clangExperimentsEnabled()) {
+        require(clangFrontend == nullptr, "Clang frontend should remain disabled unless explicitly requested");
+        return;
+    }
+
+    const std::string source = "struct Broken { void run( { int value = 0; }\n";
+    const ModernizationFrontendResult result = clangFrontend->analyze(source);
+    require(diagnosticsContain(result.diagnostics, "clang_parse=failure fallback=LightweightFrontend"),
+            "Clang frontend should report fallback when parsing fails");
+    require(result.document.originalSource == source, "fallback document should preserve original source");
+    require(!result.document.tokens.empty(), "fallback document should still expose lightweight tokens");
 }
 
 void testFallbackOnUnsupportedSyntax()
@@ -360,6 +720,10 @@ int main()
     testRepresentationParserBacking();
     testFrontendInterfaceDefaultsToLightweight();
     testOptionalClangFrontendFactory();
+    testClangFrontendReadOnlyEntityPopulation();
+    testClangFrontendSymbolResolutionGraph();
+    testClangFrontendParsesPastedSingleFileWithHeadersAndMacroTypedef();
+    testClangFrontendFallbackOnInvalidSource();
     testFallbackOnUnsupportedSyntax();
     testRewriteCoordinatorAppliesDescendingEdits();
     testRewriteCoordinatorRejectsOverlapsDuplicatesAndInvalidRanges();

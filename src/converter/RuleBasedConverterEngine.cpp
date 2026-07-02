@@ -1,8 +1,10 @@
 #include "converter/RuleBasedConverterEngine.h"
 
+#include "converter/ClangAstRewriteEngine.h"
 #include "converter/ModernCppExplanationGenerator.h"
 #include "converter/OfflineModernizationPipeline.h"
 #include "converter/RawTextRepresentation.h"
+#include "utils/CrashBreadcrumb.h"
 
 #include <algorithm>
 #include <cctype>
@@ -359,7 +361,7 @@ public:
                std::vector<ConversionChange>& changes) const override
     {
         static const std::regex simpleTypedef(
-            R"(^([ \t]*)typedef\s+([^;\(\)\{\}=]+?)\s+([A-Za-z_]\w*)\s*;\s*$)");
+            R"(^([ \t]*)typedef\s+([^;\(\)\{\}=]+?)\s+([A-Za-z_]\w*)\s*;\s*(//.*)?$)");
 
         const std::string code = representation.sourceText();
         std::stringstream input(code);
@@ -375,8 +377,10 @@ public:
                 const std::string indent = match[1].str();
                 const std::string type = collapseWhitespace(match[2].str());
                 const std::string alias = match[3].str();
+                const std::string trailingComment = match[4].matched ? match[4].str() : std::string{};
 
-                const std::string usingLine = indent + "using " + alias + " = " + type + ";";
+                const std::string usingLine = indent + "using " + alias + " = " + type + ";"
+                    + (trailingComment.empty() ? std::string{} : " " + trailingComment);
                 if (options.useUsingAliases) {
                     rewrittenLine = usingLine;
                     addAppliedChange(changes,
@@ -1325,8 +1329,34 @@ ConversionResult RuleBasedConverterEngine::convert(const std::string& legacyCode
 ConversionResult RuleBasedConverterEngine::convert(const std::string& legacyCode,
                                                    const ModernizationOptions& options) const
 {
+    CrashBreadcrumb::ScopedStage stage("rule-based converter");
     ConversionResult result;
-    RawTextRepresentation representation(legacyCode);
+    result.diagnosticVerbosity = options.diagnosticVerbosity;
+    result.debugRawDiagnosticsEnabled = options.enableDebugRawDiagnostics;
+    std::vector<std::string> prePipelineDiagnostics;
+    std::string preRuleCode = legacyCode;
+
+    if (options.frontendSelection != ModernizationFrontendSelection::Lightweight
+        && options.enableClangFrontend
+        && options.enableClangAstRewrite) {
+        CrashBreadcrumb::ScopedStage astRewriteStage("Clang AST rewrite engine");
+        const ClangAstRewriteEngine clangAstRewriteEngine;
+        ClangAstRewriteResult astRewriteResult = clangAstRewriteEngine.rewriteTypedefAliases(preRuleCode,
+                                                                                            options,
+                                                                                            result.changes);
+        preRuleCode = std::move(astRewriteResult.code);
+        prePipelineDiagnostics = std::move(astRewriteResult.diagnostics);
+    } else if (options.frontendSelection != ModernizationFrontendSelection::Lightweight) {
+        std::string reason = "internal Clang AST rewrite flag disabled";
+        if (!options.enableClangFrontend) {
+            reason = "internal Clang frontend flag disabled";
+        }
+        prePipelineDiagnostics.push_back("AST REWRITE enabled=false ast_rewrite_enabled=false selected_rule=\"typedef alias modernization\" reason=\""
+                                         + reason
+                                         + "\"");
+    }
+
+    RawTextRepresentation representation(preRuleCode);
 
     if (!options.customInstruction.empty()) {
         addSuggestion(result.changes,
@@ -1336,11 +1366,13 @@ ConversionResult RuleBasedConverterEngine::convert(const std::string& legacyCode
     }
 
     for (const auto& rule : rules_) {
+        CrashBreadcrumb::ScopedStage ruleStage("pre-pipeline conversion rule");
         rule->apply(representation, options, result.changes);
     }
 
     result.modernCode = representation.sourceText();
     const OfflineModernizationPipeline pipeline;
+    CrashBreadcrumb::ScopedStage pipelineStage("offline modernization pipeline");
     const OfflineModernizationPipelineResult pipelineResult = pipeline.runAfterSafeRules(result.modernCode, options, result.changes);
     result.modernCode = pipelineResult.modernCode;
     result.compileVerificationEnabled = pipelineResult.compileVerificationEnabled;
@@ -1350,6 +1382,11 @@ ConversionResult RuleBasedConverterEngine::convert(const std::string& legacyCode
     result.compilerOutput = pipelineResult.compilerOutput;
     result.rewriteLevel = pipelineResult.rewriteLevel;
     result.diagnosticMessages = pipelineResult.diagnosticMessages;
+    if (!prePipelineDiagnostics.empty()) {
+        result.diagnosticMessages.insert(result.diagnosticMessages.begin(),
+                                         prePipelineDiagnostics.begin(),
+                                         prePipelineDiagnostics.end());
+    }
     result.explanation = explanationGenerator_->generate(result.modernCode, result.changes, options);
     return result;
 }

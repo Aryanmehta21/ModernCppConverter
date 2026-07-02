@@ -258,10 +258,14 @@ std::string repairStreamArtifacts(const std::string& code,
 
 void appendRepairDiagnostics(SemanticValidationAndRepairResult& result,
                              const ParsedDocument& document,
+                             const std::string& frontendName,
+                             const bool reusedSelectedRepresentation,
                              const std::vector<ConversionChange>& changes,
                              const std::size_t firstChange)
 {
-    result.diagnostics.push_back("SEMANTIC REPAIR section=started frontend=LightweightCppParser parse="
+    result.diagnostics.push_back("SEMANTIC REPAIR section=started frontend=" + frontendName
+                                 + " representation_reused=" + std::string(reusedSelectedRepresentation ? "true" : "false")
+                                 + " parse="
                                  + std::string(document.parseSucceeded ? "ok" : "fallback")
                                  + " functions=" + std::to_string(document.functions.size())
                                  + " classes=" + std::to_string(document.aggregates.size())
@@ -296,13 +300,14 @@ SemanticValidationAndRepairResult SemanticValidationAndRepairPass::validateAndRe
     const std::string& code,
     const ModernizationOptions& options,
     const TransformationContext& context,
+    const ParsedDocument& selectedDocument,
+    const std::string& selectedFrontendName,
+    const bool reusedSelectedRepresentation,
     std::vector<ConversionChange>& changes) const
 {
     SemanticValidationAndRepairResult result;
     result.code = code;
 
-    const LightweightCppParser parser;
-    const ParsedDocument document = parser.parse(code);
     const std::size_t firstChange = changes.size();
 
     const ReturnTypePropagationPass returnTypePropagationPass;
@@ -353,6 +358,23 @@ SemanticValidationAndRepairResult SemanticValidationAndRepairPass::validateAndRe
                          "Ran final semantic validation and repaired safe inconsistencies before formatting and compile verification.");
     }
 
-    appendRepairDiagnostics(result, document, changes, firstChange);
+    appendRepairDiagnostics(result, selectedDocument, selectedFrontendName, reusedSelectedRepresentation, changes, firstChange);
     return result;
+}
+
+SemanticValidationAndRepairResult SemanticValidationAndRepairPass::validateAndRepair(
+    const std::string& code,
+    const ModernizationOptions& options,
+    const TransformationContext& context,
+    std::vector<ConversionChange>& changes) const
+{
+    const LightweightCppParser parser;
+    const ParsedDocument document = parser.parse(code);
+    return validateAndRepair(code,
+                             options,
+                             context,
+                             document,
+                             "LightweightFrontend",
+                             false,
+                             changes);
 }

@@ -1,5 +1,7 @@
 #include "converter/CompileVerifier.h"
 
+#include "utils/CrashBreadcrumb.h"
+
 #include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
@@ -70,6 +72,7 @@ CompileVerificationResult CompileVerifier::verifySyntaxOnly(const std::string& c
 
 CompileVerificationResult CompileVerifier::verifySyntaxOnly(const std::string& code, CppStandard standard)
 {
+    CrashBreadcrumb::ScopedStage stage("CompileVerifier syntax-only");
     QElapsedTimer verificationTimer;
     verificationTimer.start();
     qInfo() << "Compile verification started";

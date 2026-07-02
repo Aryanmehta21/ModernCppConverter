@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ConversionChange.h"
+#include "ModernizationOptions.h"
 
 #include <string>
 #include <vector>
@@ -20,6 +21,8 @@ struct ConversionResult
     bool compileVerificationEnabled = false;
     bool compileVerificationPassed = false;
     bool compileVerificationAutoFixAttempted = false;
+    DiagnosticVerbosity diagnosticVerbosity = DiagnosticVerbosity::Normal;
+    bool debugRawDiagnosticsEnabled = true;
     std::string compilerUsed;
     std::string compilerOutput;
     std::string rewriteLevel;

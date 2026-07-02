@@ -55,6 +55,24 @@ target_link_libraries(V1RegressionTests
 
 add_test(NAME V1RegressionTests COMMAND V1RegressionTests)
 
+add_executable(ModernCppConverterSmokeTests
+    ModernCppConverterSmokeTests.cpp
+)
+modern_cpp_converter_use_root_output(ModernCppConverterSmokeTests)
+
+target_link_libraries(ModernCppConverterSmokeTests
+    PRIVATE
+        ModernCppConverterCore
+        ModernCppConverterWarnings
+        Qt6::Network
+)
+target_compile_definitions(ModernCppConverterSmokeTests
+    PRIVATE
+        MODERNCPP_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+)
+
+add_test(NAME ModernCppConverterSmokeTests COMMAND ModernCppConverterSmokeTests)
+
 add_executable(GuiConversionSmokeTests
     GuiConversionSmokeTests.cpp
 )

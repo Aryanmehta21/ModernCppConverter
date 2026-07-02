@@ -3,6 +3,7 @@
 #include "converter/TransformationContext.h"
 #include "models/ConversionChange.h"
 #include "models/ModernizationOptions.h"
+#include "parser/ParsedEntity.h"
 
 #include <string>
 #include <vector>
@@ -22,5 +23,12 @@ public:
     [[nodiscard]] SemanticValidationAndRepairResult validateAndRepair(const std::string& code,
                                                                       const ModernizationOptions& options,
                                                                       const TransformationContext& context,
+                                                                      std::vector<ConversionChange>& changes) const;
+    [[nodiscard]] SemanticValidationAndRepairResult validateAndRepair(const std::string& code,
+                                                                      const ModernizationOptions& options,
+                                                                      const TransformationContext& context,
+                                                                      const ParsedDocument& selectedDocument,
+                                                                      const std::string& selectedFrontendName,
+                                                                      bool reusedSelectedRepresentation,
                                                                       std::vector<ConversionChange>& changes) const;
 };

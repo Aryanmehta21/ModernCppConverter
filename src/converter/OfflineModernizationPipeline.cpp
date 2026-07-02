@@ -3,9 +3,11 @@
 #include "converter/AggressiveRewriteEngine.h"
 #include "converter/AlgorithmPolishPass.h"
 #include "converter/AlgorithmModernizationPass.h"
+#include "converter/AtomicCounterModernizationPass.h"
 #include "converter/AutoPtrRemovalPass.h"
 #include "converter/ClassResourceAnalyzerPass.h"
 #include "converter/ClassStringBufferModernizationPass.h"
+#include "converter/ClangSemanticValidationPass.h"
 #include "converter/CompilerDiagnosticCleanupPass.h"
 #include "converter/CompileVerifier.h"
 #include "converter/ConcurrencyRaiiModernizationPass.h"
@@ -16,9 +18,11 @@
 #include "converter/EnumToStringCandidatePass.h"
 #include "converter/FileIoModernizationPass.h"
 #include "converter/FunctionPointerModernizationPass.h"
+#include "converter/FrontendCodeRepresentation.h"
 #include "converter/FunctionalModernizationPass.h"
 #include "converter/FunctorToLambdaPass.h"
 #include "converter/ImpactCascadingCleanupPass.h"
+#include "converter/IncludeCleanupPass.h"
 #include "converter/IteratorModernizationPass.h"
 #include "converter/MallocFreeModernizationPass.h"
 #include "converter/MemberApiCascadePass.h"
@@ -55,6 +59,8 @@
 #include "converter/TransformationContext.h"
 #include "converter/VectorParadigmRewritePass.h"
 #include "frontend/FrontendFactory.h"
+#include "utils/AppVersion.h"
+#include "utils/CrashBreadcrumb.h"
 
 #include <algorithm>
 #include <chrono>
@@ -65,6 +71,7 @@
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace
 {
@@ -103,6 +110,263 @@ std::string modernizationLevelName(const OfflineModernizationLevel level)
 std::string targetStandardName(const CppStandard standard)
 {
     return standard == CppStandard::Cpp17 ? "C++17" : "C++20";
+}
+
+std::string frontendSelectionName(const ModernizationFrontendSelection selection)
+{
+    switch (selection) {
+    case ModernizationFrontendSelection::Lightweight:
+        return "Lightweight";
+    case ModernizationFrontendSelection::ClangExperimental:
+        return "ClangExperimental";
+    case ModernizationFrontendSelection::Auto:
+        return "Auto";
+    }
+    return "Lightweight";
+}
+
+bool diagnosticsContainText(const std::vector<std::string>& diagnostics, const std::string& needle)
+{
+    return std::any_of(diagnostics.begin(), diagnostics.end(), [&needle](const std::string& diagnostic) {
+        return diagnostic.find(needle) != std::string::npos;
+    });
+}
+
+FrontendEntityCounts entityCountsForDocument(const ParsedDocument& document)
+{
+    return FrontendEntityCounts{
+        document.aggregates.size(),
+        document.functions.size(),
+        document.enums.size(),
+        document.memberVariables.size() + document.globalVariables.size() + document.localVariables.size(),
+    };
+}
+
+ClangParseConfig clangParseConfigForOptions(const ModernizationOptions& options)
+{
+    ClangParseConfig config;
+    config.languageStandard = options.targetStandard == CppStandard::Cpp17 ? "c++17" : "c++20";
+    config.virtualFileName = "input.cpp";
+    config.compileArguments = {"-std=" + config.languageStandard, "-fsyntax-only", "-x", "c++"};
+    return config;
+}
+
+std::string clangParseConfigSummary(const ClangParseConfig& config)
+{
+    std::ostringstream output;
+    output << "virtual_file=" << config.virtualFileName
+           << " standard=" << config.languageStandard
+           << " args=";
+    for (std::size_t index = 0; index < config.compileArguments.size(); ++index) {
+        if (index != 0U) {
+            output << ',';
+        }
+        output << config.compileArguments[index];
+    }
+    output << " include_paths=";
+    for (std::size_t index = 0; index < config.includePaths.size(); ++index) {
+        if (index != 0U) {
+            output << ',';
+        }
+        output << config.includePaths[index];
+    }
+    output << " resource_dir=" << config.resourceDir
+           << " system_root=" << config.systemRoot;
+    return output.str();
+}
+
+struct FrontendSelectionAnalysis
+{
+    ModernizationFrontendSelection requested = ModernizationFrontendSelection::Lightweight;
+    std::string selectedFrontendName = "LightweightFrontend";
+    bool clangEnabled = false;
+    bool clangAvailable = false;
+    bool fallbackUsed = false;
+    std::string fallbackReason;
+    ModernizationFrontendResult result;
+    std::shared_ptr<CodeRepresentation> representation;
+    ClangParseConfig clangConfig;
+    std::vector<std::string> debugDiagnostics;
+    std::string summaryDiagnostic;
+
+    [[nodiscard]] bool selectedClang() const
+    {
+        return result.kind == ModernizationFrontendKind::ClangExperimental
+            && selectedFrontendName == "ClangExperimentalFrontend";
+    }
+};
+
+void appendClangAttemptDiagnostics(FrontendSelectionAnalysis& analysis,
+                                   const ModernizationFrontendResult& clangAttempt,
+                                   const bool fallbackUsed,
+                                   const std::string& fallbackReason)
+{
+    const bool parseFailed = diagnosticsContainText(clangAttempt.diagnostics, "clang_parse=failure");
+    const bool parseSucceeded = clangAttempt.parseSucceeded && !parseFailed;
+    std::string configSummary = clangParseConfigSummary(analysis.clangConfig);
+    for (const std::string& diagnostic : clangAttempt.diagnostics) {
+        constexpr std::string_view prefix = "FRONTEND clang_parse_config=\"";
+        if (diagnostic.rfind(std::string(prefix), 0) == 0 && diagnostic.size() > prefix.size()) {
+            configSummary = diagnostic.substr(prefix.size());
+            if (!configSummary.empty() && configSummary.back() == '"') {
+                configSummary.pop_back();
+            }
+            break;
+        }
+    }
+    analysis.debugDiagnostics.push_back("CLANG ATTEMPT config=\""
+                                        + configSummary
+                                        + "\"");
+    analysis.debugDiagnostics.push_back("CLANG ATTEMPT initialization=success");
+    analysis.debugDiagnostics.push_back(std::string("CLANG ATTEMPT parse=")
+                                        + (parseSucceeded ? "success" : "failure"));
+    analysis.debugDiagnostics.push_back(std::string("CLANG ATTEMPT entity_extraction=")
+                                        + (parseSucceeded ? "success" : "skipped"));
+    analysis.debugDiagnostics.push_back(std::string("CLANG ATTEMPT overall=")
+                                        + (parseSucceeded ? "success" : "failure"));
+    analysis.debugDiagnostics.push_back(std::string("CLANG ATTEMPT fallback_used=")
+                                        + (fallbackUsed ? "true" : "false")
+                                        + " fallback_reason=\"" + fallbackReason + "\"");
+    for (const std::string& diagnostic : clangAttempt.diagnostics) {
+        if (diagnostic.rfind("CLANG DIAGNOSTIC", 0) == 0) {
+            analysis.debugDiagnostics.push_back(diagnostic);
+        }
+    }
+}
+
+FrontendSelectionAnalysis analyzeFrontendForOptions(const std::string& source,
+                                                    const ModernizationOptions& options,
+                                                    const ModernizationFrontendSelection requested)
+{
+    CrashBreadcrumb::ScopedStage stage("frontend selection");
+    const bool compiledWithClang = clangExperimentsEnabled();
+    const ClangParseConfig clangConfig = clangParseConfigForOptions(options);
+    const bool clangAvailable = options.enableClangFrontend
+        && createClangExperimentalFrontend(clangConfig) != nullptr;
+    FrontendSelectionAnalysis analysis;
+    analysis.requested = requested;
+    analysis.clangEnabled = compiledWithClang;
+    analysis.clangAvailable = clangAvailable;
+    analysis.clangConfig = clangConfig;
+
+    auto assignLightweight = [&](ModernizationFrontendResult lightweightResult,
+                                 bool fallback,
+                                 std::string reason) {
+        analysis.selectedFrontendName = "LightweightFrontend";
+        analysis.fallbackUsed = fallback;
+        analysis.fallbackReason = std::move(reason);
+        lightweightResult.kind = ModernizationFrontendKind::Lightweight;
+        lightweightResult.frontendName = "LightweightFrontend";
+        lightweightResult.entityCounts = entityCountsForDocument(lightweightResult.document);
+        analysis.result = std::move(lightweightResult);
+    };
+
+    auto analyzeLightweight = [&]() {
+        std::unique_ptr<IModernizationFrontend> lightweightFrontend = createDefaultModernizationFrontend();
+        return lightweightFrontend->analyze(source);
+    };
+
+    if (requested == ModernizationFrontendSelection::Lightweight) {
+        assignLightweight(analyzeLightweight(), false, {});
+    } else if (requested == ModernizationFrontendSelection::ClangExperimental) {
+        if (!options.enableClangFrontend) {
+            assignLightweight(analyzeLightweight(),
+                              true,
+                              "Internal Clang frontend flag disabled");
+        } else if (clangAvailable) {
+            std::unique_ptr<IModernizationFrontend> clangFrontend = createClangExperimentalFrontend(clangConfig);
+            CrashBreadcrumb::ScopedStage clangStage("Clang parse");
+            ModernizationFrontendResult clangAttempt = clangFrontend->analyze(source);
+            if (diagnosticsContainText(clangAttempt.diagnostics, "clang_parse=failure")) {
+                appendClangAttemptDiagnostics(analysis,
+                                              clangAttempt,
+                                              true,
+                                              "Clang parse failed; LightweightFrontend fallback used");
+                assignLightweight(ModernizationFrontendResult{
+                                      ModernizationFrontendKind::Lightweight,
+                                      "LightweightFrontend",
+                                      clangAttempt.document,
+                                      entityCountsForDocument(clangAttempt.document),
+                                      {},
+                                      clangAttempt.document.parseSucceeded,
+                                  },
+                                  true,
+                                  "Clang parse failed; LightweightFrontend fallback used");
+            } else {
+                appendClangAttemptDiagnostics(analysis, clangAttempt, false, {});
+                analysis.selectedFrontendName = "ClangExperimentalFrontend";
+                analysis.result = std::move(clangAttempt);
+            }
+        } else {
+            assignLightweight(analyzeLightweight(),
+                              true,
+                              compiledWithClang ? "Clang frontend unavailable" : "Clang support not compiled");
+        }
+    } else {
+        if (!options.enableClangFrontend) {
+            assignLightweight(analyzeLightweight(),
+                              true,
+                              "Internal Clang frontend flag disabled");
+        } else if (clangAvailable) {
+            std::unique_ptr<IModernizationFrontend> clangFrontend = createClangExperimentalFrontend(clangConfig);
+            CrashBreadcrumb::ScopedStage clangStage("Clang parse");
+            ModernizationFrontendResult clangAttempt = clangFrontend->analyze(source);
+            if (diagnosticsContainText(clangAttempt.diagnostics, "clang_parse=failure")) {
+                appendClangAttemptDiagnostics(analysis,
+                                              clangAttempt,
+                                              true,
+                                              "Clang parse failed; LightweightFrontend fallback used");
+                assignLightweight(ModernizationFrontendResult{
+                                      ModernizationFrontendKind::Lightweight,
+                                      "LightweightFrontend",
+                                      clangAttempt.document,
+                                      entityCountsForDocument(clangAttempt.document),
+                                      {},
+                                      clangAttempt.document.parseSucceeded,
+                                  },
+                                  true,
+                                  "Clang parse failed; LightweightFrontend fallback used");
+            } else {
+                appendClangAttemptDiagnostics(analysis, clangAttempt, false, {});
+                analysis.selectedFrontendName = "ClangExperimentalFrontend";
+                analysis.result = std::move(clangAttempt);
+            }
+        } else {
+            assignLightweight(analyzeLightweight(),
+                              true,
+                              compiledWithClang ? "Clang frontend unavailable" : "Clang support not compiled");
+        }
+    }
+
+    if (analysis.result.frontendName.empty()) {
+        assignLightweight(analyzeLightweight(), true, "Requested frontend could not be constructed");
+    }
+
+    analysis.representation = std::make_shared<FrontendCodeRepresentation>(source, analysis.result.document);
+
+    const bool clangParseRequested = requested != ModernizationFrontendSelection::Lightweight
+        && options.enableClangFrontend
+        && compiledWithClang;
+    const bool isolatedClangParse = diagnosticsContainText(analysis.result.diagnostics, "isolated_process=true");
+    std::ostringstream output;
+    output << "FRONTEND requested=" << frontendSelectionName(requested)
+           << " selected=" << analysis.selectedFrontendName
+           << " clang_enabled=" << (compiledWithClang ? "true" : "false")
+           << " clang_available=" << (clangAvailable ? "true" : "false")
+           << " clang_parse_enabled=" << (clangParseRequested ? "true" : "false")
+           << " isolated_process=" << (isolatedClangParse ? "true" : "false")
+           << " ast_rewrite_enabled=" << (options.enableClangAstRewrite ? "true" : "false")
+           << " clang_validation_enabled=" << (options.enableClangValidation ? "true" : "false")
+           << " shared_ast_reuse_enabled=" << (options.enableSharedAstReuse ? "true" : "false")
+           << " fallback=" << (analysis.fallbackUsed ? "true" : "false")
+           << " reason=\"" << analysis.fallbackReason << "\""
+           << " parse=" << (analysis.result.parseSucceeded ? "success" : "failure")
+           << " classes=" << analysis.result.entityCounts.classes
+           << " functions=" << analysis.result.entityCounts.functions
+           << " enums=" << analysis.result.entityCounts.enums
+           << " variables=" << analysis.result.entityCounts.variables;
+    analysis.summaryDiagnostic = output.str();
+    return analysis;
 }
 
 bool containsAnyLowered(const std::string& loweredText, const std::initializer_list<std::string_view> needles)
@@ -1059,17 +1323,19 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     std::vector<SkippedRiskDiagnostic> skippedRiskDiagnostics;
     constexpr int maxModernizationIterations = 20;
 
+    result.diagnosticMessages.push_back(AppVersion::diagnosticLine());
     result.diagnosticMessages.push_back("MODERNIZATION PROFILE level="
                                         + modernizationLevelName(options.offlineModernizationLevel)
                                         + " target=" + targetStandardName(options.targetStandard)
                                         + " structural_passes=" + (shouldRunStructuralPass(options) ? "enabled" : "disabled")
                                         + " ownership_consistency=" + (shouldRunOwnershipConsistencyPass(options) ? "enabled" : "disabled")
                                         + " compile_verification=" + (options.compileVerificationEnabled ? "requested" : "pipeline-default"));
-    if (const std::unique_ptr<IModernizationFrontend> frontend = createDefaultModernizationFrontend()) {
-        const ModernizationFrontendResult frontendResult = frontend->analyze(normalizedCode);
+    const FrontendSelectionAnalysis frontendAnalysis = analyzeFrontendForOptions(normalizedCode, options, options.frontendSelection);
+    result.diagnosticMessages.push_back(frontendAnalysis.summaryDiagnostic);
+    if (options.diagnosticVerbosity == DiagnosticVerbosity::Debug) {
         result.diagnosticMessages.insert(result.diagnosticMessages.end(),
-                                         frontendResult.diagnostics.begin(),
-                                         frontendResult.diagnostics.end());
+                                         frontendAnalysis.debugDiagnostics.begin(),
+                                         frontendAnalysis.debugDiagnostics.end());
     }
     if (!shouldRunStructuralPass(options)) {
         result.diagnosticMessages.push_back("SKIPPED PASS GROUP Structural modernization reason=offline modernization level is Conservative");
@@ -1160,6 +1426,7 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     }
 
     auto runTracedPass = [&](const std::string& passName, auto&& transform) {
+        CrashBreadcrumb::enter(passName);
         const int iteration = ++passIterations[passName];
         const std::string before = result.modernCode;
         const std::uint64_t hashBefore = stableHash(before);
@@ -1195,11 +1462,21 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                                                                    0,
                                                                    0,
                                                                    "iteration-limit-exceeded; returned-last-stable-version"));
+            CrashBreadcrumb::fail(passName, "iteration limit exceeded");
             return;
         }
 
         const auto started = std::chrono::steady_clock::now();
-        std::string candidate = transform(before);
+        std::string candidate;
+        try {
+            candidate = transform(before);
+        } catch (const std::exception& exception) {
+            CrashBreadcrumb::fail(passName, exception.what());
+            throw;
+        } catch (...) {
+            CrashBreadcrumb::fail(passName, "unknown exception");
+            throw;
+        }
         const auto finished = std::chrono::steady_clock::now();
         const auto elapsedMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(finished - started).count();
         std::string statusOverride;
@@ -1283,17 +1560,94 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                                                                elapsedMilliseconds,
                                                                status));
         result.modernCode = std::move(candidate);
+        CrashBreadcrumb::exit(passName);
     };
 
     auto runSemanticValidationAndRepairPass = [&]() {
         runTracedPass("SemanticValidationAndRepairPass", [&](const std::string& input) {
             const SemanticValidationAndRepairPass pass;
-            SemanticValidationAndRepairResult repairResult = pass.validateAndRepair(input, options, transformationContext, changes);
+            const ParsedDocument* selectedDocument = frontendAnalysis.representation != nullptr
+                ? frontendAnalysis.representation->parsedDocument()
+                : nullptr;
+            const bool selectedDocumentMatchesInput = selectedDocument != nullptr
+                && selectedDocument->originalSource == input;
+            const bool canReuseSelectedDocument = options.enableSharedAstReuse && selectedDocumentMatchesInput;
+            if (selectedDocument != nullptr && !canReuseSelectedDocument) {
+                result.diagnosticMessages.push_back(options.enableSharedAstReuse
+                    ? "SEMANTIC REPAIR representation_reused=false reason=\"selected frontend source graph is stale after rewrites; reparsing current source\""
+                    : "SEMANTIC REPAIR representation_reused=false reason=\"internal shared AST reuse flag disabled\"");
+            }
+            SemanticValidationAndRepairResult repairResult = canReuseSelectedDocument
+                ? pass.validateAndRepair(input,
+                                         options,
+                                         transformationContext,
+                                         *selectedDocument,
+                                         frontendAnalysis.selectedFrontendName,
+                                         true,
+                                         changes)
+                : pass.validateAndRepair(input, options, transformationContext, changes);
             result.diagnosticMessages.insert(result.diagnosticMessages.end(),
                                              repairResult.diagnostics.begin(),
                                              repairResult.diagnostics.end());
             return repairResult.code;
         });
+    };
+
+    auto runIncludeCleanupPass = [&]() {
+        CrashBreadcrumb::ScopedStage stage("include cleanup");
+        const IncludeCleanupPass includeCleanupPass;
+        IncludeCleanupResult includeCleanup = includeCleanupPass.run(result.modernCode, changes);
+
+        std::ostringstream addedIncludes;
+        for (std::size_t index = 0; index < includeCleanup.requiredIncludeNamesAdded.size(); ++index) {
+            if (index != 0) {
+                addedIncludes << ", ";
+            }
+            addedIncludes << includeCleanup.requiredIncludeNamesAdded[index];
+        }
+        std::ostringstream removedObsoleteIncludes;
+        for (std::size_t index = 0; index < includeCleanup.obsoleteIncludeNamesRemoved.size(); ++index) {
+            if (index != 0) {
+                removedObsoleteIncludes << ", ";
+            }
+            removedObsoleteIncludes << includeCleanup.obsoleteIncludeNamesRemoved[index];
+        }
+        std::ostringstream keptObsoleteIncludes;
+        for (std::size_t index = 0; index < includeCleanup.obsoleteIncludeNamesKept.size(); ++index) {
+            if (index != 0) {
+                keptObsoleteIncludes << ", ";
+            }
+            keptObsoleteIncludes << includeCleanup.obsoleteIncludeNamesKept[index];
+        }
+        std::ostringstream skippedObsoleteIncludes;
+        for (std::size_t index = 0; index < includeCleanup.obsoleteIncludeNamesSkipped.size(); ++index) {
+            if (index != 0) {
+                skippedObsoleteIncludes << ", ";
+            }
+            skippedObsoleteIncludes << includeCleanup.obsoleteIncludeNamesSkipped[index];
+        }
+
+        result.diagnosticMessages.push_back("INCLUDE CLEANUP syntax_normalized="
+                                            + std::to_string(includeCleanup.syntaxNormalizedCount)
+                                            + " duplicates_removed="
+                                            + std::to_string(includeCleanup.duplicateIncludesRemovedCount)
+                                            + " preserved="
+                                            + std::to_string(includeCleanup.includesPreservedCount)
+                                            + " required_added="
+                                            + std::to_string(includeCleanup.requiredIncludesAddedCount)
+                                            + " required_already_present="
+                                            + std::to_string(includeCleanup.requiredIncludesAlreadyPresentCount)
+                                            + " added=\"" + addedIncludes.str() + "\""
+                                            + " obsolete_removed="
+                                            + std::to_string(includeCleanup.obsoleteIncludesRemovedCount)
+                                            + " obsolete_kept="
+                                            + std::to_string(includeCleanup.obsoleteIncludesKeptCount)
+                                            + " obsolete_skipped="
+                                            + std::to_string(includeCleanup.obsoleteIncludesSkippedCount)
+                                            + " removed_obsolete=\"" + removedObsoleteIncludes.str() + "\""
+                                            + " kept_obsolete=\"" + keptObsoleteIncludes.str() + "\""
+                                            + " skipped_obsolete=\"" + skippedObsoleteIncludes.str() + "\"");
+        result.modernCode = std::move(includeCleanup.code);
     };
 
     if (shouldRunStructuralPass(options)) {
@@ -1539,6 +1893,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
             const ConcurrencyRaiiModernizationPass pass;
             return pass.rewrite(input, options, changes);
         });
+        applyPolish("Atomic counter modernization", [&](const std::string& input) {
+            const AtomicCounterModernizationPass pass;
+            return pass.rewrite(input, options, changes);
+        });
         applyPolish("Rule of Zero polish", [&](const std::string& input) {
             const RuleOfZeroPolishPass pass;
             return pass.rewrite(input, changes);
@@ -1566,8 +1924,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     }
 
     runSemanticValidationAndRepairPass();
+    runIncludeCleanupPass();
 
     if (options.compileVerificationEnabled || aggressiveAiLike || shouldRunStructuralPass(options)) {
+        CrashBreadcrumb::ScopedStage compileStage("compile verification");
         result.diagnosticMessages.push_back("COMPILE VERIFICATION status=started stage=initial");
         const auto compileStarted = std::chrono::steady_clock::now();
         CompileVerificationResult verification = CompileVerifier::verifySyntaxOnly(result.modernCode, options.targetStandard);
@@ -1714,6 +2074,7 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
                 return pass.validateAndRepair(input, options, changes);
             });
             runSemanticValidationAndRepairPass();
+            runIncludeCleanupPass();
 
             if (result.modernCode != beforeCleanup) {
                 result.compileVerificationAutoFixAttempted = true;
@@ -1784,6 +2145,7 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     }
 
     auto runPostConversionFormatting = [&]() {
+        CrashBreadcrumb::ScopedStage stage("post-conversion formatting");
         if (!options.enablePostConversionFormatting) {
             result.diagnosticMessages.push_back("POST FORMAT formatting skipped: disabled");
             return;
@@ -1833,6 +2195,29 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
     };
 
     runPostConversionFormatting();
+
+    {
+        CrashBreadcrumb::ScopedStage stage("Clang semantic validation");
+        if (options.enableClangValidation) {
+            const ClangSemanticValidationPass clangValidationPass;
+            const std::vector<std::string> clangValidationDiagnostics =
+                clangValidationPass.validateWithSelectedFrontend(frontendAnalysis.result,
+                                                                 frontendAnalysis.selectedClang(),
+                                                                 frontendAnalysis.fallbackUsed,
+                                                                 frontendAnalysis.fallbackReason,
+                                                                 frontendAnalysis.clangConfig,
+                                                                 result.modernCode,
+                                                                 options,
+                                                                 changes,
+                                                                 result.compileVerificationEnabled,
+                                                                 result.compileVerificationPassed);
+            result.diagnosticMessages.insert(result.diagnosticMessages.end(),
+                                             clangValidationDiagnostics.begin(),
+                                             clangValidationDiagnostics.end());
+        } else {
+            result.diagnosticMessages.push_back("CLANG VALIDATION enabled=false reason=\"internal Clang validation flag disabled\"");
+        }
+    }
 
     result.diagnosticMessages.push_back(skippedRiskSummaryMessage(skippedRiskDiagnostics));
     result.diagnosticMessages.push_back(rollbackSummaryMessage(rollbackDiagnostics));

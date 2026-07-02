@@ -1,6 +1,7 @@
 #include "converter/RewriteCoordinator.h"
 
 #include <algorithm>
+#include <cassert>
 #include <set>
 #include <string>
 #include <tuple>
@@ -81,6 +82,7 @@ RewriteApplicationResult RewriteCoordinator::apply(const std::string& source,
     });
 
     for (const RewriteEdit& edit : accepted) {
+        assert(edit.range.isValidFor(result.code.size()) && "Rewrite edit range must remain valid before application");
         result.code.replace(edit.range.start.offset, edit.range.length(), edit.replacementText);
         result.appliedEdits.push_back(edit);
     }

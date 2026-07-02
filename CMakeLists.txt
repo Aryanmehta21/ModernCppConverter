@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(ModernCppConverter
-    VERSION 0.1.0
+    VERSION 1.2.0
     DESCRIPTION "Rule-based legacy C++ to modern C++ converter"
     LANGUAGES CXX
 )
@@ -16,7 +16,7 @@ set(CMAKE_AUTOUIC ON)
 
 option(ENABLE_CLANG_EXPERIMENTS "Build optional Clang-backed analysis experiments" OFF)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network Concurrent)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network Concurrent)
 
 if(ENABLE_CLANG_EXPERIMENTS)
     enable_language(C)
@@ -34,6 +34,29 @@ endif()
 get_property(MODERN_CPP_CONVERTER_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(NOT MODERN_CPP_CONVERTER_IS_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
+
+set(MODERNCPP_APP_VERSION "1.2.0-rc1" CACHE STRING "ModernCppConverter release version")
+set(MODERNCPP_RELEASE_CHANNEL "rc" CACHE STRING "ModernCppConverter release channel")
+string(TIMESTAMP MODERNCPP_BUILD_DATE "%Y-%m-%d" UTC)
+find_package(Git QUIET)
+set(MODERNCPP_GIT_COMMIT "unknown")
+if(Git_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        OUTPUT_VARIABLE MODERNCPP_GIT_COMMIT_FROM_GIT
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(MODERNCPP_GIT_COMMIT_FROM_GIT)
+        set(MODERNCPP_GIT_COMMIT "${MODERNCPP_GIT_COMMIT_FROM_GIT}")
+    endif()
+endif()
+if(ENABLE_CLANG_EXPERIMENTS)
+    set(MODERNCPP_CLANG_ENABLED_VALUE 1)
+else()
+    set(MODERNCPP_CLANG_ENABLED_VALUE 0)
 endif()
 
 add_library(ModernCppConverterWarnings INTERFACE)

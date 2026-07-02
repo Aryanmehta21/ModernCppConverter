@@ -1,4 +1,5 @@
 #include "app/ConversionCoordinator.h"
+#include "utils/CrashBreadcrumb.h"
 
 #include <QDateTime>
 #include <QDebug>
@@ -48,10 +49,40 @@ std::string targetStandardName(CppStandard standard)
     return standard == CppStandard::Cpp17 ? "C++17" : "C++20";
 }
 
+std::string frontendSelectionName(ModernizationFrontendSelection selection)
+{
+    switch (selection) {
+    case ModernizationFrontendSelection::Lightweight:
+        return "Lightweight";
+    case ModernizationFrontendSelection::ClangExperimental:
+        return "ClangExperimental";
+    case ModernizationFrontendSelection::Auto:
+        return "Auto";
+    }
+    return "Lightweight";
+}
+
+std::string diagnosticVerbosityName(DiagnosticVerbosity verbosity)
+{
+    switch (verbosity) {
+    case DiagnosticVerbosity::Summary:
+        return "Summary";
+    case DiagnosticVerbosity::Normal:
+        return "Normal";
+    case DiagnosticVerbosity::Verbose:
+        return "Verbose";
+    case DiagnosticVerbosity::Debug:
+        return "Debug";
+    }
+    return "Normal";
+}
+
 std::string optionsDiagnostic(const ModernizationOptions& options)
 {
     return "selected modernization options level=" + modernizationLevelName(options.offlineModernizationLevel)
         + " target=" + targetStandardName(options.targetStandard)
+        + " frontend=" + frontendSelectionName(options.frontendSelection)
+        + " diagnostics=" + diagnosticVerbosityName(options.diagnosticVerbosity)
         + " compileVerification=" + (options.compileVerificationEnabled ? "enabled" : "profile-default")
         + " auto=" + (options.useAuto ? "on" : "off")
         + " lambdas=" + (options.useLambdas ? "on" : "off")
@@ -123,7 +154,9 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
                                                            const ModernizationOptions& options,
                                                            ConversionMode requestedMode) const
 {
+    CrashBreadcrumb::ScopedStage stage("conversion coordinator");
     if (requestedMode == ConversionMode::OfflineRuleBased) {
+        CrashBreadcrumb::ScopedStage offlineStage("offline conversion dispatch");
         qInfo() << "Offline mode selected";
         QElapsedTimer timer;
         timer.start();
@@ -140,8 +173,10 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
     }
 
     qInfo() << modeName(requestedMode) << "selected";
+    CrashBreadcrumb::ScopedStage backendStage("backend availability check");
     qInfo() << "Backend health check starts";
     if (!backendClient_->isAvailable()) {
+        CrashBreadcrumb::ScopedStage fallbackStage("offline fallback dispatch");
         qWarning() << "Backend health check failed; offline fallback will be used";
         QElapsedTimer timer;
         timer.start();
@@ -170,6 +205,7 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
     qInfo() << "Backend health check succeeded";
 
     if (requestedMode == ConversionMode::OnlineAiAssisted) {
+        CrashBreadcrumb::ScopedStage onlineStage("online AI dispatch");
         qInfo() << "Online conversion request starts";
         BackendConversionResponse response = backendClient_->convert(code, options, requestedMode, nullptr);
         if (response.ok) {
@@ -205,6 +241,7 @@ CoordinatedConversionResult ConversionCoordinator::convert(const std::string& co
 
     QElapsedTimer localTimer;
     localTimer.start();
+    CrashBreadcrumb::ScopedStage hybridStage("hybrid local offline dispatch");
     qInfo() << "Hybrid local offline pipeline started";
     ConversionResult localResult = localEngine_->convert(code, options);
     const qint64 localElapsed = localTimer.elapsed();

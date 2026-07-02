@@ -71,7 +71,7 @@ bool parseIncludeLine(const std::string& line, IncludeLine& include)
     return !target.empty();
 }
 
-std::string normalizeAndSortIncludes(const std::string& code, const bool ensureMemory)
+std::string normalizeIncludesPreservingOrder(const std::string& code, const bool ensureMemory)
 {
     std::stringstream input(code);
     std::vector<std::string> lines;
@@ -116,28 +116,15 @@ std::string normalizeAndSortIncludes(const std::string& code, const bool ensureM
             uniqueIncludes.push_back(include);
         }
     }
-    std::sort(uniqueIncludes.begin(), uniqueIncludes.end(), [](const IncludeLine& left, const IncludeLine& right) {
-        if (left.local != right.local) {
-            return !left.local && right.local;
-        }
-        return left.key < right.key;
-    });
 
     std::vector<std::string> outputLines;
     for (std::size_t index = 0; index < cursor; ++index) {
         outputLines.push_back(lines[index]);
     }
-    bool emittedLocalSeparator = false;
-    bool emittedAnyInclude = false;
     for (const IncludeLine& include : uniqueIncludes) {
-        if (include.local && emittedAnyInclude && !emittedLocalSeparator) {
-            outputLines.emplace_back();
-            emittedLocalSeparator = true;
-        }
         outputLines.push_back(include.normalized);
-        emittedAnyInclude = true;
     }
-    if (emittedAnyInclude && consumed < lines.size() && !trim(lines[consumed]).empty()) {
+    if (!uniqueIncludes.empty() && consumed < lines.size() && !trim(lines[consumed]).empty()) {
         outputLines.emplace_back();
     }
     for (std::size_t index = consumed; index < lines.size(); ++index) {
@@ -202,7 +189,7 @@ std::string prepareFormattingInput(const std::string& code)
 {
     bool needsMemory = false;
     std::string prepared = rewriteUniquePtrNewConstruction(code, needsMemory);
-    prepared = normalizeAndSortIncludes(prepared, needsMemory);
+    prepared = normalizeIncludesPreservingOrder(prepared, needsMemory);
     return prepared;
 }
 

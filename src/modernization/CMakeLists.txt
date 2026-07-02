@@ -2,11 +2,14 @@ target_sources(ModernCppConverterCore
     PRIVATE
         ${PROJECT_SOURCE_DIR}/src/converter/AlgorithmPolishPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/AlgorithmModernizationPass.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/AtomicCounterModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/AutoDeductionPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/AutoPtrRemovalPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ClassContextResolver.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ClassResourceAnalyzerPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ClassStringBufferModernizationPass.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/ClangAstRewriteEngine.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/ClangSemanticValidationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/CompilerDiagnosticCleanupPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ConcurrencyRaiiModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ContainerModernizationCleanupPass.cpp
@@ -24,6 +27,7 @@ target_sources(ModernCppConverterCore
         ${PROJECT_SOURCE_DIR}/src/converter/FunctorToLambdaPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/FunctorToLambdaValidationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ImpactCascadingCleanupPass.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/IncludeCleanupPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/IndexLoopModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/IteratorModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/MallocFreeModernizationPass.cpp

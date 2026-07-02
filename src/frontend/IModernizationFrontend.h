@@ -6,6 +6,16 @@
 #include <string>
 #include <vector>
 
+struct ClangParseConfig
+{
+    std::string languageStandard = "c++20";
+    std::string virtualFileName = "input.cpp";
+    std::string systemRoot;
+    std::string resourceDir;
+    std::vector<std::string> includePaths;
+    std::vector<std::string> compileArguments = {"-std=c++20", "-fsyntax-only", "-x", "c++"};
+};
+
 enum class ModernizationFrontendKind
 {
     Lightweight,

@@ -22,6 +22,21 @@ enum class OfflineRewriteStyle
     AggressiveAiLikeRewrite,
 };
 
+enum class ModernizationFrontendSelection
+{
+    Lightweight,
+    ClangExperimental,
+    Auto,
+};
+
+enum class DiagnosticVerbosity
+{
+    Summary,
+    Normal,
+    Verbose,
+    Debug,
+};
+
 struct ModernizationOptions
 {
     bool useNullptr = true;
@@ -56,6 +71,13 @@ struct ModernizationOptions
     bool applyStringViewWhenSafe = false;
     bool compileVerificationEnabled = false;
     bool enablePostConversionFormatting = false;
+    bool enableClangFrontend = true;
+    bool enableClangAstRewrite = false;
+    bool enableClangValidation = false;
+    bool enableSharedAstReuse = false;
+    bool enableDebugRawDiagnostics = true;
+    ModernizationFrontendSelection frontendSelection = ModernizationFrontendSelection::Lightweight;
+    DiagnosticVerbosity diagnosticVerbosity = DiagnosticVerbosity::Normal;
     OfflineModernizationLevel offlineModernizationLevel = OfflineModernizationLevel::Balanced;
     OfflineRewriteStyle offlineRewriteStyle = OfflineRewriteStyle::SafeModernization;
     CppStandard targetStandard = CppStandard::Cpp20;
