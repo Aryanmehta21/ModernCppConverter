@@ -49,6 +49,7 @@ target_sources(ModernCppConverterCore
         ${PROJECT_SOURCE_DIR}/src/converter/PolymorphicSafetyPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/PostConversionFormatter.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/PrintfModernizationPass.cpp
+        ${PROJECT_SOURCE_DIR}/src/converter/PthreadThreadModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/QualityModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/RangeForModernizationPass.cpp
         ${PROJECT_SOURCE_DIR}/src/converter/ReturnTypePropagationPass.cpp

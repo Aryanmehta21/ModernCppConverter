@@ -73,7 +73,7 @@ bool isCleanupOnlyBody(const std::string& body, const std::string& targetExpress
     std::stringstream bodyStream(body);
     std::string bodyLine;
     const std::regex cleanupDeleteLine("delete(?:\\s*\\[\\s*\\])?\\s+" + targetExpression + "\\s*;");
-    const std::regex cleanupNullAssignmentLine("(" + targetExpression + ")\\s*=\\s*nullptr\\s*;");
+    const std::regex cleanupNullAssignmentLine("(" + targetExpression + ")\\s*=\\s*(?:nullptr|NULL|0)\\s*;");
     while (std::getline(bodyStream, bodyLine)) {
         const std::string stripped = trim(bodyLine);
         if (stripped.empty()
@@ -88,6 +88,75 @@ bool isCleanupOnlyBody(const std::string& body, const std::string& targetExpress
     return true;
 }
 
+std::size_t findMatchingBrace(const std::string& code, const std::size_t openBrace)
+{
+    int depth = 0;
+    bool inString = false;
+    bool inCharacter = false;
+    bool escaped = false;
+
+    for (std::size_t index = openBrace; index < code.size(); ++index) {
+        const char current = code[index];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if ((inString || inCharacter) && current == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (!inCharacter && current == '"') {
+            inString = !inString;
+            continue;
+        }
+        if (!inString && current == '\'') {
+            inCharacter = !inCharacter;
+            continue;
+        }
+        if (inString || inCharacter) {
+            continue;
+        }
+        if (current == '{') {
+            ++depth;
+        } else if (current == '}') {
+            --depth;
+            if (depth == 0) {
+                return index;
+            }
+        }
+    }
+
+    return std::string::npos;
+}
+
+bool isCleanupOnlyDestructorBody(std::string body, const std::string& targetExpression)
+{
+    const std::regex cleanupIfBlock(R"(if\s*\(\s*)" + targetExpression
+                                    + R"(\s*(?:==|!=)\s*(?:nullptr|NULL|0)\s*\)\s*\{\s*(?:delete(?:\s*\[\s*\])?\s+)"
+                                    + targetExpression + R"(\s*;\s*)?(?:)"
+                                    + targetExpression + R"(\s*=\s*(?:nullptr|NULL|0)\s*;\s*)?\})",
+                                    std::regex::ECMAScript);
+    body = std::regex_replace(body, cleanupIfBlock, "");
+
+    const std::regex cleanupSingleLineIf(R"(if\s*\(\s*)" + targetExpression
+                                         + R"(\s*(?:==|!=)\s*(?:nullptr|NULL|0)\s*\)\s*(?:delete(?:\s*\[\s*\])?\s+)"
+                                         + targetExpression + R"(\s*;|)"
+                                         + targetExpression + R"(\s*=\s*(?:nullptr|NULL|0)\s*;))",
+                                         std::regex::ECMAScript);
+    body = std::regex_replace(body, cleanupSingleLineIf, "");
+
+    const std::regex cleanupDeleteLine(R"((^|\n)[ \t]*delete(?:\s*\[\s*\])?\s+)" + targetExpression + R"(\s*;\s*)",
+                                       std::regex::ECMAScript);
+    body = std::regex_replace(body, cleanupDeleteLine, "\n");
+
+    const std::regex cleanupNullAssignmentLine(R"((^|\n)[ \t]*)" + targetExpression
+                                               + R"(\s*=\s*(?:nullptr|NULL|0)\s*;\s*)",
+                                               std::regex::ECMAScript);
+    body = std::regex_replace(body, cleanupNullAssignmentLine, "\n");
+
+    return trim(body).empty();
+}
+
 std::string cleanupEmptyDestructor(std::string code,
                                    const TypeChangeRecord& record,
                                    std::vector<ConversionChange>& changes)
@@ -97,24 +166,47 @@ std::string cleanupEmptyDestructor(std::string code,
     }
 
     const std::string className = escapeRegex(record.scopeName);
-    const std::regex emptyDestructorPattern(R"(\n?[ \t]*~)" + className + R"(\s*\(\s*\)\s*\{\s*\}\s*)");
+    const std::regex destructorPattern(R"((^|\n)[ \t]*~)" + className + R"(\s*\(\s*\)\s*\{)",
+                                       std::regex::ECMAScript);
     std::smatch match;
-    if (!std::regex_search(code, match, emptyDestructorPattern)) {
+    if (!std::regex_search(code, match, destructorPattern)) {
         return code;
     }
 
-    const std::string before = trim(match[0].str());
+    const std::size_t destructorStart = static_cast<std::size_t>(match.position(0))
+        + (match[1].matched && !match[1].str().empty() ? 1U : 0U);
+    const std::size_t openBrace = static_cast<std::size_t>(match.position(0) + match.length(0) - 1U);
+    const std::size_t closeBrace = findMatchingBrace(code, openBrace);
+    if (closeBrace == std::string::npos) {
+        return code;
+    }
+
+    const std::string body = code.substr(openBrace + 1U, closeBrace - openBrace - 1U);
+    const std::string targetExpression = accessExpressionRegex(record.symbolName);
+    if (!trim(body).empty() && !isCleanupOnlyDestructorBody(body, targetExpression)) {
+        return code;
+    }
+
+    std::size_t destructorEnd = closeBrace + 1U;
+    while (destructorEnd < code.size() && (code[destructorEnd] == ' ' || code[destructorEnd] == '\t' || code[destructorEnd] == '\r')) {
+        ++destructorEnd;
+    }
+    if (destructorEnd < code.size() && code[destructorEnd] == '\n') {
+        ++destructorEnd;
+    }
+
+    const std::string before = trim(code.substr(destructorStart, destructorEnd - destructorStart));
     addAppliedChange(changes,
                      "Rule of Zero destructor cleanup",
                      before,
                      "removed",
-                     "Removed an empty cleanup-only destructor after standard library value-type modernization.");
+                     "Removed a cleanup-only destructor after standard library value-type modernization.");
     addAppliedChange(changes,
                      "Rule of Zero special member removal",
                      before,
                      "removed",
                      "The special member only existed for manual cleanup now handled by standard library members.");
-    code.replace(static_cast<std::size_t>(match.position()), static_cast<std::size_t>(match.length()), "\n");
+    code.replace(destructorStart, destructorEnd - destructorStart, "");
     return code;
 }
 } // namespace

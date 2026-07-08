@@ -39,6 +39,7 @@
 #include "converter/PolymorphicSafetyPass.h"
 #include "converter/PostConversionFormatter.h"
 #include "converter/PrintfModernizationPass.h"
+#include "converter/PthreadThreadModernizationPass.h"
 #include "converter/QualityModernizationPass.h"
 #include "converter/ReturnTypePropagationPass.h"
 #include "converter/RuleOfZeroPass.h"
@@ -1527,6 +1528,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         std::vector<RollbackDiagnostic> passRollbackDiagnostics;
         std::vector<SkippedRiskDiagnostic> passSkippedRiskDiagnostics;
         for (auto change = changesBegin; change != changes.end(); ++change) {
+            if (passName == "PthreadThreadModernizationPass"
+                && change->ruleName == "PTHREAD MODERNIZATION DEBUG") {
+                result.diagnosticMessages.push_back(change->reason);
+            }
             RollbackDiagnostic rollbackDiagnostic = classifyRollback(*change, passName);
             if (rollbackDiagnostic.isRollback) {
                 passRollbackDiagnostics.push_back(std::move(rollbackDiagnostic));
@@ -1840,6 +1845,10 @@ OfflineModernizationPipelineResult OfflineModernizationPipeline::runAfterSafeRul
         });
         runTracedPass("ReturnTypePropagationPass", [&](const std::string& input) {
             const ReturnTypePropagationPass pass;
+            return pass.rewrite(input, changes);
+        });
+        runTracedPass("PthreadThreadModernizationPass", [&](const std::string& input) {
+            const PthreadThreadModernizationPass pass;
             return pass.rewrite(input, changes);
         });
 

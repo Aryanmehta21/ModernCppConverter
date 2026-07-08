@@ -8,10 +8,12 @@
 #include "converter/ScopedEnumOutputPropagationPass.h"
 #include "converter/ScopedEnumOutputValidator.h"
 #include "converter/ScopedEnumUsagePropagationPass.h"
+#include "converter/SafeReplacementEngine.h"
 #include "converter/SemanticConsistencyValidator.h"
 #include "converter/SemanticModernizationValidator.h"
 #include "converter/SemanticTypeValidationPass.h"
 #include "converter/SmartPointerSinkPropagationPass.h"
+#include "converter/ValueTypePointerOperationScanner.h"
 #include "converter/VectorParadigmRewritePass.h"
 #include "parser/LightweightCppParser.h"
 
@@ -256,6 +258,181 @@ std::string repairStreamArtifacts(const std::string& code,
     return joinLines(lines, !code.empty() && code.back() == '\n');
 }
 
+bool isStandardValueObjectType(std::string type)
+{
+    type = trim(std::move(type));
+    if (type.find('*') != std::string::npos || type.find('&') != std::string::npos) {
+        return false;
+    }
+    return type == "std::string"
+        || type.starts_with("std::vector<")
+        || type.starts_with("std::array<")
+        || type.starts_with("std::optional<")
+        || type.starts_with("std::deque<")
+        || type.starts_with("std::list<")
+        || type.starts_with("std::map<")
+        || type.starts_with("std::set<")
+        || type.starts_with("std::unordered_map<")
+        || type.starts_with("std::unordered_set<");
+}
+
+bool contextContainsTypeChange(const TransformationContext& context,
+                               const std::string& symbolName,
+                               const std::string& scopeName,
+                               const std::string& newType)
+{
+    return std::any_of(context.typeChanges().begin(), context.typeChanges().end(), [&](const TypeChangeRecord& record) {
+        return record.symbolName == symbolName
+            && record.scopeName == scopeName
+            && record.newType == newType;
+    });
+}
+
+TransformationContext valueTypeRepairContextForCode(const std::string& code,
+                                                    const TransformationContext& context)
+{
+    TransformationContext repairContext;
+    for (const TypeChangeRecord& record : context.typeChanges()) {
+        repairContext.registerTypeChange(record);
+    }
+
+    const LightweightCppParser parser;
+    const ParsedDocument document = parser.parse(code);
+    auto addVariable = [&](const ParsedVariable& variable) {
+        if (!isStandardValueObjectType(variable.type)
+            || contextContainsTypeChange(repairContext, variable.name, variable.parentName, variable.type)) {
+            return;
+        }
+        repairContext.registerTypeChange(TypeChangeRecord{
+            variable.name,
+            "pointer-like storage",
+            variable.type,
+            variable.parentName,
+            variable.isMember,
+            "Semantic validation value-type fact",
+            {"remove pointer-specific operations"},
+            {},
+            false,
+        });
+    };
+
+    for (const ParsedVariable& variable : document.memberVariables) {
+        addVariable(variable);
+    }
+    for (const ParsedVariable& variable : document.globalVariables) {
+        addVariable(variable);
+    }
+    for (const ParsedVariable& variable : document.localVariables) {
+        addVariable(variable);
+    }
+
+    return repairContext;
+}
+
+std::string normalizeDuplicateConstInLine(const std::string& line, bool& changed)
+{
+    std::string output;
+    output.reserve(line.size());
+    bool inString = false;
+    bool inCharacter = false;
+    bool escaped = false;
+
+    auto isIdentifierCharacter = [&](const std::size_t index) {
+        return index < line.size()
+            && (std::isalnum(static_cast<unsigned char>(line[index])) != 0 || line[index] == '_');
+    };
+    auto hasWordAt = [&](const std::size_t index, const std::string_view word) {
+        return index + word.size() <= line.size()
+            && line.compare(index, word.size(), word) == 0
+            && (index == 0U || !isIdentifierCharacter(index - 1U))
+            && !isIdentifierCharacter(index + word.size());
+    };
+
+    for (std::size_t index = 0; index < line.size();) {
+        const char current = line[index];
+        if (escaped) {
+            output.push_back(current);
+            escaped = false;
+            ++index;
+            continue;
+        }
+        if ((inString || inCharacter) && current == '\\') {
+            output.push_back(current);
+            escaped = true;
+            ++index;
+            continue;
+        }
+        if (!inCharacter && current == '"') {
+            inString = !inString;
+            output.push_back(current);
+            ++index;
+            continue;
+        }
+        if (!inString && current == '\'') {
+            inCharacter = !inCharacter;
+            output.push_back(current);
+            ++index;
+            continue;
+        }
+        if (!inString && !inCharacter && hasWordAt(index, "const")) {
+            std::size_t scan = index + 5U;
+            std::size_t afterWhitespace = scan;
+            while (afterWhitespace < line.size() && std::isspace(static_cast<unsigned char>(line[afterWhitespace])) != 0) {
+                ++afterWhitespace;
+            }
+
+            bool duplicate = false;
+            while (hasWordAt(afterWhitespace, "const")) {
+                duplicate = true;
+                scan = afterWhitespace + 5U;
+                afterWhitespace = scan;
+                while (afterWhitespace < line.size() && std::isspace(static_cast<unsigned char>(line[afterWhitespace])) != 0) {
+                    ++afterWhitespace;
+                }
+            }
+
+            if (duplicate) {
+                output += "const";
+                if (afterWhitespace < line.size() && !std::ispunct(static_cast<unsigned char>(line[afterWhitespace]))) {
+                    output.push_back(' ');
+                }
+                index = afterWhitespace;
+                changed = true;
+                continue;
+            }
+        }
+
+        output.push_back(current);
+        ++index;
+    }
+
+    return output;
+}
+
+std::string normalizeDuplicateConstQualifiers(const std::string& code,
+                                              std::vector<ConversionChange>& changes)
+{
+    const SafeReplacementEngine safeReplacement;
+    bool changed = false;
+    std::string updated = safeReplacement.rewriteCodeLines(code, [&](const std::string& line) {
+        std::string trailingComment;
+        const std::string codePart = SafeReplacementEngine::splitTrailingLineComment(line, trailingComment);
+        bool lineChanged = false;
+        const std::string normalized = normalizeDuplicateConstInLine(codePart, lineChanged);
+        if (lineChanged) {
+            changed = true;
+            addAppliedChange(changes,
+                             "Duplicate const qualifier normalization",
+                             trim(codePart),
+                             trim(normalized),
+                             "Collapsed duplicate const qualifiers introduced by combined type propagation.");
+        }
+        return normalized + trailingComment;
+    });
+
+    return changed ? updated : code;
+}
+
 void appendRepairDiagnostics(SemanticValidationAndRepairResult& result,
                              const ParsedDocument& document,
                              const std::string& frontendName,
@@ -345,10 +522,15 @@ SemanticValidationAndRepairResult SemanticValidationAndRepairPass::validateAndRe
         result.code = vectorParadigmRewritePass.rewrite(result.code, context, changes);
     }
 
+    const TransformationContext valueTypeRepairContext = valueTypeRepairContextForCode(result.code, context);
+    const ValueTypePointerOperationScanner valueTypePointerOperationScanner;
+    result.code = valueTypePointerOperationScanner.rewrite(result.code, valueTypeRepairContext, changes);
+
     const SemanticConsistencyValidator semanticConsistencyValidator;
     result.code = semanticConsistencyValidator.validateAndRepair(result.code, options, context, {}, changes);
     const SemanticModernizationValidator semanticModernizationValidator;
     result.code = semanticModernizationValidator.validateAndRepair(result.code, options, context, {}, changes);
+    result.code = normalizeDuplicateConstQualifiers(result.code, changes);
 
     if (result.code != code) {
         addAppliedChange(changes,

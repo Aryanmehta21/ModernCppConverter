@@ -18,6 +18,7 @@
 #include "converter/OwnershipGraphAnalyzer.h"
 #include "converter/OwnershipSanityScanner.h"
 #include "converter/PostConversionFormatter.h"
+#include "converter/PthreadThreadModernizationPass.h"
 #include "converter/ReturnTypePropagationPass.h"
 #include "converter/ScopeAwareSymbolTable.h"
 #include "converter/ScopeLeakValidationPass.h"
@@ -219,6 +220,20 @@ bool hasSkippedRule(const std::vector<ConversionChange>& changes, const std::str
 {
     return std::any_of(changes.begin(), changes.end(), [&ruleName](const ConversionChange& change) {
         return change.skipped && contains(change.ruleName, ruleName);
+    });
+}
+
+bool hasRule(const std::vector<ConversionChange>& changes, const std::string& ruleName)
+{
+    return std::any_of(changes.begin(), changes.end(), [&ruleName](const ConversionChange& change) {
+        return contains(change.ruleName, ruleName);
+    });
+}
+
+bool hasChangeReasonContaining(const std::vector<ConversionChange>& changes, const std::string& text)
+{
+    return std::any_of(changes.begin(), changes.end(), [&text](const ConversionChange& change) {
+        return contains(change.reason, text);
     });
 }
 
@@ -4893,6 +4908,63 @@ void testEmptyCleanupBlockAfterValueTypeModernizationIsRemoved()
     require(hasAppliedRule(changes, "Remove empty cleanup block"), "empty cleanup block removal should be tracked");
 }
 
+void testSemanticRepairRemovesVectorNullDestructorAndDuplicateConst()
+{
+    ModernizationOptions options = structuralOptions();
+
+    TransformationContext context;
+    context.registerTypeChange(TypeChangeRecord{
+        "records",
+        "DeviceRecord*",
+        "std::vector<DeviceRecord>",
+        "DeviceStore",
+        true,
+        "Raw dynamic array to std::vector",
+        {"remove pointer cleanup"},
+        {},
+        false,
+    });
+
+    const std::string code =
+        "#include <vector>\n"
+        "struct DeviceRecord\n"
+        "{\n"
+        "    int id;\n"
+        "};\n"
+        "class DeviceStore\n"
+        "{\n"
+        "public:\n"
+        "    ~DeviceStore()\n"
+        "    {\n"
+        "        if (records != nullptr)\n"
+        "        {\n"
+        "            records = nullptr;\n"
+        "        }\n"
+        "    }\n"
+        "    const const DeviceRecord* getRecord() const\n"
+        "    {\n"
+        "        return records.empty() ? nullptr : &records[0];\n"
+        "    }\n"
+        "private:\n"
+        "    std::vector<DeviceRecord> records;\n"
+        "};\n";
+
+    std::vector<ConversionChange> changes;
+    const SemanticValidationAndRepairPass pass;
+    const SemanticValidationAndRepairResult result = pass.validateAndRepair(code, options, context, changes);
+
+    require(!contains(result.code, "records != nullptr"), "semantic repair should remove vector nullptr comparison");
+    require(!contains(result.code, "records = nullptr"), "semantic repair should remove vector nullptr assignment");
+    require(!contains(result.code, "~DeviceStore()"), "cleanup-only vector destructor should be removed");
+    require(!contains(result.code, "const const"), "duplicate const qualifiers should be normalized");
+    require(contains(result.code, "const DeviceRecord* getRecord() const"),
+            "single const pointer qualifier should remain after normalization\nOutput:\n" + result.code);
+    require(hasAppliedRule(changes, "Rule of Zero destructor cleanup"),
+            "cleanup-only destructor removal should be tracked");
+    require(hasAppliedRule(changes, "Duplicate const qualifier normalization"),
+            "duplicate const normalization should be tracked");
+}
+
 void testVectorMemberGetterCascadesToContainerReference()
 {
     const RuleBasedConverterEngine converter;
@@ -4935,6 +5007,109 @@ void testVectorMemberGetterCascadesToContainerReference()
     if (!result.compilerUsed.empty()) {
         require(result.compileVerificationPassed, "vector member getter cascade sample should pass syntax verification");
     }
+}
+
+void testFullStressVectorStorageSemanticRepairCompiles()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <iostream>\n"
+        "#define DEFAULT_CAPACITY 2\n"
+        "struct DeviceRecord\n"
+        "{\n"
+        "    int id;\n"
+        "    int status;\n"
+        "};\n\n"
+        "class DeviceStore\n"
+        "{\n"
+        "public:\n"
+        "    DeviceStore()\n"
+        "    {\n"
+        "        count = 0;\n"
+        "        capacity = DEFAULT_CAPACITY;\n"
+        "        records = new DeviceRecord[capacity];\n"
+        "    }\n\n"
+        "    ~DeviceStore()\n"
+        "    {\n"
+        "        if (records != nullptr)\n"
+        "        {\n"
+        "            delete[] records;\n"
+        "            records = nullptr;\n"
+        "        }\n"
+        "    }\n\n"
+        "    bool addRecord(int id, int status)\n"
+        "    {\n"
+        "        if (count >= capacity)\n"
+        "        {\n"
+        "            int newCapacity = capacity * 2;\n"
+        "            DeviceRecord* temp = new DeviceRecord[newCapacity];\n"
+        "            for (int index = 0; index < count; ++index)\n"
+        "            {\n"
+        "                temp[index] = records[index];\n"
+        "            }\n"
+        "            delete[] records;\n"
+        "            records = temp;\n"
+        "            capacity = newCapacity;\n"
+        "        }\n"
+        "        records[count].id = id;\n"
+        "        records[count].status = status;\n"
+        "        ++count;\n"
+        "        return true;\n"
+        "    }\n\n"
+        "    int getCount() const\n"
+        "    {\n"
+        "        return count;\n"
+        "    }\n\n"
+        "    DeviceRecord* getRecord(int index) const\n"
+        "    {\n"
+        "        if (index < count)\n"
+        "        {\n"
+        "            return &records[index];\n"
+        "        }\n"
+        "        return nullptr;\n"
+        "    }\n\n"
+        "private:\n"
+        "    DeviceRecord* records;\n"
+        "    int count;\n"
+        "    int capacity;\n"
+        "};\n\n"
+        "void printRecord(DeviceRecord* record)\n"
+        "{\n"
+        "    if (record != nullptr)\n"
+        "    {\n"
+        "        std::cout << record->id << '\\n';\n"
+        "    }\n"
+        "}\n\n"
+        "int main()\n"
+        "{\n"
+        "    DeviceStore store;\n"
+        "    store.addRecord(10, 1);\n"
+        "    const DeviceRecord* record = store.getRecord(0);\n"
+        "    printRecord(record);\n"
+        "    return static_cast<int>(store.getCount());\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::vector<DeviceRecord> records;"),
+            "full stress case should convert raw storage to vector\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "records != nullptr"),
+            "full stress case should not retain vector nullptr comparisons\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "records == nullptr"),
+            "full stress case should not retain vector nullptr equality checks\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "records = nullptr"),
+            "full stress case should not retain vector nullptr assignments\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "delete[] records"),
+            "full stress case should not retain manual vector cleanup\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "const const"),
+            "full stress case should not emit duplicate const qualifiers\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "~DeviceStore()"),
+            "cleanup-only destructor should be removed by Rule of Zero\nOutput:\n" + result.modernCode);
+    require(result.compileVerificationPassed,
+            "full stress vector semantic repair should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
 }
 
 void testLocalCollectionDoesNotLeakIntoUnrelatedClassGetter()
@@ -7578,6 +7753,505 @@ void testSleepModernizationKeepsUnistdForOtherPosixSymbols()
             "unrelated POSIX call should be preserved\nOutput:\n" + result.modernCode);
 }
 
+void testPthreadExactIntegerWorkerSampleTriggersPass()
+{
+    const std::string code =
+        "void* integerWorker(void* arg)\n"
+        "{\n"
+        "    int id = *(int*)arg;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "\n"
+        "pthread_t firstThread;\n"
+        "pthread_create(&firstThread, nullptr, integerWorker, &id);\n"
+        "pthread_join(firstThread, nullptr);\n";
+
+    std::vector<ConversionChange> changes;
+    const PthreadThreadModernizationPass pass;
+    const std::string modernized = pass.rewrite(code, changes);
+
+    require(contains(modernized, "void integerWorker(int* arg)"),
+            "exact pthread worker sample should modernize the worker signature\nOutput:\n" + modernized);
+    require(contains(modernized, "int id = *arg;"),
+            "exact pthread worker sample should remove the void* cast/deref\nOutput:\n" + modernized);
+    require(contains(modernized, "std::thread firstThread(integerWorker, &id);"),
+            "exact pthread_create sample should become std::thread construction\nOutput:\n" + modernized);
+    require(contains(modernized, "firstThread.join();"),
+            "exact pthread_join sample should become std::thread::join\nOutput:\n" + modernized);
+    require(!contains(modernized, "pthread_create"),
+            "exact pthread_create sample should not remain after pass rewrite\nOutput:\n" + modernized);
+    require(!contains(modernized, "pthread_join"),
+            "exact pthread_join sample should not remain after pass rewrite\nOutput:\n" + modernized);
+    require(hasRule(changes, "PTHREAD MODERNIZATION started"),
+            "pthread pass start diagnostic should be emitted");
+    require(hasRule(changes, "pthread_create detected"),
+            "pthread_create detection diagnostic should be emitted");
+    require(hasRule(changes, "pthread_join matched"),
+            "pthread_join matching diagnostic should be emitted");
+    require(hasRule(changes, "pthread worker argument type inferred"),
+            "worker type inference diagnostic should be emitted");
+    require(hasChangeReasonContaining(changes, "converted_groups_count=1"),
+            "pthread summary should report one converted group");
+    require(hasAppliedRule(changes, "pthread_create/join to std::thread"),
+            "pthread conversion should be tracked as applied");
+}
+
+void testPthreadIntegerWorkerFirstThreadModernizesThroughPipeline()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = aiStyleOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "void* integerWorker(void* arg)\n"
+        "{\n"
+        "    int id = *(int*)arg;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    int id = 1;\n"
+        "    pthread_t firstThread;\n"
+        "    pthread_create(&firstThread, nullptr, integerWorker, &id);\n"
+        "    pthread_join(firstThread, nullptr);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "#include <thread>"),
+            "pipeline pthread conversion should add thread include\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::thread firstThread(integerWorker, &id);"),
+            "pipeline should convert exact integerWorker/firstThread pthread_create pattern\nOutput:\n"
+                + result.modernCode);
+    require(contains(result.modernCode, "firstThread.join();"),
+            "pipeline should convert exact integerWorker/firstThread pthread_join pattern\nOutput:\n"
+                + result.modernCode);
+    require(!contains(result.modernCode, "pthread_create"),
+            "pipeline should not leave pthread_create after safe conversion\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "pthread_join"),
+            "pipeline should not leave pthread_join after safe conversion\nOutput:\n" + result.modernCode);
+    require(hasRule(result.changes, "PTHREAD MODERNIZATION started"),
+            "pipeline should report pthread pass execution");
+    require(hasRule(result.changes, "pthread_create detected"),
+            "pipeline should report pthread_create detection");
+    require(hasRule(result.changes, "pthread_join matched"),
+            "pipeline should report pthread_join matching");
+    require(hasRule(result.changes, "pthread worker argument type inferred"),
+            "pipeline should report inferred worker argument type");
+    require(hasChangeReasonContaining(result.changes, "converted_groups_count=1"),
+            "pipeline pthread summary should report one converted group");
+    require(diagnosticsContain(result, "PTHREAD MODERNIZATION DEBUG"),
+            "pipeline should expose pthread debug diagnostics in Conversion Details");
+    require(diagnosticsContain(result, "pass_registered=true"),
+            "pthread debug should report pass registration");
+    require(diagnosticsContain(result, "pass_executed=true"),
+            "pthread debug should report pass execution");
+    require(diagnosticsContain(result, "source_contains_pthread_create=true"),
+            "pthread debug should report source pthread_create detection");
+    require(diagnosticsContain(result, "raw_pthread_create_matches=1"),
+            "pthread debug should report raw pthread_create match count");
+    require(diagnosticsContain(result, "raw_pthread_join_matches=1"),
+            "pthread debug should report raw pthread_join match count");
+    require(diagnosticsContain(result, "function_workers_found=1"),
+            "pthread debug should report discovered worker functions");
+    require(diagnosticsContain(result, "candidate_groups_found=1"),
+            "pthread debug should report candidate group pairing");
+    require(diagnosticsContain(result, "converted_groups=1"),
+            "pthread debug should report converted group count");
+    require(diagnosticsContain(result, "skipped_groups=0"),
+            "pthread debug should report no skipped groups for the exact sample");
+    require(diagnosticsContain(result, "thread_handle_expression=\"firstThread\""),
+            "pthread debug should report detected create/join handle expression");
+    require(diagnosticsContain(result, "attributes_expression=\"nullptr\""),
+            "pthread debug should report detected pthread_create attributes");
+    require(diagnosticsContain(result, "worker_function=\"integerWorker\""),
+            "pthread debug should report detected worker function");
+    require(diagnosticsContain(result, "argument_expression=\"&id\""),
+            "pthread debug should report detected pthread_create argument");
+    require(diagnosticsContain(result, "result_expression=\"nullptr\""),
+            "pthread debug should report detected pthread_join result expression");
+    require(result.compileVerificationPassed,
+            "pipeline pthread integerWorker conversion should compile\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+}
+
+void testPthreadSingleThreadModernizesToStdThread()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "void* worker(void* arg)\n"
+        "{\n"
+        "    int id = *(int*)arg;\n"
+        "    (void)id;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    pthread_t thread;\n"
+        "    int id = 1;\n"
+        "    pthread_create(&thread, nullptr, worker, &id);\n"
+        "    pthread_join(thread, nullptr);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "#include <thread>"),
+            "pthread conversion should add thread include\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "#include <pthread.h>"),
+            "pthread header should be removed when no pthread API/type remains\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "void worker(const int* arg)"),
+            "worker signature should be modernized to an inferred const int pointer after const propagation\nOutput:\n"
+                + result.modernCode);
+    require(contains(result.modernCode, "int id = *arg;"),
+            "worker argument cast/deref should be simplified after typed signature\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::thread thread(worker, &id);"),
+            "pthread_create should become std::thread construction\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "thread.join();"),
+            "pthread_join should become std::thread::join\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "pthread_create"),
+            "pthread_create should not remain after full conversion\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "pthread_join"),
+            "pthread_join should not remain after full conversion\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "return nullptr;"),
+            "null worker return should be removed when worker becomes void\nOutput:\n" + result.modernCode);
+    require(hasAppliedRule(result, "pthread_create/join to std::thread"),
+            "pthread conversion should be tracked");
+    require(hasAppliedRule(result, "pthread worker signature modernization"),
+            "worker signature modernization should be tracked");
+    require(result.compileVerificationPassed,
+            "single pthread conversion should pass syntax verification\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+}
+
+void testPthreadIndexedThreadsModernizeToSeparateStdThreads()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "void* worker(void* arg)\n"
+        "{\n"
+        "    int id = *(int*)arg;\n"
+        "    (void)id;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    pthread_t threads[2];\n"
+        "    int ids[2] = {1, 2};\n"
+        "    pthread_create(&threads[0], nullptr, worker, &ids[0]);\n"
+        "    pthread_create(&threads[1], nullptr, worker, &ids[1]);\n"
+        "    pthread_join(threads[0], nullptr);\n"
+        "    pthread_join(threads[1], nullptr);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "std::thread threads0(worker, &ids[0]);"),
+            "first indexed pthread_create should become a separate std::thread variable\nOutput:\n"
+                + result.modernCode);
+    require(contains(result.modernCode, "std::thread threads1(worker, &ids[1]);"),
+            "second indexed pthread_create should become a separate std::thread variable\nOutput:\n"
+                + result.modernCode);
+    require(contains(result.modernCode, "threads0.join();"),
+            "first indexed pthread_join should use the generated std::thread variable\nOutput:\n"
+                + result.modernCode);
+    require(contains(result.modernCode, "threads1.join();"),
+            "second indexed pthread_join should use the generated std::thread variable\nOutput:\n"
+                + result.modernCode);
+    require(!contains(result.modernCode, "pthread_t threads"),
+            "pthread_t array declaration should be removed after full indexed conversion\nOutput:\n"
+                + result.modernCode);
+    require(!contains(result.modernCode, "pthread_create"),
+            "indexed pthread_create calls should not remain\nOutput:\n" + result.modernCode);
+    require(result.compileVerificationPassed,
+            "indexed pthread conversion should pass syntax verification\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+}
+
+void testPthreadWorkerStructPointerModernizes()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "struct Job\n"
+        "{\n"
+        "    int id;\n"
+        "};\n"
+        "void* worker(void* arg)\n"
+        "{\n"
+        "    Job* job = (Job*)arg;\n"
+        "    job->id += 1;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    pthread_t thread;\n"
+        "    Job job{1};\n"
+        "    pthread_create(&thread, nullptr, worker, &job);\n"
+        "    pthread_join(thread, nullptr);\n"
+        "    return job.id;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "void worker(Job* arg)"),
+            "struct pointer worker argument should be inferred\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "arg->id += 1;"),
+            "worker pointer alias should be simplified to direct typed argument access\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "std::thread thread(worker, &job);"),
+            "struct pointer pthread_create should become std::thread\nOutput:\n" + result.modernCode);
+    require(result.compileVerificationPassed,
+            "struct pointer pthread conversion should pass syntax verification\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+}
+
+void testPthreadStaticCastWorkerPointerModernizes()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "struct Device\n"
+        "{\n"
+        "    int value;\n"
+        "};\n"
+        "void* worker(void* arg)\n"
+        "{\n"
+        "    Device* device = static_cast<Device*>(arg);\n"
+        "    device->value += 1;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    pthread_t thread;\n"
+        "    Device device{1};\n"
+        "    pthread_create(&thread, nullptr, worker, &device);\n"
+        "    pthread_join(thread, nullptr);\n"
+        "    return device.value;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "void worker(Device* arg)"),
+            "static_cast pthread worker argument should be inferred\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "arg->value += 1;"),
+            "static_cast pthread worker alias should be simplified to typed argument access\nOutput:\n"
+                + result.modernCode);
+    require(contains(result.modernCode, "std::thread thread(worker, &device);"),
+            "static_cast pthread_create should become std::thread\nOutput:\n" + result.modernCode);
+    require(result.compileVerificationPassed,
+            "static_cast pthread conversion should pass syntax verification\nCompiler output:\n"
+                + result.compilerOutput + "\nOutput:\n" + result.modernCode);
+}
+
+void testPthreadNonNullAttributesAreSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "void* worker(void* arg)\n"
+        "{\n"
+        "    int id = *(int*)arg;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    pthread_t thread;\n"
+        "    pthread_attr_t attributes;\n"
+        "    int id = 1;\n"
+        "    pthread_create(&thread, &attributes, worker, &id);\n"
+        "    pthread_join(thread, nullptr);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "pthread_create(&thread, &attributes, worker, &id);"),
+            "pthread_create with non-null attributes should be preserved\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <pthread.h>"),
+            "pthread header should be retained when pthread APIs remain\nOutput:\n" + result.modernCode);
+    require(hasSkippedRule(result.changes, "pthread_create/join to std::thread skipped"),
+            "non-null attributes skip should be tracked");
+}
+
+void testPthreadCreateReturnValueUsedIsSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "void* worker(void* arg)\n"
+        "{\n"
+        "    int id = *(int*)arg;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    pthread_t thread;\n"
+        "    int id = 1;\n"
+        "    int rc = pthread_create(&thread, nullptr, worker, &id);\n"
+        "    pthread_join(thread, nullptr);\n"
+        "    return rc;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "int rc = pthread_create(&thread, nullptr, worker, &id);"),
+            "pthread_create return value usage should prevent conversion\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::thread thread(worker, &id);"),
+            "create return value usage should not be partially converted\nOutput:\n" + result.modernCode);
+    require(hasSkippedRule(result.changes, "pthread_create/join to std::thread skipped"),
+            "create return value skip should be tracked");
+}
+
+void testPthreadJoinReturnValueUsedIsSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "void* worker(void* arg)\n"
+        "{\n"
+        "    int id = *(int*)arg;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    pthread_t thread;\n"
+        "    int id = 1;\n"
+        "    pthread_create(&thread, nullptr, worker, &id);\n"
+        "    int rc = pthread_join(thread, nullptr);\n"
+        "    return rc;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "pthread_create(&thread, nullptr, worker, &id);"),
+            "pthread group should remain unchanged when join result is used\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "int rc = pthread_join(thread, nullptr);"),
+            "pthread_join return value usage should be preserved\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::thread thread(worker, &id);"),
+            "join return value usage should not be partially converted\nOutput:\n" + result.modernCode);
+    require(hasSkippedRule(result.changes, "pthread_create/join to std::thread skipped"),
+            "join return value skip should be tracked");
+}
+
+void testPthreadDetachUsageIsSkippedAndHeaderRetained()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "void* worker(void* arg)\n"
+        "{\n"
+        "    int id = *(int*)arg;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    pthread_t thread;\n"
+        "    int id = 1;\n"
+        "    pthread_create(&thread, nullptr, worker, &id);\n"
+        "    pthread_detach(thread);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "pthread_detach(thread);"),
+            "detached pthread lifecycle should remain unchanged\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "#include <pthread.h>"),
+            "pthread header should be retained for unsupported pthread usage\nOutput:\n" + result.modernCode);
+    require(hasSkippedRule(result.changes, "pthread_create/join to std::thread skipped"),
+            "pthread_detach skip should be tracked");
+}
+
+void testPthreadAmbiguousVoidPointerUsageIsSkippedAtomically()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "void* worker(void* arg)\n"
+        "{\n"
+        "    void* raw = arg;\n"
+        "    (void)raw;\n"
+        "    return nullptr;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    pthread_t thread;\n"
+        "    int id = 1;\n"
+        "    pthread_create(&thread, nullptr, worker, &id);\n"
+        "    pthread_join(thread, nullptr);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "void* worker(void* arg)"),
+            "ambiguous worker signature should remain unchanged\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "pthread_create(&thread, nullptr, worker, &id);"),
+            "ambiguous worker group should not partially convert create\nOutput:\n" + result.modernCode);
+    require(contains(result.modernCode, "pthread_join(thread, nullptr);"),
+            "ambiguous worker group should not partially convert join\nOutput:\n" + result.modernCode);
+    require(hasSkippedRule(result.changes, "pthread_create/join to std::thread skipped"),
+            "ambiguous worker skip should be tracked");
+}
+
+void testPthreadMeaningfulWorkerReturnIsSkipped()
+{
+    const RuleBasedConverterEngine converter;
+    ModernizationOptions options = structuralOptions();
+    options.compileVerificationEnabled = true;
+
+    const ConversionResult result = converter.convert(
+        "#include <pthread.h>\n"
+        "void* worker(void* arg)\n"
+        "{\n"
+        "    int id = *(int*)arg;\n"
+        "    (void)id;\n"
+        "    return arg;\n"
+        "}\n"
+        "int main()\n"
+        "{\n"
+        "    pthread_t thread;\n"
+        "    int id = 1;\n"
+        "    pthread_create(&thread, nullptr, worker, &id);\n"
+        "    pthread_join(thread, nullptr);\n"
+        "    return 0;\n"
+        "}\n",
+        options);
+
+    require(contains(result.modernCode, "return arg;"),
+            "worker meaningful pointer return should be preserved\nOutput:\n" + result.modernCode);
+    require(!contains(result.modernCode, "std::thread thread(worker, &id);"),
+            "meaningful worker return should skip std::thread conversion\nOutput:\n" + result.modernCode);
+    require(hasSkippedRule(result.changes, "pthread_create/join to std::thread skipped"),
+            "meaningful worker return skip should be tracked");
+    require(hasChangeReasonContaining(result.changes, "worker returns a meaningful pointer"),
+            "meaningful worker return skip reason should be reported");
+    require(hasChangeReasonContaining(result.changes, "skipped_groups_count=1"),
+            "pthread summary should report one skipped group");
+}
+
 void testReadOnlyRawPointerParameterBecomesConstPointer()
 {
     const RuleBasedConverterEngine converter;
@@ -10021,7 +10695,9 @@ int main(int argc, char** argv)
     testValueTypePointerOperationScannerRemovesPointerLeftovers();
     testValueTypeNullptrEqualityBecomesValueStateCheck();
     testEmptyCleanupBlockAfterValueTypeModernizationIsRemoved();
+    testSemanticRepairRemovesVectorNullDestructorAndDuplicateConst();
     testVectorMemberGetterCascadesToContainerReference();
+    testFullStressVectorStorageSemanticRepairCompiles();
     testLocalCollectionDoesNotLeakIntoUnrelatedClassGetter();
     testLengthGetterForIndependentMemberIsPreserved();
     testScopeLeakValidatorRepairsWrongInClassSymbolWhenSafe();
@@ -10091,6 +10767,18 @@ int main(int argc, char** argv)
     testUserDefinedSleepFunctionIsSkipped();
     testSleepInsideMacroIsSkipped();
     testSleepModernizationKeepsUnistdForOtherPosixSymbols();
+    testPthreadExactIntegerWorkerSampleTriggersPass();
+    testPthreadIntegerWorkerFirstThreadModernizesThroughPipeline();
+    testPthreadSingleThreadModernizesToStdThread();
+    testPthreadIndexedThreadsModernizeToSeparateStdThreads();
+    testPthreadWorkerStructPointerModernizes();
+    testPthreadStaticCastWorkerPointerModernizes();
+    testPthreadNonNullAttributesAreSkipped();
+    testPthreadCreateReturnValueUsedIsSkipped();
+    testPthreadJoinReturnValueUsedIsSkipped();
+    testPthreadDetachUsageIsSkippedAndHeaderRetained();
+    testPthreadAmbiguousVoidPointerUsageIsSkippedAtomically();
+    testPthreadMeaningfulWorkerReturnIsSkipped();
     testReadOnlyRawPointerParameterBecomesConstPointer();
     testMutatingRawPointerParameterIsSkipped();
     testNonConstMethodRawPointerParameterIsSkipped();

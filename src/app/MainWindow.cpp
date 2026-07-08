@@ -1124,6 +1124,7 @@ QString MainWindow::formatChanges(const ConversionResult& result) const
         QStringList compileDiagnostics;
         QStringList semanticRepairDiagnostics;
         QStringList clangValidationDiagnostics;
+        QStringList pthreadDiagnostics;
         QStringList formattingDiagnostics;
         QStringList finalStatuses;
         QStringList debugDetails;
@@ -1319,6 +1320,8 @@ QString MainWindow::formatChanges(const ConversionResult& result) const
                     || diagnostic.contains("warning", Qt::CaseInsensitive)) {
                     clangValidationDiagnostics.push_back(diagnostic);
                 }
+            } else if (diagnostic.startsWith("PTHREAD MODERNIZATION DEBUG", Qt::CaseInsensitive)) {
+                pthreadDiagnostics.push_back(diagnostic);
             } else if (diagnostic.startsWith("POST FORMAT", Qt::CaseInsensitive)
                        || diagnostic.startsWith("INCLUDE CLEANUP", Qt::CaseInsensitive)) {
                 formattingDiagnostics.push_back(diagnostic);
@@ -1390,6 +1393,7 @@ QString MainWindow::formatChanges(const ConversionResult& result) const
         appendListSection("Warnings", warnings);
         appendListSection("Semantic Repairs", semanticRepairDiagnostics);
         appendListSection("Clang Validation", clangValidationDiagnostics);
+        appendListSection("Pthread Modernization Debug", pthreadDiagnostics);
         appendListSection("Compile Verification Diagnostics", compileDiagnostics);
         appendListSection("Formatting And Include Cleanup", formattingDiagnostics);
 
